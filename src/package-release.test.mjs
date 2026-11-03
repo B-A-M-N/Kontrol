@@ -177,9 +177,16 @@ try {
     // mutation return approval_required without executing.
     KONTROL_TUNNEL_REVIEWER_SECRET: "package-release-reviewer-secret-long-enough",
   } });
+  // Fixture ownership: the doctor probe must not read the ambient
+  // ~/.kontrol/config.json. That file belongs to the operator, not the
+  // fixture; an unrelated legacy config would fail this gate on an
+  // otherwise healthy artifact. The legacy-config FAIL branch itself stays
+  // covered by config.test.ts against fixture homes.
+  const doctorHome = join(tmp, "doctor-home");
+  mkdirSync(doctorHome, { recursive: true });
   const doctorOutput = execFileSync("node", [installedCli, "doctor"], {
     cwd: installPrefix,
-    env: serviceEnv,
+    env: { ...serviceEnv, HOME: doctorHome },
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"], // capture stderr — review #10
   });
@@ -566,6 +573,10 @@ function serviceEnvForInstall(tmpRoot, installPrefix) {
     XDG_DATA_HOME: join(tmpRoot, "service-data-home"),
     KONTROL_SERVICE_DATA_DIR: join(tmpRoot, "service-data"),
     KONTROL_ALLOWED_ROOTS: installPrefix,
+    // Fixture reviewer credential: `service unit` generation is guarded by
+    // the tunnel reviewer-auth check under an ask-capable policy, so the
+    // fixture must present the dedicated secret (never a real credential).
+    KONTROL_TUNNEL_REVIEWER_SECRET: "package-release-fixture-reviewer-secret",
   } });
 }
 

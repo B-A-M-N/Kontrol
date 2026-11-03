@@ -18,9 +18,11 @@ import {
   workspaceRelativePath,
 } from "./checkpoint-coverage.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
+import { resolveTestGitIdentity } from "./test-git-identity.js";
 
-const testGitName = execFileSync("git", ["config", "user.name"], { cwd: process.cwd(), encoding: "utf8" }).trim();
-const testGitEmail = execFileSync("git", ["config", "user.email"], { cwd: process.cwd(), encoding: "utf8" }).trim();
+const testGitIdentity = resolveTestGitIdentity();
+const testGitName = testGitIdentity.name;
+const testGitEmail = testGitIdentity.email;
 
 // ── Pure classifier ──────────────────────────────────────
 

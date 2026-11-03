@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { mkdtempSync } from "node:fs";
 import { mkdtemp, mkdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,10 +13,15 @@ import { ProcessSessionManager } from "./process-sessions.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 import { createWorkSessionManager } from "./work-sessions.js";
+import { resolveTestGitIdentity } from "./test-git-identity.js";
 
 const execFileAsync = promisify(execFile);
-const testGitName = (await execFileAsync("git", ["config", "user.name"], { cwd: process.cwd() })).stdout.trim();
-const testGitEmail = (await execFileAsync("git", ["config", "user.email"], { cwd: process.cwd() })).stdout.trim();
+// Single fixture-identity source (ambient with synthetic fallback): the same
+// helper checkpoint-coverage and peer-jobs-enqueue use, so this suite works
+// with operator git config and under neutral-home qualification.
+const testGitIdentity = resolveTestGitIdentity();
+const testGitName = testGitIdentity.name;
+const testGitEmail = testGitIdentity.email;
 const root = await realpath(await mkdtemp(join(tmpdir(), "kontrol-workspace-test-")));
 
 try {
@@ -32,13 +38,19 @@ try {
   await mkdir(largeFixture);
   await Promise.all(Array.from({ length: 10_000 }, (_, index) => mkdir(join(largeFixture, `dir-${index}`))));
 
-  const config = loadConfig({
+  // Pin an empty machine-config dir so this test asserts workspace behavior
+  // only: a machine-local ~/.kontrol/config.json (e.g. tunnel auth mode)
+  // would otherwise leak into loadConfig and trip unrelated validation.
+  const emptyConfigDir = mkdtempSync(join(tmpdir(), "kontrol-empty-config-workspaces-"));
+  const baseConfigEnv = {
+    KONTROL_CONFIG_DIR: emptyConfigDir,
     KONTROL_ALLOWED_ROOTS: root,
     KONTROL_WORKTREE_ROOT: join(root, ".kontrol", "worktrees"),
     KONTROL_AGENT_DIR: agentDir,
     KONTROL_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
-  });
+  };
+  const config = loadConfig(baseConfigEnv);
   const registry = new WorkspaceRegistry(config);
   const { workspace, agentsFiles, availableAgentsFiles } = await registry.openWorkspace(root);
 
@@ -173,12 +185,8 @@ try {
   lifecycleDb.sqlite.prepare("update workspace_sessions set retired_at = ? where id = ?")
     .run(new Date(Date.now() - 60_000).toISOString(), persistentWorktree.workspace.id);
   const collectorConfig = loadConfig({
-    KONTROL_ALLOWED_ROOTS: root,
-    KONTROL_WORKTREE_ROOT: join(root, ".kontrol", "worktrees"),
-    KONTROL_AGENT_DIR: agentDir,
-    KONTROL_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    ...baseConfigEnv,
     KONTROL_MANAGED_WORKTREE_RETENTION_MS: "1",
-    PORT: "1",
   });
   const collector = new WorkspaceRegistry(collectorConfig, firstStore);
   const retiredRow = lifecycleDb.sqlite.prepare("select mode, managed, status, retired_at from workspace_sessions where id = ?")
@@ -245,13 +253,10 @@ try {
     await git(repo, ["commit", "-m", "Initial commit"]);
   }));
   const capConfig = loadConfig({
-    KONTROL_ALLOWED_ROOTS: root,
+    ...baseConfigEnv,
     KONTROL_WORKTREE_ROOT: join(root, ".capped-worktrees"),
-    KONTROL_AGENT_DIR: agentDir,
-    KONTROL_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     KONTROL_MANAGED_WORKTREE_PROJECT_LIMIT: "1",
     KONTROL_MANAGED_WORKTREE_GLOBAL_LIMIT: "2",
-    PORT: "1",
   });
   const capStore = new SqliteWorkspaceStore(join(root, ".cap-state"));
   const capRegistry = new WorkspaceRegistry(capConfig, capStore);
@@ -278,11 +283,9 @@ try {
     const aliasRoot = join(root, "alias-root");
     await symlink(root, aliasRoot, "dir");
     const aliasConfig = loadConfig({
+      ...baseConfigEnv,
       KONTROL_ALLOWED_ROOTS: aliasRoot,
       KONTROL_WORKTREE_ROOT: join(aliasRoot, ".kontrol", "alias-worktrees"),
-      KONTROL_AGENT_DIR: agentDir,
-      KONTROL_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
-      PORT: "1",
     });
     const aliasWorkspace = await new WorkspaceRegistry(aliasConfig).openWorkspace({
       path: join(aliasRoot, "git-project"),

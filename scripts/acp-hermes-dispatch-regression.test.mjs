@@ -11,8 +11,12 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createServer } from "node:http";
+
+// Run the adapter from the tree under test, never a hardcoded checkout path.
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 const root = mkdtempSync(join(tmpdir(), "kontrol-hermes-dispatch-regression-"));
 const stateDir = join(root, "state");
@@ -51,7 +55,7 @@ await new Promise((resolve) => stub.listen(0, "127.0.0.1", resolve));
 const stubPort = stub.address().port;
 
 const adapter = spawn(process.execPath, ["scripts/acp-hermes-native-adapter.mjs"], {
-  cwd: "/home/bamn/devspace",
+  cwd: repoRoot,
   env: {
     ...process.env,
     KONTROL_ACP_AGENT_SECRET: "regression-agent-secret",
@@ -68,11 +72,14 @@ adapter.stdout.on("data", (chunk) => { adapterOutput += String(chunk); });
 adapter.stderr.on("data", (chunk) => { adapterOutput += String(chunk); });
 
 const adapterBase = `http://127.0.0.1:${freePort}`;
+// Every adapter call carries a hard deadline: a hung provider must fail this
+// test loudly instead of stalling the release gate forever.
 async function postRuns(body) {
   const res = await fetch(`${adapterBase}/runs`, {
     method: "POST",
     headers: { "Content-Type": "application/json", authorization: `Bearer ${ADAPTER_SECRET}` },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(60_000),
   });
   return { status: res.status, json: await res.json() };
 }
@@ -98,10 +105,10 @@ try {
   const readyDeadline = Date.now() + 15_000;
   for (;;) {
     try {
-      const health = await fetch(`${adapterBase}/health`);
+      const health = await fetch(`${adapterBase}/health`, { signal: AbortSignal.timeout(5_000) });
       if (health.ok || health.status === 503) break;
     } catch { /* still starting */ }
-    if (Date.now() > readyDeadline) throw new Error(`adapter under test did not start: ${adapterOutput.slice(-2000)}`);
+    if (Date.now() > readyDeadline) throw new Error(`adapter under test did not start (exit=${adapter.exitCode} signal=${adapter.signalCode}): ${adapterOutput.slice(-2000)}`);
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
@@ -154,9 +161,34 @@ try {
   assert.equal(conflict.json?.error?.code, "dispatch_idempotency_conflict");
 
   console.log("acp-hermes-dispatch-regression.test.mjs: ordinary delegation + idempotent replay passed");
+} catch (error) {
+  // A failing body must surface the adapter transcript: without it an
+  // adapter crash is indistinguishable from a test hang.
+  console.error(`acp-hermes-dispatch-regression FAILED: ${error instanceof Error ? error.message : String(error)}`);
+  console.error(`--- adapter transcript ---\n${adapterOutput.slice(-4000)}`);
+  throw error;
 } finally {
+  // Bounded shutdown: when the adapter already exited (for example a fast
+  // startup failure), its 'exit' event fired before any listener attached,
+  // so an unbounded wait would hang the whole runtime chain forever.
   adapter.kill("SIGTERM");
-  await new Promise((resolve) => adapter.once("exit", resolve));
-  stub.close();
+  if (adapter.exitCode === null && adapter.signalCode === null) {
+    await Promise.race([
+      new Promise((resolve) => adapter.once("exit", resolve)),
+      new Promise((resolve) => setTimeout(resolve, 5_000)),
+    ]);
+  }
+  if (adapter.exitCode === null && adapter.signalCode === null) {
+    adapter.kill("SIGKILL");
+    await Promise.race([
+      new Promise((resolve) => adapter.once("exit", resolve)),
+      new Promise((resolve) => setTimeout(resolve, 5_000)),
+    ]);
+  }
+  stub.closeAllConnections();
+  await Promise.race([
+    new Promise((resolve) => stub.close(resolve)),
+    new Promise((resolve) => setTimeout(resolve, 5_000)),
+  ]);
   rmSync(root, { recursive: true, force: true });
 }
