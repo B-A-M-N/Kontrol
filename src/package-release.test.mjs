@@ -470,8 +470,21 @@ async function exerciseInstalledServiceLifecycle(installedPkg, tmpRoot) {
   writeFileSync(join(candidate, "cli.js"), "#!/usr/bin/env node\n");
   writeFileSync(join(candidate, "build-meta.json"), JSON.stringify(candidateMeta));
 
+  // Hermetic operator configuration: without an explicit fixture config dir
+  // this exercise would inherit the ambient ~/.kontrol/config.json, and any
+  // operator-configured tunnel would become a required rollback auxiliary
+  // that the stubbed systemctl can never activate.
+  const fixtureConfigDir = join(rootDir, "kontrol-config");
+  mkdirSync(fixtureConfigDir, { recursive: true });
+  writeFileSync(join(fixtureConfigDir, "config.json"), JSON.stringify({ serviceComponents: [] }));
+  // Explicit environment file: with no tunnel configured, install no longer
+  // materializes one as a side effect, so the fixture provides its own.
+  const fixtureEnvDir = join(tmpRoot, "service-config-home", "kontrol");
+  mkdirSync(fixtureEnvDir, { recursive: true });
+  writeFileSync(join(fixtureEnvDir, "environment"), "PORT=9\n", { mode: 0o600 });
   const env = {
     ...serviceEnvForInstall(tmpRoot, rootDir),
+    KONTROL_CONFIG_DIR: fixtureConfigDir,
     KONTROL_STATE_DIR: join(rootDir, "database state"),
     KONTROL_USER_SERVICE_NAME: "kontrol-package-fixture.service",
   };
@@ -520,11 +533,16 @@ async function exerciseInstalledServiceLifecycle(installedPkg, tmpRoot) {
   } finally {
     sqlite.close();
   }
-  assert.deepEqual(calls.filter((call) => call.startsWith("start") || call.startsWith("stop")).slice(-4), [
-    "stop kontrol-package-fixture.service",
-    "start kontrol-package-fixture.service",
-    "stop kontrol-package-fixture.service",
-    "start kontrol-package-fixture.service",
+  // Full-stack lifecycle contract: the candidate stops the aggregate target
+  // (never just the core unit), and rollback stops, reloads, and restarts
+  // through the target as well. The core-only stop/start sequence this
+  // asserted before is the behavior review finding #1 ordered removed.
+  assert.deepEqual(calls.slice(-5), [
+    "stop kontrol.target",
+    "enable --now kontrol.target",
+    "stop kontrol.target",
+    "daemon-reload",
+    "enable --now kontrol.target",
   ]);
 }
 

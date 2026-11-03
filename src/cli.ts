@@ -15,6 +15,7 @@ import { loadPolicyConfig, policyCanAsk } from "./policy.js";
 import { collectDurableSnapshotRoots } from "./runtime/snapshot-roots.js";
 import { createReviewRouteStore } from "./review-handoff/route-store.js";
 import { runServiceCommand } from "./service.js";
+import { isPermanentConfigFailure, SCHEMA_INCOMPATIBLE_EXIT_CODE } from "./lifecycle-coordinator.js";
 import { isRuntimeIdentityLive, readBuildIdentity, readRuntimeIdentity } from "./runtime-identity.js";
 import {
   generateOwnerToken,
@@ -1556,6 +1557,13 @@ function checkBashShell(): string {
 }
 
 main(process.argv.slice(2)).catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(message);
+  // Permanent configuration failures (e.g. the installed executable cannot
+  // read the live database schema) must exit distinct from transient
+  // failures so systemd RestartPreventExitStatus stops retrying them
+  // instead of burning the start budget.
+  process.exitCode = isPermanentConfigFailure({ stderr: message })
+    ? SCHEMA_INCOMPATIBLE_EXIT_CODE
+    : 1;
 });

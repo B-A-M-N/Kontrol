@@ -1380,6 +1380,16 @@ rollback() {
 
 on_exit() {
   local status=$?
+  # A lifecycle-fence refusal is a clean pre-launch abort, not a failed
+  # activation: release owned locks, record the refusal, and exit without
+  # entering rollback (which would restore the tmux generation and create
+  # the mixed-mode stack the fence refused).
+  if [[ "${LIFECYCLE_FENCE_REFUSED:-0}" == "1" ]]; then
+    write_deployment_record "failed" "refused: a systemd-owned Kontrol stack is already active" "failed" || true
+    cleanup
+    trap - EXIT
+    exit 1
+  fi
   if [[ "$PREPARE_ONLY" == "1" ]]; then
     if [[ "$status" != "0" ]]; then
       write_deployment_record "failed" "candidate preparation failed before activation" "failed" || true
@@ -1447,6 +1457,34 @@ fi
 export KONTROL_DEPLOYMENT_ID="$DEPLOYMENT_ID"
 export KONTROL_DEPLOYMENT_OPERATION="$([[ "$PREPARE_ONLY" == "1" ]] && echo prepare || echo activate)"
 write_deployment_record "preparing" "deployment controller owns the transaction" "" || true
+
+# Lifecycle fence: a tmux launch must refuse to create a second stack while a
+# systemd-owned Kontrol stack is already live. The decision lives in
+# src/lifecycle-coordinator.ts (via src/lifecycle-cli.ts), not in shell
+# state-machine logic. --prepare-only only builds a candidate and launches
+# nothing, so it is exempt. An explicit operator takeover
+# (KONTROL_TAKEOVER_AUTHORIZED=1) stops the conflicting stack through the
+# fenced takeover transaction first; it is never a blind bypass and remains
+# reversible by stopping the tmux stack again.
+if [[ "$PREPARE_ONLY" != "1" ]]; then
+  if [[ "${KONTROL_TAKEOVER_AUTHORIZED:-0}" == "1" ]]; then
+    if ! node --import tsx src/lifecycle-cli.ts takeover-stack --to=tmux; then
+      echo "ERROR: start-all.sh refused: the authorized takeover did not clear the conflicting stack." >&2
+      # A fence refusal must never enter rollback: restoring the tmux
+      # generation here would create exactly the mixed-mode stack refused.
+      LIFECYCLE_FENCE_REFUSED=1
+      exit 1
+    fi
+  fi
+  if ! node --import tsx src/lifecycle-cli.ts check-start --backend=tmux; then
+    echo "ERROR: start-all.sh refused: a systemd-owned Kontrol stack is already active." >&2
+    echo "Stop it first (./stop-all.sh), or set KONTROL_TAKEOVER_AUTHORIZED=1 to stop that stack through the fenced takeover before launch." >&2
+    # A fence refusal must never enter rollback: restoring the tmux
+    # generation here would create exactly the mixed-mode stack refused.
+    LIFECYCLE_FENCE_REFUSED=1
+    exit 1
+  fi
+fi
 
 # runtime.lock is the serving-owner lock. In activation mode this check is
 # intentionally after the recovery trap: restart-kontrol.sh has stopped the

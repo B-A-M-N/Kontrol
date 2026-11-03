@@ -10,11 +10,20 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { createConnection } from "node:net";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import Database from "better-sqlite3";
 import { loadKontrolFiles, type KontrolServiceComponent } from "./user-config.js";
+import {
+  SCHEMA_INCOMPATIBLE_EXIT_CODE,
+  aggregateLifecycleStatus,
+  buildLifecycleManifest,
+  preflightArtifactCompatibility,
+  type ComponentLiveness,
+} from "./lifecycle-coordinator.js";
 import { loadPolicyConfig, policyCanAsk } from "./policy.js";
 import { acquireDeploymentLock, releaseDeploymentLock, type DeploymentLockHandle } from "./deployment-lock.js";
 import { restoreDeploymentDatabaseBackup } from "./db/deployment-backup.js";
@@ -53,6 +62,14 @@ export interface ServiceCommandDependencies {
   requireSystemd?: () => void;
   /** Test seam for readiness and exact artifact identity verification. */
   waitForReady?: (paths: ServicePaths, expected: InstalledServiceState) => Promise<void>;
+  /** Test seam for unit active-state probes (stop verification, status). */
+  probeUnitActive?: (unit: string) => boolean;
+  /** Test seam for full unit-state probes (status verdict). */
+  probeUnit?: (unit: string) => UnitProbeState;
+  /** Test seam for auxiliary endpoint reachability (status verdict). */
+  probeComponentEndpoint?: (unit: string, port: number) => Promise<{ reachable: boolean; detail?: string }>;
+  /** Test seam for persistent enablement probes (member reconciliation). */
+  probeUnitEnabled?: (unit: string) => boolean | null;
 }
 
 interface DeploymentRecord {
@@ -62,8 +79,22 @@ interface DeploymentRecord {
   previous?: InstalledServiceState;
   candidate?: InstalledServiceState;
   databaseRestore?: unknown;
+  memberRestore?: MemberEnablementRestore;
   error?: string;
   updatedAt: string;
+}
+
+/**
+ * Outcome of a member-enablement restore: which units were disabled and
+ * enabled, and which prior states could not be determined. Unknown priors
+ * are conservatively re-enabled (members are meant to be enabled) but stay
+ * listed under `unresolved` so the journal never silently claims an exact
+ * restoration it could not prove.
+ */
+export interface MemberEnablementRestore {
+  disabled: string[];
+  enabled: string[];
+  unresolved: string[];
 }
 
 function defaultDataRoot(env: NodeJS.ProcessEnv): string {
@@ -126,6 +157,266 @@ function updateDeploymentRecord(paths: ServicePaths, record: DeploymentRecord, p
 
 function compiledArtifactPath(): string {
   return dirname(fileURLToPath(import.meta.url));
+}
+
+export type LiveDatabaseInspection =
+  /** No database file exists yet: a fresh install with nothing to be compatible with. */
+  | { status: "absent" }
+  /** The live schema version was read without mutation. */
+  | { status: "ok"; schemaVersion: number }
+  /** A database file exists but its schema version cannot be established. */
+  | { status: "unreadable"; reason: string };
+
+/**
+ * Inspect the live database schema version without mutating anything. The
+ * read-only open can never trigger a migration or a backup. Three outcomes
+ * are distinguished: absent (fresh install), ok (a version was read), and
+ * unreadable (a file exists but cannot be inspected — corrupt, locked, or
+ * pre-migration). Unreadable is never conflated with absent: callers must
+ * fail closed instead of skipping compatibility gates.
+ */
+export function inspectLiveDatabase(stateDir: string): LiveDatabaseInspection {
+  const dbPath = join(stateDir, "kontrol.sqlite");
+  if (!existsSync(dbPath)) return { status: "absent" };
+  let sqlite: Database.Database | undefined;
+  try {
+    sqlite = new Database(dbPath, { readonly: true });
+    const row = sqlite
+      .prepare("select max(version) as version from kontrol_schema_migrations")
+      .get() as { version?: unknown } | undefined;
+    const version = Number(row?.version);
+    if (!Number.isInteger(version) || version < 0) {
+      return { status: "unreadable", reason: `${dbPath} exists but its schema version is unreadable (${String(row?.version)})` };
+    }
+    return { status: "ok", schemaVersion: version };
+  } catch (error) {
+    return { status: "unreadable", reason: `${dbPath} exists but cannot be inspected: ${error instanceof Error ? error.message : String(error)}` };
+  } finally {
+    try {
+      sqlite?.close();
+    } catch {
+      // Read-only probe; close failures carry no state.
+    }
+  }
+}
+
+/**
+ * Fail closed when the candidate artifact cannot open the live database.
+ * This is the check whose absence left the obsolete 113 build crash-looping
+ * against the schema-116 database: the refusal must happen here, before
+ * any unit rewrite, process start, or migration — never in the journal
+ * after five restarts. An unreadable database blocks the gate instead of
+ * skipping it: proceeding without a compatibility verdict risks exactly
+ * the crash loop this gate exists to prevent.
+ */
+function preflightCandidateAgainstLiveDatabase(paths: ServicePaths, candidate: ServiceBuild): void {
+  const inspection = inspectLiveDatabase(paths.stateDir);
+  if (inspection.status === "absent") return;
+  if (inspection.status === "unreadable") {
+    throw new Error(`cannot verify candidate ${candidate.buildId} against the live database: ${inspection.reason}`);
+  }
+  const verdict = preflightArtifactCompatibility(candidate, inspection.schemaVersion);
+  if (!verdict.compatible) throw new Error(verdict.reason);
+}
+
+/**
+ * Production units require their environment file (no `-` optional prefix
+ * in the rendered unit). Validate its presence before any mutation without
+ * ever logging its contents — install/upgrade must not default into an
+ * insecure or incorrect authentication mode when configuration is absent.
+ */
+function requireServiceEnvironmentFile(paths: ServicePaths): void {
+  if (!existsSync(paths.environmentFile)) {
+    throw new Error(
+      `Kontrol service environment file is missing: ${paths.environmentFile}. Create it before install/upgrade (never inline secrets on the command line).`,
+    );
+  }
+}
+
+/** Byte snapshot of one file; null when absent. */
+function snapshotFile(path: string): string | null {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/** Restore a file snapshot; files absent at snapshot time are removed. */
+function restoreFileSnapshot(path: string, snapshot: string | null): void {
+  if (snapshot === null) rmSync(path, { force: true });
+  else writeFileSync(path, snapshot);
+}
+
+/** Byte snapshot of every installed unit file plus the installed state. */
+function snapshotUnitFiles(paths: ServicePaths): Map<string, string | null> {
+  const names = new Set<string>([paths.unitPath, paths.statePath]);
+  try {
+    const configRoot = dirname(paths.unitPath);
+    for (const entry of readdirSync(configRoot)) {
+      if (entry === "kontrol.target" || /^kontrol-.+\.service$/.test(entry)) {
+        names.add(join(configRoot, entry));
+      }
+    }
+  } catch {
+    // Config root may not exist yet on a fresh install.
+  }
+  const snapshot = new Map<string, string | null>();
+  for (const name of names) {
+    try {
+      snapshot.set(name, readFileSync(name, "utf8"));
+    } catch {
+      snapshot.set(name, null);
+    }
+  }
+  return snapshot;
+}
+
+/** Restore a byte snapshot; files absent at snapshot time are removed. */
+function restoreUnitFiles(snapshot: Map<string, string | null>): void {
+  for (const [path, content] of snapshot) {
+    if (content === null) rmSync(path, { force: true });
+    else writeFileSync(path, content);
+  }
+}
+
+/** Delete managed units the failed candidate added: anything matching the
+ * managed-unit pattern that the pre-mutation snapshot does not contain.
+ * Snapshotted units are restored by restoreUnitFiles; this only removes
+ * files the candidate introduced, so rollback cannot leak added units. */
+function removeUnitsAddedSince(snapshot: Map<string, string | null>, configRoot: string): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(configRoot);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (entry !== "kontrol.target" && !/^kontrol-.+\.service$/.test(entry)) continue;
+    const full = join(configRoot, entry);
+    if (!snapshot.has(full)) rmSync(full, { force: true });
+  }
+}
+
+/** Member units present before a mutation: managed unit files excluding the
+ * core service and the aggregate target (both are reconciled separately). */
+function previousMemberUnits(snapshot: Map<string, string | null>, serviceName: string): string[] {
+  const members: string[] = [];
+  for (const path of snapshot.keys()) {
+    const base = path.split("/").at(-1) ?? "";
+    if (!/^kontrol-.+\.service$/.test(base) || base === serviceName) continue;
+    members.push(base);
+  }
+  return members.sort();
+}
+
+/** Persistent enablement of pre-existing members: true/false when the query
+ * succeeds, null when enablement cannot be determined (fail toward
+ * re-enabling on rollback, since our members are meant to be enabled). */
+function snapshotMemberEnablement(units: string[], dependencies: ServiceCommandDependencies): Map<string, boolean | null> {
+  const enablement = new Map<string, boolean | null>();
+  for (const unit of units) enablement.set(unit, probeUnitEnabled(unit, dependencies));
+  return enablement;
+}
+
+function probeUnitEnabled(unit: string, dependencies: ServiceCommandDependencies): boolean | null {
+  if (dependencies.probeUnitEnabled) {
+    try {
+      return dependencies.probeUnitEnabled(unit);
+    } catch {
+      return null;
+    }
+  }
+  try {
+    const result = spawnSync("systemctl", ["--user", "is-enabled", unit], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const state = String(result.stdout ?? "").trim().toLowerCase();
+    if (/^(enabled|enabled-runtime|indirect)\b/.test(state)) return true;
+    if (/^(disabled|masked)\b/.test(state)) return false;
+    if (result.status !== 0 && /^(disabled|masked)\b/.test(state)) return false;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Stop a removed member while systemd still knows it; a unit that is
+ * already gone is not a failure. Unexpected errors propagate fail-closed. */
+function stopManagedUnit(paths: ServicePaths, unit: string, dependencies: ServiceCommandDependencies): void {
+  try {
+    systemctl(paths, ["stop", unit], dependencies);
+  } catch (error) {
+    if (/not loaded|could not be found|not-found|no such file/i.test(error instanceof Error ? error.message : String(error))) return;
+    throw error;
+  }
+}
+
+/** Drop a removed member's persistent enablement; missing units are not a
+ * failure. Unexpected errors propagate fail-closed. */
+function disableManagedUnit(paths: ServicePaths, unit: string, dependencies: ServiceCommandDependencies): void {
+  try {
+    systemctl(paths, ["disable", unit], dependencies);
+  } catch (error) {
+    if (/not loaded|could not be found|not-found|no such file/i.test(error instanceof Error ? error.message : String(error))) return;
+    throw error;
+  }
+}
+
+/** Stop obsolete members while systemd still knows them: this must run
+ * before their unit files are deleted, or their processes orphan. */
+function stopRemovedMembers(paths: ServicePaths, removed: string[], dependencies: ServiceCommandDependencies): void {
+  for (const unit of removed) stopManagedUnit(paths, unit, dependencies);
+}
+
+/** Drop obsolete members' persistent enablement after their files are gone
+ * so no reboot-persistent symlink survives a removal. */
+function disableRemovedMembers(paths: ServicePaths, removed: string[], dependencies: ServiceCommandDependencies): void {
+  for (const unit of removed) disableManagedUnit(paths, unit, dependencies);
+}
+
+/** Prove no obsolete managed member survived: removal must end in a
+ * stopped, disabled unit — never a live process behind a deleted file. */
+function verifyNoObsoleteSurvivors(removed: string[], dependencies: ServiceCommandDependencies): void {
+  const survivors = removed.filter((unit) => probeUnitActive(unit, dependencies));
+  if (survivors.length > 0) {
+    throw new Error(`removed members still active after stop: ${survivors.join(", ")}`);
+  }
+}
+
+/** Rollback-side enablement restore: every previously disabled member is
+ * disabled again, every previously enabled member is re-enabled, and
+ * candidate-added members are disabled. A prior state that could not be
+ * determined is conservatively re-enabled (members are meant to be
+ * enabled) but reported under `unresolved` — never silently claimed exact. */
+function restoreMemberEnablement(
+  paths: ServicePaths,
+  previousMembers: string[],
+  previousEnablement: Map<string, boolean | null>,
+  nextMembers: string[],
+  dependencies: ServiceCommandDependencies,
+): MemberEnablementRestore {
+  const summary: MemberEnablementRestore = { disabled: [], enabled: [], unresolved: [] };
+  for (const unit of nextMembers) {
+    if (previousMembers.includes(unit)) continue;
+    disableManagedUnit(paths, unit, dependencies);
+    summary.disabled.push(unit);
+  }
+  const disable: string[] = [];
+  const enable: string[] = [];
+  for (const unit of previousMembers) {
+    const prior = previousEnablement.get(unit);
+    if (prior === false) disable.push(unit);
+    else {
+      enable.push(unit);
+      if (prior !== true) summary.unresolved.push(unit);
+    }
+  }
+  for (const unit of disable) {
+    disableManagedUnit(paths, unit, dependencies);
+    summary.disabled.push(unit);
+  }
+  if (enable.length > 0) systemctl(paths, ["enable", ...enable], dependencies);
+  summary.enabled.push(...enable);
+  return summary;
 }
 
 export function readServiceBuild(artifactPath: string): ServiceBuild {
@@ -467,7 +758,7 @@ export function renderComponentServiceUnit(options: {
     "[Service]",
     "Type=simple",
     `WorkingDirectory=${systemdQuote(options.workingDirectory)}`,
-    `EnvironmentFile=-${systemdQuote(options.environmentFile)}`,
+    `EnvironmentFile=${systemdQuote(options.environmentFile)}`,
     `Environment=${systemdQuote(`KONTROL_LAUNCHER=systemd`)}`,
     `Environment=${systemdQuote(`KONTROL_EXPECTED_BUILD_ID=${options.buildId}`)}`,
     `ExecStart=/usr/bin/env ${execArgs}`,
@@ -481,11 +772,21 @@ export function renderComponentServiceUnit(options: {
   ].join("\n");
 }
 
-export function renderKontrolTargetUnit(): string {
+/**
+ * Render the aggregate target from the single lifecycle component manifest.
+ * Every member starts with the target (Wants) and stops with it (each
+ * member carries PartOf=kontrol.target); the core is additionally Required
+ * so a dead core fails the aggregate instead of reporting a healthy stack.
+ * Shutdown propagation relies on the members' PartOf, not on BindsTo here,
+ * so an auxiliary failure degrades the stack without killing the core.
+ */
+export function renderKontrolTargetUnit(memberUnits: string[], coreUnit: string): string {
+  const wanted = [...new Set([coreUnit, ...memberUnits])];
   return [
     "[Unit]",
     "Description=Kontrol control plane (core + configured adapters/tunnel)",
-    "Wants=kontrol-core.service",
+    `Wants=${wanted.join(" ")}`,
+    `Requires=${coreUnit}`,
     "",
     "[Install]",
     "WantedBy=default.target",
@@ -515,7 +816,7 @@ export function renderUserServiceUnit(options: {
     "[Service]",
     "Type=simple",
     `WorkingDirectory=${systemdQuote(options.workingDirectory)}`,
-    `EnvironmentFile=-${systemdQuote(options.environmentFile)}`,
+    `EnvironmentFile=${systemdQuote(options.environmentFile)}`,
     `Environment=${systemdQuote("KONTROL_LAUNCHER=systemd")}`,
     `Environment=${systemdQuote(`KONTROL_EXPECTED_BUILD_ID=${options.buildId}`)}`,
     `Environment=${systemdQuote(`KONTROL_EXPECTED_SCHEMA_VERSION=${options.schemaVersion}`)}`,
@@ -525,6 +826,10 @@ export function renderUserServiceUnit(options: {
     `Environment=${systemdQuote(`KONTROL_STATE_DIR=${options.stateDir}`)}`,
     `ExecStart=/usr/bin/env node ${systemdQuote(artifactCli)} serve`,
     "Restart=on-failure",
+    // Permanent configuration failures (schema/build incompatibility exits
+    // 78 via the CLI classifier) must not be retried: retrying burns the
+    // start budget and masks the operator action required.
+    `RestartPreventExitStatus=${SCHEMA_INCOMPATIBLE_EXIT_CODE}`,
     "RestartSec=5",
     "KillMode=control-group",
     "Nice=0",
@@ -574,7 +879,10 @@ function writeUnit(paths: ServicePaths, state: InstalledServiceState, components
       rmSync(componentTemp, { force: true });
     }
   }
-  const targetText = renderKontrolTargetUnit();
+  // The target graph is generated from the same lifecycle manifest both
+  // backends enumerate, so deployed units can never drift from the source.
+  const manifest = buildLifecycleManifest({ coreServiceName: paths.serviceName, components });
+  const targetText = renderKontrolTargetUnit(manifest.filter((c) => c.name !== "core").map((c) => c.systemdUnit), paths.serviceName);
   const targetTemp = `${join(configRoot, "kontrol.target")}.tmp-${process.pid}-${randomUUID()}`;
   try {
     writeFileSync(targetTemp, targetText, { mode: 0o644 });
@@ -604,8 +912,7 @@ function requireSystemd(dependencies: ServiceCommandDependencies): void {
 }
 
 async function waitForReady(paths: ServicePaths, expected: InstalledServiceState): Promise<void> {
-  const port = Number(process.env.PORT ?? 7676);
-  const endpoint = `http://127.0.0.1:${port}/core-readyz`;
+  const endpoint = `http://127.0.0.1:${readInstalledPort(paths)}/core-readyz`;
   for (let attempt = 0; attempt < 60; attempt += 1) {
     try {
       const response = await fetch(endpoint, { signal: AbortSignal.timeout(1_000) });
@@ -640,32 +947,245 @@ function makeRecord(deploymentId: string, operation: DeploymentRecord["operation
 async function install(paths: ServicePaths, dependencies: ServiceCommandDependencies, env: NodeJS.ProcessEnv = process.env): Promise<void> {
   requireSystemd(dependencies);
   await withDeploymentLock(paths, "install", async (_lock, deploymentId) => {
-    const current = copyRelease(paths, readServiceBuild(dependencies.currentArtifactPath?.() ?? compiledArtifactPath()));
-    const state = { ...current, deploymentId };
+    const build = readServiceBuild(dependencies.currentArtifactPath?.() ?? compiledArtifactPath());
     const components = readServiceComponents(env);
     requireTunnelReviewerWiring(components, env);
-    materializeTunnelReviewerSecret(components, env, paths.environmentFile);
-    const record = makeRecord(deploymentId, "install", undefined, state);
-    writeDeploymentRecord(paths, record);
-    writeUnit(paths, state, components);
-    systemctl(paths, ["daemon-reload"], dependencies);
-    updateDeploymentRecord(paths, record, { stage: "commit" });
+    // Pre-mutation gates first: candidate/database compatibility is decided
+    // before any byte changes. Only then may the environment file be
+    // touched, and its prior state is snapshotted so any later failure
+    // restores it byte-for-byte.
+    preflightCandidateAgainstLiveDatabase(paths, build);
+    const environmentSnapshot = snapshotFile(paths.environmentFile);
+    const unitSnapshot = snapshotUnitFiles(paths);
+    const previousMembers = previousMemberUnits(unitSnapshot, paths.serviceName);
+    const previousEnablement = snapshotMemberEnablement(previousMembers, dependencies);
+    const nextMembers = components.map((component) => componentServiceName(component.name));
+    const removedMembers = previousMembers.filter((unit) => !nextMembers.includes(unit));
+    try {
+      materializeTunnelReviewerSecret(components, env, paths.environmentFile);
+      requireServiceEnvironmentFile(paths);
+      const state = { ...copyRelease(paths, build), deploymentId };
+      const record = makeRecord(deploymentId, "install", undefined, state);
+      writeDeploymentRecord(paths, record);
+      try {
+        // Stop obsolete members while systemd still knows them; their files
+        // are deleted by writeUnit below.
+        stopRemovedMembers(paths, removedMembers, dependencies);
+        writeUnit(paths, state, components);
+        systemctl(paths, ["daemon-reload"], dependencies);
+        disableRemovedMembers(paths, removedMembers, dependencies);
+        updateDeploymentRecord(paths, record, { stage: "commit" });
+      } catch (error) {
+        // Best-effort cleanup of this install's own artifacts: the release
+        // copy is removed and units this install added are deleted, while
+        // pre-existing units are restored. The deployment journal keeps the
+        // failure for audit.
+        try {
+          rmSync(state.artifactPath, { recursive: true, force: true });
+        } catch {
+          // Leave the orphaned copy rather than masking the original error.
+        }
+        restoreUnitFiles(unitSnapshot);
+        removeUnitsAddedSince(unitSnapshot, dirname(paths.unitPath));
+        try {
+          const memberRestore = restoreMemberEnablement(paths, previousMembers, previousEnablement, nextMembers, dependencies);
+          if (memberRestore.unresolved.length > 0) {
+            throw new Error(`member enablement unresolved for: ${memberRestore.unresolved.join(", ")}`);
+          }
+        } catch (cleanupError) {
+          const reason = error instanceof Error ? error.message : String(error);
+          const cleanupReason = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+          throw new Error(`${reason}; member enablement restore also failed: ${cleanupReason}`);
+        }
+        throw error;
+      }
+    } catch (error) {
+      restoreFileSnapshot(paths.environmentFile, environmentSnapshot);
+      throw error;
+    }
   });
 }
 
-async function activate(paths: ServicePaths, operation: "start" | "stop" | "restart", dependencies: ServiceCommandDependencies): Promise<void> {
+async function activate(paths: ServicePaths, operation: "start" | "stop" | "restart", dependencies: ServiceCommandDependencies, env: NodeJS.ProcessEnv = process.env): Promise<void> {
   requireSystemd(dependencies);
   const installed = readInstalledState(paths);
   if (!installed) throw new Error(`No installed Kontrol service at ${paths.statePath}; run \`kontrol service install\` first.`);
   await withDeploymentLock(paths, operation, async (_lock, deploymentId) => {
     const record = makeRecord(deploymentId, operation, installed, installed);
     writeDeploymentRecord(paths, record);
-    if (operation === "start") systemctl(paths, ["enable", "--now", paths.serviceName], dependencies);
-    else if (operation === "stop") systemctl(paths, ["stop", paths.serviceName], dependencies);
-    else systemctl(paths, ["restart", paths.serviceName], dependencies);
-    if (operation !== "stop") await (dependencies.waitForReady?.(paths, installed) ?? waitForReady(paths, installed));
+    // All three operations address the aggregate target so the complete
+    // configured stack — core plus every configured auxiliary unit —
+    // starts and stops together, never just the core.
+    if (operation === "stop") {
+      systemctl(paths, ["stop", "kontrol.target"], dependencies);
+      const components = readServiceComponents(env);
+      verifyStackStopped(buildLifecycleManifest({ coreServiceName: paths.serviceName, components }), dependencies);
+    } else {
+      // Refuse to (re)start a build that cannot read the live database
+      // instead of launching another doomed start loop.
+      preflightCandidateAgainstLiveDatabase(paths, installed);
+      requireServiceEnvironmentFile(paths);
+      const components = readServiceComponents(env);
+      const manifest = buildLifecycleManifest({ coreServiceName: paths.serviceName, components });
+      // Persist every member so a reboot restores the same aggregate stack,
+      // then start the target; members are pulled up through Wants.
+      const members = manifest.map((c) => c.systemdUnit).filter((unit) => unit !== paths.serviceName);
+      if (members.length > 0) systemctl(paths, ["enable", ...members], dependencies);
+      if (operation === "start") systemctl(paths, ["enable", "--now", "kontrol.target"], dependencies);
+      else systemctl(paths, ["restart", "kontrol.target"], dependencies);
+      await (dependencies.waitForReady?.(paths, installed) ?? waitForReady(paths, installed));
+      verifyAuxiliariesActive(manifest, dependencies);
+    }
     updateDeploymentRecord(paths, record, { stage: "commit" });
   });
+}
+
+/**
+ * Active-state probe for one systemd unit. Injectable for hermetic tests;
+ * the default shells to `systemctl --user is-active --quiet`.
+ */
+function probeUnitActive(unit: string, dependencies: ServiceCommandDependencies): boolean {
+  if (dependencies.probeUnitActive) return dependencies.probeUnitActive(unit);
+  const result = spawnSync("systemctl", ["--user", "is-active", "--quiet", unit], { stdio: "ignore" });
+  return result.status === 0;
+}
+
+/** Units that must be quiet after a stack stop: every member plus the target. */
+function stackStopScope(manifest: { systemdUnit: string }[]): string[] {
+  return [...manifest.map((c) => c.systemdUnit), "kontrol.target"];
+}
+
+/** Throw when any owned unit survived a stack stop; success means gone. */
+function verifyStackStopped(manifest: { systemdUnit: string }[], dependencies: ServiceCommandDependencies): void {
+  const survivors = stackStopScope(manifest).filter((unit) => probeUnitActive(unit, dependencies));
+  if (survivors.length > 0) {
+    throw new Error(`stop did not fully shut down the owned stack; still active: ${survivors.join(", ")}`);
+  }
+}
+
+/**
+ * Throw when a required auxiliary failed to reach active state after a
+ * stack start. The core itself is verified separately by waitForReady;
+ * every other required member must be systemd-active here.
+ */
+function verifyAuxiliariesActive(
+  manifest: { name: string; systemdUnit: string; required: boolean }[],
+  dependencies: ServiceCommandDependencies,
+): void {
+  const missing = manifest
+    .filter((c) => c.name !== "core" && c.required && !probeUnitActive(c.systemdUnit, dependencies))
+    .map((c) => c.systemdUnit);
+  if (missing.length > 0) {
+    throw new Error(`required auxiliaries did not reach active state: ${missing.join(", ")}`);
+  }
+}
+
+export type UnitProbeState = "active" | "failed" | "inactive" | "unknown";
+
+/** Full unit-state probe; injectable for hermetic tests. */
+function defaultProbeUnit(unit: string): UnitProbeState {
+  if (spawnSync("systemctl", ["--user", "is-active", "--quiet", unit], { stdio: "ignore" }).status === 0) return "active";
+  if (spawnSync("systemctl", ["--user", "is-failed", "--quiet", unit], { stdio: "ignore" }).status === 0) return "failed";
+  const show = spawnSync("systemctl", ["--user", "show", "-p", "LoadState", "--value", unit], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  if (show.status === 0 && String(show.stdout ?? "").trim() === "loaded") return "inactive";
+  return "unknown";
+}
+
+export type InstalledPortSource = "configured" | "default-missing" | "default-malformed";
+
+export interface InstalledPort {
+  port: number;
+  source: InstalledPortSource;
+  /** Raw PORT assignment when present, for diagnostics (never a secret). */
+  raw?: string;
+}
+
+export const DEFAULT_SERVICE_PORT = 7676;
+
+/**
+ * Readiness probe port from the installed service environment, never from
+ * the invoking CLI process environment: the installed unit and the probe
+ * must agree on the port or readiness checks the wrong endpoint. The
+ * source is reported explicitly so callers never silently treat a
+ * malformed or missing PORT as a healthy configured value.
+ */
+export function describeInstalledPort(paths: ServicePaths): InstalledPort {
+  try {
+    for (const line of readFileSync(paths.environmentFile, "utf8").split("\n")) {
+      const match = line.match(/^\s*(?:export\s+)?PORT\s*=\s*"?([^"\s]+)"?\s*$/);
+      if (match) {
+        const port = Number(match[1]);
+        if (Number.isInteger(port) && port >= 1 && port <= 65535) {
+          return { port, source: "configured", raw: match[1] };
+        }
+        return { port: DEFAULT_SERVICE_PORT, source: "default-malformed", raw: match[1] };
+      }
+    }
+  } catch {
+    // Missing/unreadable environment falls back to the default port.
+  }
+  return { port: DEFAULT_SERVICE_PORT, source: "default-missing" };
+}
+
+/** Numeric port for readiness probes; see describeInstalledPort for provenance. */
+export function readInstalledPort(paths: ServicePaths): number {
+  return describeInstalledPort(paths).port;
+}
+
+/**
+ * Functional reachability check for one auxiliary component endpoint. A
+ * systemd-active unit that accepts no connections is degraded, not ready:
+ * this is the independent functional signal behind the aggregate verdict.
+ */
+function probeComponentEndpoint(_name: string, port: number, timeoutMs = 1500): Promise<{ reachable: boolean; detail?: string }> {
+  return new Promise((resolve) => {
+    const socket = createConnection({ host: "127.0.0.1", port, timeout: timeoutMs });
+    socket.once("connect", () => {
+      socket.destroy();
+      resolve({ reachable: true });
+    });
+    const fail = (detail: string) => {
+      socket.destroy();
+      resolve({ reachable: false, detail });
+    };
+    socket.once("timeout", () => fail("connection timed out"));
+    socket.once("error", (error) => fail(error instanceof Error ? error.message : String(error)));
+  });
+}
+
+/** Bounded core-readiness check against the installed endpoint + identity. */
+async function probeCoreReady(paths: ServicePaths, installed: InstalledServiceState): Promise<boolean> {
+  const endpoint = `http://127.0.0.1:${readInstalledPort(paths)}/core-readyz`;
+  try {
+    const response = await fetch(endpoint, { signal: AbortSignal.timeout(2_000) });
+    if (!response.ok) return false;
+    const body = (await response.json()) as { ok?: boolean };
+    if (body.ok !== true) return false;
+    const identity = readJson<{ buildId?: string; artifactPath?: string }>(join(paths.stateDir, "server.identity.json"));
+    return identity?.buildId === installed.buildId && identity?.artifactPath === installed.artifactPath;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Rebuild the previous component manifest from the unit snapshot so
+ * rollback verification checks exactly the units that were restored —
+ * even when the candidate added or removed component units.
+ */
+function manifestFromUnitSnapshot(paths: ServicePaths, unitSnapshot: Map<string, string | null>): { name: string; systemdUnit: string; required: boolean }[] {
+  const specs: { name: string; systemdUnit: string; required: boolean }[] = [{
+    name: "core",
+    systemdUnit: paths.serviceName,
+    required: true,
+  }];
+  for (const path of unitSnapshot.keys()) {
+    if (path === paths.unitPath || unitSnapshot.get(path) === null) continue;
+    const base = path.endsWith("/kontrol.target") || path === "kontrol.target" ? "kontrol.target" : path.split("/").at(-1) ?? "";
+    if (base === "kontrol.target" || !/^kontrol-.+\.service$/.test(base)) continue;
+    specs.push({ name: base.replace(/^kontrol-/, "").replace(/\.service$/, ""), systemdUnit: base, required: true });
+  }
+  return specs;
 }
 
 async function upgrade(paths: ServicePaths, dependencies: ServiceCommandDependencies, env: NodeJS.ProcessEnv = process.env): Promise<void> {
@@ -673,21 +1193,51 @@ async function upgrade(paths: ServicePaths, dependencies: ServiceCommandDependen
   const previous = readInstalledState(paths);
   if (!previous) throw new Error(`No installed Kontrol service at ${paths.statePath}; run \`kontrol service install\` first.`);
   await withDeploymentLock(paths, "upgrade", async (_lock, deploymentId) => {
-    const candidate = { ...copyRelease(paths, readServiceBuild(dependencies.currentArtifactPath?.() ?? compiledArtifactPath())), deploymentId };
+    const build = readServiceBuild(dependencies.currentArtifactPath?.() ?? compiledArtifactPath());
+    const upgradeComponents = readServiceComponents(env);
+    requireTunnelReviewerWiring(upgradeComponents, env);
+    // Gates before mutation: a rejected candidate leaves no trace.
+    preflightCandidateAgainstLiveDatabase(paths, build);
+    // Snapshots before mutation: unit files, installed state, the
+    // environment file, and member enablement are all restored on failure.
+    const unitSnapshot = snapshotUnitFiles(paths);
+    const environmentSnapshot = snapshotFile(paths.environmentFile);
+    const previousMembers = previousMemberUnits(unitSnapshot, paths.serviceName);
+    const previousEnablement = snapshotMemberEnablement(previousMembers, dependencies);
+    let candidate: InstalledServiceState;
+    try {
+      materializeTunnelReviewerSecret(upgradeComponents, env, paths.environmentFile);
+      requireServiceEnvironmentFile(paths);
+      candidate = { ...copyRelease(paths, build), deploymentId };
+    } catch (error) {
+      restoreFileSnapshot(paths.environmentFile, environmentSnapshot);
+      throw error;
+    }
+    const manifest = buildLifecycleManifest({ coreServiceName: paths.serviceName, components: upgradeComponents });
+    const members = manifest.map((c) => c.systemdUnit).filter((unit) => unit !== paths.serviceName);
+    const removedMembers = previousMembers.filter((unit) => !members.includes(unit));
     let record = makeRecord(deploymentId, "upgrade", previous, candidate);
     writeDeploymentRecord(paths, record);
     record = updateDeploymentRecord(paths, record, { stage: "prepared" });
-    const upgradeComponents = readServiceComponents(env);
-    requireTunnelReviewerWiring(upgradeComponents, env);
-    materializeTunnelReviewerSecret(upgradeComponents, env, paths.environmentFile);
-    writeUnit(paths, candidate, upgradeComponents);
-    systemctl(paths, ["daemon-reload"], dependencies);
     try {
+      // Reconcile the full configured stack: obsolete members are stopped
+      // while systemd still knows them, then added components gain units,
+      // removed ones lose their files and enablement, and everything new
+      // is enabled persistently before activation.
+      stopRemovedMembers(paths, removedMembers, dependencies);
+      writeUnit(paths, candidate, upgradeComponents);
+      systemctl(paths, ["daemon-reload"], dependencies);
+      disableRemovedMembers(paths, removedMembers, dependencies);
+      if (members.length > 0) systemctl(paths, ["enable", ...members], dependencies);
       record = updateDeploymentRecord(paths, record, { stage: "stop" });
-      systemctl(paths, ["stop", paths.serviceName], dependencies);
+      systemctl(paths, ["stop", "kontrol.target"], dependencies);
+      verifyStackStopped(manifest, dependencies);
+      // No obsolete managed member may survive: removal ends stopped.
+      verifyNoObsoleteSurvivors(removedMembers, dependencies);
       record = updateDeploymentRecord(paths, record, { stage: "activate" });
-      systemctl(paths, ["start", paths.serviceName], dependencies);
+      systemctl(paths, ["enable", "--now", "kontrol.target"], dependencies);
       await (dependencies.waitForReady?.(paths, candidate) ?? waitForReady(paths, candidate));
+      verifyAuxiliariesActive(manifest, dependencies);
       updateDeploymentRecord(paths, record, { stage: "commit" });
       return;
     } catch (error) {
@@ -695,8 +1245,9 @@ async function upgrade(paths: ServicePaths, dependencies: ServiceCommandDependen
       record = updateDeploymentRecord(paths, record, { stage: "rollback", error: reason });
       try {
         // Do not touch the live database until systemd confirms that the
-        // candidate process is stopped and no longer owns the runtime lock.
-        systemctl(paths, ["stop", paths.serviceName], dependencies);
+        // candidate stack is stopped and no longer owns the runtime lock.
+        systemctl(paths, ["stop", "kontrol.target"], dependencies);
+        verifyStackStopped(manifest, dependencies);
         const databaseRestore = restoreDeploymentDatabaseBackup({
           stateDir: paths.stateDir,
           deploymentId,
@@ -704,17 +1255,25 @@ async function upgrade(paths: ServicePaths, dependencies: ServiceCommandDependen
           expectedOriginalSchemaVersion: previous.schemaVersion,
         });
         record = updateDeploymentRecord(paths, record, { databaseRestore });
-        writeUnit(paths, previous, readServiceComponents(env));
+        restoreUnitFiles(unitSnapshot);
+        removeUnitsAddedSince(unitSnapshot, dirname(paths.unitPath));
+        restoreFileSnapshot(paths.environmentFile, environmentSnapshot);
+        // Restore prior membership and enablement: candidate-added members
+        // are disabled, restored members regain their exact prior state.
+        // Anything unresolvable is recorded in the journal, never silent.
+        const memberRestore = restoreMemberEnablement(paths, previousMembers, previousEnablement, members, dependencies);
+        record = updateDeploymentRecord(paths, record, { memberRestore });
         systemctl(paths, ["daemon-reload"], dependencies);
-        systemctl(paths, ["start", paths.serviceName], dependencies);
+        systemctl(paths, ["enable", "--now", "kontrol.target"], dependencies);
         await (dependencies.waitForReady?.(paths, previous) ?? waitForReady(paths, previous));
+        verifyAuxiliariesActive(manifestFromUnitSnapshot(paths, unitSnapshot), dependencies);
         updateDeploymentRecord(paths, record, { stage: "commit" });
       } catch (rollbackError) {
         const rollbackReason = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
         updateDeploymentRecord(paths, record, { stage: "rollback_failed", error: `${reason}; rollback: ${rollbackReason}` });
         throw new Error(`Candidate ${candidate.buildId} failed readiness and rollback was not verified: ${rollbackReason}`);
       }
-      throw new Error(`Candidate ${candidate.buildId} failed readiness; previous build ${previous.buildId} and database were restored.`);
+      throw new Error(`Candidate ${candidate.buildId} failed readiness; previous build ${previous.buildId} and database were restored (cause: ${reason}).`);
     }
   });
 }
@@ -744,6 +1303,116 @@ async function uninstall(paths: ServicePaths, dependencies: ServiceCommandDepend
   });
 }
 
+/**
+ * Authoritative aggregate verdict over the installed systemd stack. Unlike
+ * raw `systemctl status` text, this binds the installed build, the live
+ * process identity, the live database schema, and every required component
+ * into one verdict: READY, RUNNING, DEGRADED, BLOCKED, or STOPPED.
+ */
+async function runStatus(paths: ServicePaths, dependencies: ServiceCommandDependencies, env: NodeJS.ProcessEnv = process.env): Promise<void> {
+  const installed = readInstalledState(paths);
+  if (!installed) throw new Error(`No installed Kontrol service at ${paths.statePath}; run \`kontrol service install\` first.`);
+  // Unresolvable component configuration is a verdict, not a crash: the
+  // stack cannot be READY when its own membership is unknown.
+  let components: KontrolServiceComponent[];
+  try {
+    components = readServiceComponents(env);
+  } catch (error) {
+    console.log([
+      `kontrol service status: BLOCKED`,
+      `backend: systemd`,
+      `installed: build ${installed.buildId} (schema ${installed.schemaVersion}, max readable ${installed.maxReadableSchemaVersion}, content ${installed.contentSha256})`,
+      `reasons:`,
+      `  - configured components cannot be resolved: ${error instanceof Error ? error.message : String(error)}`,
+    ].join("\n"));
+    return;
+  }
+  const manifest = buildLifecycleManifest({ coreServiceName: paths.serviceName, components });
+  const probe = dependencies.probeUnit ?? defaultProbeUnit;
+  const states = new Map(manifest.map((c) => [c.name, probe(c.systemdUnit)]));
+  const inspection = inspectLiveDatabase(paths.stateDir);
+  const liveIdentity = readJson<{ buildId?: string; artifactPath?: string; generationId?: string }>(
+    join(paths.stateDir, "server.identity.json"),
+  );
+  const coreReady = await probeCoreReady(paths, installed);
+  const permanentFailures: string[] = [];
+  if (inspection.status === "unreadable") {
+    // An existing but uninspectable database blocks any compatibility
+    // claim: the gate cannot be skipped, so the stack cannot be READY.
+    permanentFailures.push(`live database cannot be inspected: ${inspection.reason}`);
+  } else if (inspection.status === "ok" && inspection.schemaVersion > installed.maxReadableSchemaVersion) {
+    permanentFailures.push(
+      `installed build ${installed.buildId} cannot read live database schema ${inspection.schemaVersion} (max ${installed.maxReadableSchemaVersion}); upgrade to a compatible candidate instead of restarting`,
+    );
+  }
+  const portDesc = describeInstalledPort(paths);
+  const portNote = portDesc.source === "configured"
+    ? `readiness port ${portDesc.port} (installed environment)`
+    : portDesc.source === "default-missing"
+      ? `readiness port ${portDesc.port} (default; no PORT in installed environment)`
+      : `readiness port ${portDesc.port} (default; installed PORT=${JSON.stringify(portDesc.raw ?? "")} is malformed)`;
+  // Entries bind systemd state with independent functional readiness: a
+  // systemd-active tunnel/adapter that accepts no connections counts as
+  // failed, so the aggregator degrades instead of reporting READY on a
+  // unit that merely exists. Qualification is evidence-explicit: a TCP
+  // connection proves transport liveness, not application protocol
+  // readiness, and components without a port are systemd-state only.
+  // Neither is silently represented as fully protocol-qualified.
+  const entries: ComponentLiveness[] = [];
+  const qualification = new Map<string, string>();
+  for (const c of manifest) {
+    const state = states.get(c.name) ?? "unknown";
+    let failed = state === "failed";
+    let detail = state === "failed" || state === "unknown" ? `systemd reports ${state}` : undefined;
+    if (c.name !== "core" && state === "active" && c.port !== undefined) {
+      const endpoint = dependencies.probeComponentEndpoint
+        ? await dependencies.probeComponentEndpoint(c.systemdUnit, c.port)
+        : await probeComponentEndpoint(c.systemdUnit, c.port);
+      if (!endpoint.reachable) {
+        failed = true;
+        detail = `systemd-active but not reachable on 127.0.0.1:${c.port} (${endpoint.detail ?? "no detail"})`;
+      } else {
+        qualification.set(c.name, `endpoint 127.0.0.1:${c.port} reachable (TCP transport only; application protocol not verified)`);
+      }
+    } else if (c.name !== "core" && state === "active" && c.port === undefined) {
+      qualification.set(c.name, "systemd state only; no functional probe configured");
+    }
+    entries.push({
+      name: c.name,
+      required: c.required,
+      active: state === "active",
+      failed,
+      ...(detail !== undefined ? { detail } : {}),
+    });
+  }
+  const aggregated = aggregateLifecycleStatus({ components: entries, coreReady, permanentFailures });
+  // A malformed PORT means the readiness probe may have checked the wrong
+  // endpoint: never report READY on that basis, surface it instead.
+  const verdict = aggregated.verdict === "READY" && portDesc.source === "default-malformed" ? "DEGRADED" : aggregated.verdict;
+  const reasons = verdict !== aggregated.verdict
+    ? [...aggregated.reasons, `installed PORT is malformed; readiness probed the default port and cannot vouch for the configured endpoint`]
+    : aggregated.reasons;
+  const lines = [
+    `kontrol service status: ${verdict}`,
+    `backend: systemd`,
+    `installed: build ${installed.buildId} (schema ${installed.schemaVersion}, max readable ${installed.maxReadableSchemaVersion}, content ${installed.contentSha256})`,
+    liveIdentity?.buildId
+      ? `live: build ${liveIdentity.buildId}${liveIdentity.buildId === installed.buildId ? "" : ` (DRIFT: installed is ${installed.buildId})`}`
+      : `live: no live core identity observed`,
+    `database schema: ${inspection.status === "ok" ? inspection.schemaVersion : inspection.status === "absent" ? "absent (fresh)" : `unreadable`}`,
+    portNote,
+    `components:`,
+    ...manifest.map((c) => {
+      const state = states.get(c.name) ?? "unknown";
+      const note = qualification.get(c.name);
+      return `  ${c.name} (${c.systemdUnit}): ${state}${note ? `, ${note}` : ""}`;
+    }),
+    `reasons:`,
+    ...reasons.map((reason) => `  - ${reason}`),
+  ];
+  console.log(lines.join("\n"));
+}
+
 export async function runServiceCommand(args: string[], env: NodeJS.ProcessEnv = process.env, dependencies: ServiceCommandDependencies = {}): Promise<void> {
   const [command] = args;
   const paths = servicePaths(env);
@@ -758,12 +1427,14 @@ export async function runServiceCommand(args: string[], env: NodeJS.ProcessEnv =
     const components = readServiceComponents(env);
     requireTunnelReviewerWiring(components, env);
     const unit = renderUserServiceUnit({ ...state, stateDir: paths.stateDir, environmentFile: paths.environmentFile, workingDirectory: paths.dataRoot });
+    const manifest = buildLifecycleManifest({ coreServiceName: paths.serviceName, components });
+    const targetMemberUnits = manifest.filter((c) => c.name !== "core").map((c) => c.systemdUnit);
     if (args.includes("--json")) {
       console.log(JSON.stringify({
         paths,
         build,
         unit,
-        target: renderKontrolTargetUnit(),
+        target: renderKontrolTargetUnit(targetMemberUnits, paths.serviceName),
         components: components.map((component) => ({
           name: component.name,
           kind: component.kind,
@@ -786,32 +1457,47 @@ export async function runServiceCommand(args: string[], env: NodeJS.ProcessEnv =
           workingDirectory: paths.dataRoot,
         }));
       }
-      process.stdout.write(renderKontrolTargetUnit());
+      process.stdout.write(renderKontrolTargetUnit(targetMemberUnits, paths.serviceName));
     }
     return;
   }
   if (args.length > 1) throw new Error(`Usage: kontrol service ${command ?? "install|start|stop|restart|upgrade|status|logs|uninstall"}`);
   if (command === "install") return install(paths, dependencies, env);
-  if (command === "start") return activate(paths, "start", dependencies);
-  if (command === "stop") return activate(paths, "stop", dependencies);
-  if (command === "restart") return activate(paths, "restart", dependencies);
+  if (command === "start") return activate(paths, "start", dependencies, env);
+  if (command === "stop") return activate(paths, "stop", dependencies, env);
+  if (command === "restart") return activate(paths, "restart", dependencies, env);
   if (command === "upgrade") return upgrade(paths, dependencies, env);
   if (command === "uninstall") return uninstall(paths, dependencies);
   if (command === "status") {
     requireSystemd(dependencies);
-    systemctl(paths, ["--no-pager", "status", paths.serviceName], dependencies);
-    // P1.9: configured auxiliary units are part of the production surface.
-    const components = readServiceComponents(env);
-    if (components.length > 0) {
-      systemctl(paths, ["--no-pager", "status", "kontrol.target", ...components.map((c) => componentServiceName(c.name))], dependencies);
+    await runStatus(paths, dependencies, env);
+    // Existing systemd detail passthrough: the authoritative verdict above
+    // never relies on systemd activity text alone, but operators still get
+    // the raw unit state for diagnosis. Best-effort: a missing or dead unit
+    // must not turn a reported verdict into a thrown error.
+    try {
+      systemctl(paths, ["--no-pager", "status", paths.serviceName], dependencies);
+      // P1.9: configured auxiliary units are part of the production surface.
+      const components = readServiceComponents(env);
+      if (components.length > 0) {
+        systemctl(paths, ["--no-pager", "status", "kontrol.target", ...components.map((c) => componentServiceName(c.name))], dependencies);
+      }
+    } catch (error) {
+      console.error(`note: systemd detail unavailable: ${error instanceof Error ? error.message : String(error)}`);
     }
     return;
   }
   if (command === "logs") {
     requireSystemd(dependencies);
-    const result = spawnSync("journalctl", ["--user", "--no-pager", "-f", "-u", paths.serviceName], { stdio: "inherit" });
+    // Aggregate the core plus every configured auxiliary unit so one
+    // command covers the whole stack instead of only the core journal.
+    const components = readServiceComponents(env);
+    const units = [paths.serviceName, ...components.map((c) => componentServiceName(c.name))];
+    const journalArgs = ["--user", "--no-pager", "-f"];
+    for (const unit of units) journalArgs.push("-u", unit);
+    const result = spawnSync("journalctl", journalArgs, { stdio: "inherit" });
     if (result.error) throw result.error;
-    if (result.status !== 0) throw new Error(`journalctl --user -u ${paths.serviceName} failed with status ${result.status ?? "unknown"}`);
+    if (result.status !== 0) throw new Error(`journalctl --user -f -u ${units.join(" -u ")} failed with status ${result.status ?? "unknown"}`);
     return;
   }
   throw new Error("Usage: kontrol service unit|install|start|stop|restart|upgrade|status|logs|uninstall");
