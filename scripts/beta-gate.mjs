@@ -119,6 +119,15 @@ const leasePath = `${receiptPath}.controller-lease.json`;
   }
 }
 
+// The gate's own controller lease lives next to the receipt by design (it
+// serializes concurrent gate runs). It is gate runtime state, never source,
+// so cleanliness probes exclude exactly the lease file this gate owns; any
+// other untracked or modified path still fails the check. Both the starting
+// and ending probes must apply it, or the gate fails itself by construction.
+const excludeGateOwnedLease = (entries) => entries.filter(
+  (entry) => entry.slice(3) !== relative(root, leasePath),
+);
+
 // A controller shutdown (SIGTERM/SIGINT) never strands a phase as "running":
 // in-flight work settles under the executor's own absolute deadline, new
 // dispatches are refused, and the receipt records "interrupted".
@@ -214,9 +223,7 @@ async function runEvidencePhase(id, command, args, evidence) {
 // serializes concurrent gate runs). It is gate runtime state, never source,
 // so the cleanliness probe excludes exactly the lease file this gate owns;
 // any other untracked or modified path still fails the check.
-const dirtyPaths = gitStatus().filter(
-  (entry) => entry.slice(3) !== relative(root, leasePath),
-);
+const dirtyPaths = excludeGateOwnedLease(gitStatus());
 const cleanPass = dirtyPaths.length === 0;
 receipt.source = {
   started: {
@@ -341,7 +348,7 @@ receipt.phases.push({
 });
 persist();
 
-const endingDirtyPaths = gitStatus();
+const endingDirtyPaths = excludeGateOwnedLease(gitStatus());
 const endingGitSha = gitSha();
 receipt.source.finished = {
   dirtyPaths: endingDirtyPaths,
