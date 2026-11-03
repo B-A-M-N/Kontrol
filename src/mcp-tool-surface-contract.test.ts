@@ -513,10 +513,10 @@ execFileSync("git", ["init", "-q"], { cwd: gitRoot });
 execFileSync("git", ["config", "user.name", gitFixtureIdentity.name], { cwd: gitRoot });
 execFileSync("git", ["config", "user.email", gitFixtureIdentity.email], { cwd: gitRoot });
 execFileSync("git", ["add", "README.md", "stable.txt", "empty.txt"], { cwd: gitRoot });
-execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: gitRoot });
+execFileSync("git", ["-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "init"], { cwd: gitRoot });
 writeFileSync(join(gitRoot, "README.md"), "updated tracked file contents\n");
 execFileSync("git", ["add", "README.md"], { cwd: gitRoot });
-execFileSync("git", ["commit", "-q", "-m", "update README"], { cwd: gitRoot });
+execFileSync("git", ["-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "update README"], { cwd: gitRoot });
 {
   await createMcpServerForGitFixture();
 }

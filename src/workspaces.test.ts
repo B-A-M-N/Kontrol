@@ -93,7 +93,7 @@ try {
   await git(gitRoot, ["config", "user.email", testGitEmail]);
   await git(gitRoot, ["config", "user.name", testGitName]);
   await git(gitRoot, ["add", "."]);
-  await git(gitRoot, ["commit", "-m", "Initial commit"]);
+  await git(gitRoot, ["-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial commit"]);
   await writeFile(join(gitRoot, "dirty.txt"), "not copied\n");
 
   const worktreeWorkspace = await registry.openWorkspace({
@@ -250,7 +250,7 @@ try {
     await git(repo, ["config", "user.email", testGitEmail]);
     await git(repo, ["config", "user.name", testGitName]);
     await git(repo, ["add", "."]);
-    await git(repo, ["commit", "-m", "Initial commit"]);
+    await git(repo, ["-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial commit"]);
   }));
   const capConfig = loadConfig({
     ...baseConfigEnv,
