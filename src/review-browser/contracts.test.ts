@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { hostname, tmpdir } from "node:os";
@@ -544,9 +545,67 @@ try {
   assert.equal(fastRetry.status, "accepted", "retry reconciles the exact prompt while the conversation is generating");
   assert.equal(fastGenerationCommands.filter((method) => method === "Input.dispatchMouseEvent").length, 3, "generation reconciliation does not send a duplicate");
 
-  const makeDispatcher = (driver: any, failPromptAcknowledgement = false) => {
+  // Partial-response observation captures recoverable visible assistant text
+  // bound to the exact attempt; it is evidence, never a verdict.
+  {
+    const scripted = (responses: Array<(expression: string) => unknown>) => ({
+      async send(method: string, params: Record<string, unknown> = {}) {
+        if (method !== "Runtime.evaluate") return {};
+        const expression = String(params.expression);
+        for (const respond of responses) {
+          const value = respond(expression);
+          if (value !== undefined) return { result: { value } };
+        }
+        return { result: { value: {} } };
+      },
+    });
+    const generatingCdp = scripted([
+      (expression) => expression.includes("location.href")
+        ? { status: "generation_active", url: canonical.url, key: canonical.key } : undefined,
+      (expression) => expression.includes("partial-assistant-text")
+        ? { attemptPresent: true, assistantCount: 1, lastText: "partial verdict text" } : undefined,
+    ]);
+    const generatingDriver = new ChatGptPageDriver(generatingCdp as unknown as CdpClient, pageTarget);
+    const generatingBaseline = { conversationKey: canonical.key, userMessageCount: 1, assistantMessageCount: 0, capturedAt: new Date().toISOString() };
+    const generatingObs = await generatingDriver.observePartialResponse(generatingBaseline, "attempt-partial");
+    assert.equal(generatingObs.state, "generating", "an active generation reports generating with its partial text");
+    assert.equal(generatingObs.textPrefix, "partial verdict text");
+    assert.equal(generatingObs.textSha256, createHash("sha256").update("partial verdict text").digest("hex"));
+    assert.equal(generatingObs.attemptPresent, true);
+
+    const longText = `x`.repeat(9000);
+    const truncatingCdp = scripted([
+      (expression) => expression.includes("location.href")
+        ? { status: "ready", url: canonical.url, key: canonical.key } : undefined,
+      (expression) => expression.includes("assistants:")
+        ? { assistants: 1, generating: false, attemptPresent: true } : undefined,
+      (expression) => expression.includes("partial-assistant-text")
+        ? { attemptPresent: true, assistantCount: 1, lastText: longText } : undefined,
+    ]);
+    const truncatingDriver = new ChatGptPageDriver(truncatingCdp as unknown as CdpClient, pageTarget);
+    const truncatingObs = await truncatingDriver.observePartialResponse(
+      { conversationKey: canonical.key, userMessageCount: 1, assistantMessageCount: 0, capturedAt: new Date().toISOString() }, "attempt-truncate");
+    assert.equal(truncatingObs.state, "finished", "a completed generation reports finished with its final text");
+    assert.equal(truncatingObs.textPrefix?.length, 4000, "partial text is bounded before persistence");
+    assert.equal(truncatingObs.textSha256, createHash("sha256").update(longText.slice(0, 4000)).digest("hex"),
+      "the digest covers exactly the persisted prefix");
+
+    const foreignCdp = scripted([
+      (expression) => expression.includes("location.href")
+        ? { status: "generation_active", url: canonical.url, key: canonical.key } : undefined,
+      (expression) => expression.includes("partial-assistant-text")
+        ? { attemptPresent: false, assistantCount: 2, lastText: "someone else's text" } : undefined,
+    ]);
+    const foreignDriver = new ChatGptPageDriver(foreignCdp as unknown as CdpClient, pageTarget);
+    const foreignObs = await foreignDriver.observePartialResponse(generatingBaseline, "attempt-mine");
+    assert.equal(foreignObs.state, "unknown", "text from another attempt is never attributed to this one");
+    assert.equal(foreignObs.textPrefix, undefined, "unattributed text is not captured");
+  }
+
+  const makeDispatcher = (driver: any, failPromptAcknowledgement = false, hooks: { onPartial?: (input: any) => { seq: number; changed: boolean; sha256: string }; renewLease?: () => string; observeIntervalMs?: number; generationDeadlineMs?: number } = {}) => {
     let claimed = false;
     const transitions: string[] = [];
+    const partials: Array<{ textPrefix?: string }> = [];
     let failed = false;
     let completed = false;
     const claim = {
@@ -559,6 +618,8 @@ try {
     const event = { id: "event-shutdown", aggregateId: "message-shutdown", payload: { messageId: "message-shutdown", threadId: "thread-shutdown", profileId: "reviewer-shutdown" }, status: "claimed", claimToken: "token", claimedBy: "worker" };
     const dispatcher = createReviewerTurnDispatcher({
       drainTimeoutMs: 20,
+      observeIntervalMs: hooks.observeIntervalMs,
+      generationDeadlineMs: hooks.generationDeadlineMs,
       outbox: {
         subscribe: () => () => undefined,
         reapExpiredClaims: () => 0,
@@ -575,7 +636,11 @@ try {
           if (failPromptAcknowledgement && input.nextStatus === "prompt_accepted") throw new Error("simulated durable acknowledgement failure after host acceptance");
           return {};
         },
-        renewLease: () => new Date(Date.now() + 60_000).toISOString(),
+        renewLease: () => hooks.renewLease?.() ?? new Date(Date.now() + 60_000).toISOString(),
+        recordPartialObservation: (input: any) => {
+          partials.push({ textPrefix: input.textPrefix });
+          return hooks.onPartial?.(input) ?? { seq: partials.length, changed: true, sha256: input.textSha256 };
+        },
         reconcileExpiredAttempts: () => ({ reconciled: 0, uncertain: 0, fenced: 0 }),
       } as any,
       browser: {
@@ -584,7 +649,7 @@ try {
         restoreThread: async () => ({ target: pageTarget, driver }),
       } as any,
     });
-    return { dispatcher, transitions, wasFailed: () => failed, wasCompleted: () => completed };
+    return { dispatcher, transitions, partials, wasFailed: () => failed, wasCompleted: () => completed };
   };
 
   let releaseBaseline!: (value: TurnBaseline) => void;
@@ -629,6 +694,46 @@ try {
   assert.equal(acceptedThenAckFailed.transitions.at(-1), "uncertain", "a lost durable acknowledgement after host acceptance keeps the send boundary uncertain");
   assert.equal(acceptedThenAckFailed.wasCompleted(), true, "the accepted prompt's outbox item is fenced against redelivery after acknowledgement failure");
   await acceptedThenAckFailed.dispatcher.stopAndDrain();
+
+  // Supervised generation: partial observations persist while the prompt is
+  // sent exactly once; a fenced observation store stops supervision without
+  // failing the logical wait or resending.
+  {
+    const script = [
+      { state: "generating" },
+      { state: "generating", textPrefix: "draft answer", textSha256: createHash("sha256").update("draft answer").digest("hex") },
+      { state: "finished", textPrefix: "final answer", textSha256: createHash("sha256").update("final answer").digest("hex") },
+    ];
+    let submits = 0;
+    const supervised = makeDispatcher({
+      captureBaseline: async () => ({ conversationKey: canonical.key, userMessageCount: 0, assistantMessageCount: 0, capturedAt: new Date().toISOString() }),
+      submitPrompt: async () => { submits += 1; return { status: "accepted", submittedAt: new Date().toISOString(), conversationKey: canonical.key }; },
+      observePartialResponse: async () => script.shift() ?? { state: "finished" },
+    }, false, { observeIntervalMs: 5, generationDeadlineMs: 5_000 });
+    supervised.dispatcher.start();
+    await supervised.dispatcher.drainOnce();
+    await supervised.dispatcher.stopAndDrain();
+    assert.equal(submits, 1, "supervision never resends an accepted prompt");
+    assert.deepEqual(supervised.transitions.slice(0, 4), ["browser_ready", "dispatching", "prompt_accepted", "model_generating"],
+      "a healthy generation walks the normal presentation states");
+    assert.ok(supervised.transitions.includes("generation_finished"), "observed completion settles through the normal feedback pathway");
+    assert.ok(supervised.partials.some((entry) => entry.textPrefix === "draft answer"), "growing partial text is persisted during generation");
+    assert.ok(supervised.partials.some((entry) => entry.textPrefix === "final answer"), "final text is persisted on completion");
+  }
+  {
+    let submits = 0;
+    const fenced = makeDispatcher({
+      captureBaseline: async () => ({ conversationKey: canonical.key, userMessageCount: 0, assistantMessageCount: 0, capturedAt: new Date().toISOString() }),
+      submitPrompt: async () => { submits += 1; return { status: "accepted", submittedAt: new Date().toISOString(), conversationKey: canonical.key }; },
+      observePartialResponse: async () => ({ state: "generating", textPrefix: "orphaned", textSha256: createHash("sha256").update("orphaned").digest("hex") }),
+    }, false, { onPartial: () => { throw new Error("lease lost to the reconciler"); }, observeIntervalMs: 5, generationDeadlineMs: 5_000 });
+    fenced.dispatcher.start();
+    await fenced.dispatcher.drainOnce();
+    await fenced.dispatcher.stopAndDrain();
+    assert.equal(submits, 1, "a fenced observation store never triggers a duplicate send");
+    assert.ok(!fenced.transitions.includes("generation_finished"), "a fenced attempt is not settled as finished");
+    assert.equal(fenced.wasFailed(), false, "fencing is not terminal failure: the reconciler owns the attempt now");
+  }
 
   {
     const event = { id: "event-auth-handoff", aggregateId: "message-auth-handoff", payload: { messageId: "message-auth-handoff", threadId: "thread-auth-handoff", profileId: "profile-auth-handoff" }, status: "claimed", claimToken: "token", claimedBy: "worker" };
@@ -766,6 +871,7 @@ try {
           conversationFingerprint: "f".repeat(64), bindingRevision: 1, promptPayloadSha256: "a".repeat(64), prompt: "review",
         }),
         transition: () => ({}), renewLease: () => new Date(Date.now() + 60_000).toISOString(),
+        recordPartialObservation: () => ({ seq: 1, changed: true, sha256: "b".repeat(64) }),
         reconcileExpiredAttempts: () => ({ reconciled: 0, uncertain: 0, fenced: 0 }),
       } as any,
       browser: {
@@ -782,7 +888,12 @@ try {
                 return { conversationKey, userMessageCount: 0, assistantMessageCount: 0, capturedAt: new Date().toISOString() };
               },
               submitPrompt: async () => ({ status: "accepted", submittedAt: new Date().toISOString(), conversationKey }),
-              waitForGeneration: async () => "finished",
+              observePartialResponse: async () => ({
+                state: "finished", assistantMessageCount: 1, attemptPresent: true,
+                textPrefix: "parallel verdict",
+                textSha256: createHash("sha256").update("parallel verdict").digest("hex"),
+                capturedAt: new Date().toISOString(),
+              }),
             },
           };
         },

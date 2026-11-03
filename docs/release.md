@@ -58,16 +58,25 @@ enforces it mechanically inside the publish path:
    Writes `beta-code-qualification.json`.
 3. **Exact candidate** — the immutable build identity (`buildId`,
    content SHA, source SHA, dependency fingerprint) produced by that commit.
-4. **12-hour wall-clock soak against that exact `buildId`** —
-   `npm run soak:beta -- --hours 12 --build-id <buildId> ...`. Never rebuild
-   between soak and publish: the soak qualifies one immutable artifact. The
-   runner also performs recurring dual-session GET/POST SSE probes and checks
-   actual heartbeat bytes plus server-side completion accounting. An HTTPS
-   `--url` exercises the deployed HTTPS origin; with OpenAI Secure MCP Tunnel,
-   use the loopback HTTP origin and treat tunnel-client readiness as the
-   separate outbound HTTPS observation. That local probe does not stand in for
-   a fresh connected-host catalog receipt.
-5. **External catalog observation** — if the connected host supplies a genuine
+4. **12-hour deployed uptime receipt** — deploy the exact immutable candidate
+   and let the scheduled Deployment uptime qualification workflow observe it.
+   The workflow checks the active systemd service, live server and launcher
+   process identities, the runtime lock, exact installed artifact metadata,
+   `/core-readyz`, and `/readyz`. The same process generation must remain up for
+   at least 12 hours. It then creates a GitHub-attested receipt. A restart
+   changes the generation and starts the 12-hour window again. This is
+   retrospective: CI checks the recorded start time and does not occupy a
+   runner for 12 hours.
+5. **Continuity workload** — run `npm run soak:beta -- --hours <N> --build-id
+   <buildId> ...` against that same deployed candidate. This exercises MCP,
+   process, approval, SSE, recovery, and bounded-admission behavior; its
+   duration is independent of the 12-hour uptime requirement. Never rebuild
+   between these checks and publication. An HTTPS `--url` exercises the
+   deployed HTTPS origin; with OpenAI Secure MCP Tunnel, use the loopback HTTP
+   origin and treat tunnel-client readiness as the separate outbound HTTPS
+   observation. That local probe does not stand in for a fresh connected-host
+   catalog receipt.
+6. **External catalog observation** — if the connected host supplies a genuine
    registry producer, capture its `initialize`, server `tools/list`, callable
    catalog, and acknowledgement (including the matching `captureId`) on one
    session during the candidate soak, then run
@@ -97,15 +106,19 @@ enforces it mechanically inside the publish path:
    Secure Tunnel operation record verifies Kontrol's local response. The
    operator-reported HTTPS tunnel observation remains a separate, unverified
    host-facing transport fact.
-6. **Final joined receipt** — `npm run gate:beta:final` writes
+7. **Final joined receipt** — `npm run gate:beta:final` writes
    `beta-qualification.json` with `stage=combined, qualified=true` only when
-   code receipt, soak receipt, external catalog receipt, candidate identity,
-   and clean checkout all match and the host registration evidence is
-   independently verified. Server refresh notifications are not proof that
-   the host refreshed its internal catalog.
-7. **Release verification** — `npm run release:verify` (receipt ↔ buildId ↔
+   the code receipt, continuity workload, fresh deployment uptime receipt,
+   external catalog receipt, candidate identity, and clean checkout all match
+   and host registration evidence is independently verified. Set
+   `KONTROL_BETA_DEPLOYMENT_UPTIME_RECEIPT` to the downloaded CI receipt when it
+   is not at the default path. Server refresh notifications are not proof that
+   the host refreshed its internal catalog. The release workflow independently
+   rechecks the exact live build and verifies the receipt attestation before
+   staging or publishing.
+8. **Release verification** — `npm run release:verify` (receipt ↔ buildId ↔
    source SHA ↔ artifact, release-local import validation, clean checkout).
-8. **Staged package UAT** — the packed tarball installed into a clean prefix
+9. **Staged package UAT** — the packed tarball installed into a clean prefix
    and exercised end-to-end (`npm run test:package`,
    `scripts/release-uat.mjs`).
 
@@ -116,8 +129,8 @@ enforces it mechanically inside the publish path:
 git status --porcelain   # must be empty
 npm run gate:beta:code
 
-# 3–4. deploy the EXACT immutable buildId and soak it
-npm run soak:beta -- --hours 12 --url "$KONTROL_PUBLIC_BASE_URL" --workspace-path "$PWD" --build-id <buildId> \
+# 3–5. deploy the exact buildId, wait for the CI uptime receipt, then run the continuity workload
+npm run soak:beta -- --hours 1 --url "$KONTROL_PUBLIC_BASE_URL" --workspace-path "$PWD" --build-id <buildId> \
   --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" \
   --tunnel-url http://127.0.0.1:8080
 

@@ -1757,6 +1757,33 @@ try {
       processSessionId: "proc_reviewer_observe",
     });
     assert.ok(workerPtyObservation.isError, "PTY output observation is reviewer-only");
+    config.reviewBrowserJobs!.getActiveForThread = () => undefined;
+    (config.reviewBrowserJobs as any).getTerminalOutcome = (input: { reviewThreadId: string }) => input.reviewThreadId === deliveryThread.id ? {
+      attemptId: "browser-turn-terminal", classification: "reviewer_unrecoverable", reasonCode: "authentication_unrecoverable",
+      evidenceSha256: "c".repeat(64), reviewerPrincipalId: "snapshot-reviewer", routeEpoch: deliveryRoute.routeEpoch,
+      createdAt: "2026-10-26T12:02:00.000Z", attemptState: "failed", attemptErrorCode: "reviewer_unrecoverable",
+      lastProgressAt: "2026-10-26T12:01:58.000Z", partialSeq: 2, partialSha256: "d".repeat(64),
+      partialComplete: false, partialPrefix: "partial verdict draft", partialCapturedAt: "2026-10-26T12:01:58.000Z",
+    } : undefined;
+    const terminalSnapshot = await callReviewer("get_work_session_snapshot", { sessionId });
+    assert.ok(!terminalSnapshot.isError, "work-session snapshot rehydrates with a terminal outcome");
+    assert.equal(terminalSnapshot.structuredContent.reviewLoop.browserAttempt, undefined,
+      "a terminal attempt releases the active browser-turn projection");
+    const terminalOutcome = terminalSnapshot.structuredContent.reviewLoop.terminalOutcome;
+    assert.equal(terminalOutcome.classification, "reviewer_unrecoverable");
+    assert.equal(terminalOutcome.reasonCode, "authentication_unrecoverable");
+    assert.equal(terminalOutcome.partial.authority, "unverified_partial",
+      "preserved partial text is marked unverified, never a verdict");
+    assert.equal(terminalOutcome.partial.complete, false);
+    assert.equal(terminalOutcome.partial.prefix, "partial verdict draft");
+    assert.match(terminalOutcome.guidance, /await operator decision/i,
+      "a terminal outcome tells the worker to await the operator, not to resend");
+    config.reviewBrowserJobs!.getActiveForThread = (threadId: string) => threadId === deliveryThread.id ? ({
+      id: "browser-turn-snapshot", status: "awaiting_feedback", attemptNumber: 2,
+      promptSubmittedAt: "2026-10-26T12:01:00.000Z", generationStartedAt: "2026-10-26T12:01:01.000Z",
+      generationFinishedAt: "2026-10-26T12:01:02.000Z",
+    } as any) : undefined;
+    delete (config.reviewBrowserJobs as any).getTerminalOutcome;
     ptyObservationSessionId = undefined;
     const surface = await callReviewer("get_workspace_session_surface", { workspaceId: WS });
     assert.ok(!surface.isError, "workspace session surface reads through the shared snapshot path");

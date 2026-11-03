@@ -74,3 +74,24 @@ await callServerToolChecked({ name: "get_workspace_session_surface", arguments: 
 obsoleteCalls += 1;
 assert.equal(obsoleteCalls, 1);
 assert.equal(obsoleteReconnects, 0, "an obsolete App failure cannot trigger a second transport replacement");
+
+// P1.3: a replacement-App delivery that the server rejected must reject,
+// not return an apparent success with missing structured content.
+const rejectingReplacement = {
+  name: "rejecting-replacement",
+  async callServerTool() {
+    return { isError: true, content: [{ type: "text", text: "Forbidden: reviewer only" }] };
+  },
+};
+current = {
+  name: "obsolete-rejected",
+  async callServerTool() {
+    current = rejectingReplacement as any;
+    throw new Error("socket hang up from obsolete App");
+  },
+};
+await assert.rejects(
+  callServerToolChecked({ name: "get_workspace_session_surface", arguments: {} }),
+  /Forbidden: reviewer only/,
+  "a server-rejected replacement delivery must throw McpToolError, not resolve",
+);

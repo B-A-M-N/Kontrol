@@ -35,6 +35,10 @@ assert.match(
   /if ! start_beta_soak_monitor; then[\s\S]*--qualify did not start the soak monitor; qualification is not running[\s\S]*exit 1\n\s+fi/,
   "qualification mode must fail when it cannot start the soak monitor",
 );
+assert.match(script, /KONTROL_BETA_SOAK_HOURS:-1/,
+  "the continuity workload defaults to a short run instead of consuming the 12-hour uptime window");
+assert.match(script, /String\(Math\.max\(requested, minimum\)\)/,
+  "the soak runner must honor its configured duration without a hard-coded 12-hour floor");
 assert.match(script, /scripts\/kontrol-tunnel\.sh/);
 const tunnelScript = readText("scripts/kontrol-tunnel.sh");
 assert.match(tunnelScript, /KONTROL_TUNNEL_PROFILE/);
@@ -134,5 +138,79 @@ assert.match(readinessProbe, /readOnlyInspection: true/,
 assert.match(readinessProbe, /inputSchema\?\.properties\?\.readOnlyInspection/,
   "readiness must reject a stale Bash tool schema without read-only inspection support");
 assert.match(readFileSync("restart-kontrol.sh", "utf8"), /node|start-all/);
+
+// P0.1: the tunnel reviewer-secret guard is behavioral. An ask-capable
+// tunnel must refuse to start without a reviewer credential, while a
+// non-interactive policy must start without one. A regex asserting the
+// script contains the guard cannot catch an inverted conditional.
+function runTunnelArgs(envOverrides) {
+  const dir = mkdtempSync(join(tmpdir(), "kontrol-tunnel-guard-"));
+  const envFile = join(dir, "empty.env");
+  writeFileSync(envFile, "");
+  try {
+    const stdout = execFileSync("bash", ["scripts/kontrol-tunnel.sh", "--print-effective-args"], {
+      encoding: "utf8",
+      env: {
+        PATH: process.env.PATH,
+        HOME: process.env.HOME,
+        KONTROL_ENV_FILE: envFile,
+        KONTROL_CONFIG_DIR: dir,
+        KONTROL_AUTH_MODE: "tunnel",
+        KONTROL_HARPOON_INCLUDE_LOOPBACK: "false",
+        ...envOverrides,
+      },
+    });
+    return { ok: true, stdout };
+  } catch (error) {
+    return { ok: false, stderr: String(error.stderr ?? error.message) };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+{
+  const withSecret = runTunnelArgs({ KONTROL_POLICY_MODE: "ask", KONTROL_TUNNEL_REVIEWER_SECRET: "guard-test-secret" });
+  assert.equal(withSecret.ok, true, "ask-capable tunnel with a reviewer secret must start");
+  assert.ok(withSecret.stdout.includes("X-Kontrol-Tunnel-Reviewer"), "started tunnel must forward the reviewer assertion");
+
+  const askWithoutSecret = runTunnelArgs({ KONTROL_POLICY_MODE: "ask" });
+  assert.equal(askWithoutSecret.ok, false, "ask-capable tunnel without a reviewer secret must refuse startup");
+  assert.match(askWithoutSecret.stderr, /reviewer credential/, "refusal must name the missing reviewer credential");
+
+  const nonInteractive = runTunnelArgs({ KONTROL_POLICY_MODE: "allow" });
+  assert.equal(nonInteractive.ok, true, "non-interactive policy must start without a reviewer credential");
+  assert.ok(!nonInteractive.stdout.includes("X-Kontrol-Tunnel-Reviewer"), "no reviewer assertion without a configured secret");
+}
+{
+  // P0.2: the reviewer credential resolves from the dedicated variable, the
+  // legacy ACP secret, or the 0600 auth file — and the asserted header always
+  // names the dedicated variable (the server's first-precedence credential).
+  const dedicatedOnly = runTunnelArgs({ KONTROL_POLICY_MODE: "ask", KONTROL_TUNNEL_REVIEWER_SECRET: "dedicated-secret" });
+  assert.equal(dedicatedOnly.ok, true, "dedicated tunnel secret must start an ask-capable tunnel");
+  assert.ok(dedicatedOnly.stdout.includes("env:KONTROL_TUNNEL_REVIEWER_SECRET"), "header must reference the dedicated variable");
+  const bothDifferent = runTunnelArgs({
+    KONTROL_POLICY_MODE: "ask",
+    KONTROL_TUNNEL_REVIEWER_SECRET: "dedicated-secret",
+    KONTROL_ACP_REVIEWER_SECRET: "legacy-secret",
+  });
+  assert.equal(bothDifferent.ok, true, "tunnel must start when both secrets are set");
+  assert.ok(bothDifferent.stdout.includes("env:KONTROL_TUNNEL_REVIEWER_SECRET"), "header must follow server precedence (dedicated first)");
+  assert.ok(!bothDifferent.stdout.includes("env:KONTROL_ACP_REVIEWER_SECRET"), "header must not reference the losing credential");
+}
+{
+  // P0.2: auth-file-only deployment. The launcher must resolve the reviewer
+  // secret from the 0600 auth file instead of assuming a legacy variable.
+  const dir = mkdtempSync(join(tmpdir(), "kontrol-tunnel-authfile-"));
+  const envFile = join(dir, "empty.env");
+  writeFileSync(envFile, "");
+  writeFileSync(join(dir, "auth.json"), JSON.stringify({ tunnelReviewerSecret: "auth-file-secret" }));
+  let result;
+  try {
+    result = runTunnelArgs({ KONTROL_POLICY_MODE: "ask", KONTROL_CONFIG_DIR: dir });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  assert.equal(result.ok, true, "auth-file reviewer secret must satisfy the ask-capable guard");
+  assert.ok(result.stdout.includes("env:KONTROL_TUNNEL_REVIEWER_SECRET"), "header must reference the dedicated variable");
+}
 
 console.log("start-all.test.mjs: all assertions passed");

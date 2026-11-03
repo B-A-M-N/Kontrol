@@ -714,10 +714,19 @@ Current implementation contracts:
   `beta-qualification.json`. `npm run gate:beta` is the one-shot equivalent
   that runs the code stage and requires matching soak and external catalog
   receipts.
-  The canonical gate enforces a 12-hour minimum (an environment override may
-  only require longer). End-state SHA/cleanliness and candidate identity must
-  still match. `--allow-dirty` is an evidence-collection override only: a
-  dirty checkout can never produce a qualified receipt. The accelerated
+  The canonical gate enforces a 12-hour minimum on the deployment-uptime
+  receipt (`deploymentUptimeQualified`: same generation, timestamps, and live
+  checks over at least 12 hours; an environment override may only require
+  longer). The continuity workload duration itself (`--hours N`, recorded as
+  `requestedHours`) is operator-chosen and is validated only for window sanity
+  (`soakWindowValid`: finished at/after started) plus the complete required
+  assertion set — a short workload plus a qualifying 12-hour uptime receipt is
+  the designed combination, not a masquerading probe (`beta-gate-final.test.mjs`
+  pins a 2-hour workload as `soakWindowValid: true` with the 12-hour floor
+  carried by `deploymentUptimeQualified`). End-state SHA/cleanliness and
+  candidate identity must still match. `--allow-dirty` is an
+  evidence-collection override only: a dirty checkout can never produce a
+  qualified receipt. The accelerated
   lifecycle checks do not replace the required multi-hour operational soak.
 - `npm run soak:beta -- --hours 12` is the explicit real wall-clock soak
   command. It opens and closes fresh MCP transports, exercises liveness,
@@ -850,6 +859,14 @@ MCP context isolation:
   events and keep a bounded registry-status fallback for missed or older event
   paths. They do not poll the registry at a fixed two-second cadence for the
   full submit timeout.
+- Every audit produces a disposition for each material finding: `FIXED`,
+  `VERIFIED NON-ISSUE`, `ACCEPTED RISK`, `DEFERRED`, or `BLOCKED`. A fix is
+  not complete until independently verified — the author of a fix never
+  verifies it; verification re-runs the failing evidence (a reproduction,
+  a failing test, a live probe) through an independent path and quotes the
+  observed result. Audit stages advance in order only when no unresolved
+  finding invalidates the next stage: a `BLOCKED` or unverified `FIXED`
+  finding gates every later stage that depends on it.
 
 ## Peer integration (M1+M2, opt-in)
 

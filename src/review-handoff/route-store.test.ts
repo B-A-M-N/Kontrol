@@ -168,6 +168,90 @@ try {
   assert.throws(() => threads.activate({ activationSecret: pendingGrant.activationSecret, principalId: "user-b", contextId: "replacement-context" }), /invalid|stale|expired/i,
     "disabling revokes unused reviewer activation grants");
 
+  // ── Budget lock: changing maxReviewRounds starts a new loop generation.
+  //    The budget is immutable within an epoch; the old thread closes and the
+  //    next handoff opens a fresh thread carrying the new budget.
+  {
+    db.sqlite.prepare("insert into workspace_sessions (id, root, status, mode, managed, created_at, last_used_at) values (?, '/tmp', 'active', 'checkout', 'false', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')").run("ws-route-budget");
+    db.sqlite.prepare("insert into work_sessions (id, workspace_session_id, submitted_by, status, created_at, updated_at) values ('wsess-budget', 'ws-route-budget', 'tester', 'in_progress', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')").run();
+    const first = routes.configure({
+      workSessionId: "wsess-budget", ownerPrincipalId: "user-a", ownerContextId: "owner-a",
+      enabled: true, mode: "isolated_review", maxReviewRounds: 2,
+    });
+    routes.createHandoff({
+      routeId: first.id, workSessionId: "wsess-budget", submissionId: "bsub-1",
+      reviewEpoch: 1, snapshotKind: "git", snapshotRef: "bref-1", diffSha256: "bhash-1", roundNumber: 1,
+    });
+    const oldThread = threads.getForRoute(first.id, first.routeEpoch)!;
+    assert.ok(oldThread, "first epoch owns a reviewer thread");
+    const relocked = routes.configure({
+      workSessionId: "wsess-budget", ownerPrincipalId: "user-a", ownerContextId: "owner-a",
+      enabled: true, mode: "isolated_review", maxReviewRounds: 4,
+    });
+    assert.equal(relocked.routeEpoch, first.routeEpoch + 1, "a budget change advances the loop generation");
+    assert.equal(relocked.maxReviewRounds, 4);
+    assert.equal(threads.getById(oldThread.id)?.status, "closed", "a budget change closes the prior generation thread");
+    assert.equal(relocked.admittedReviewRounds, 1, "admitted history survives the generation change");
+    routes.createHandoff({
+      routeId: relocked.id, workSessionId: "wsess-budget", submissionId: "bsub-2",
+      reviewEpoch: 2, snapshotKind: "git", snapshotRef: "bref-2", diffSha256: "bhash-2", roundNumber: 2,
+    });
+    const nextThread = threads.getForRoute(relocked.id, relocked.routeEpoch)!;
+    assert.ok(nextThread && nextThread.id !== oldThread.id, "the new generation opens a fresh reviewer thread");
+    assert.equal(nextThread.maxRounds, 4, "the fresh thread carries the new generation budget");
+    // Same-value reconfiguration stays in place: no spurious generation.
+    // (Re-read the revision: the intervening handoff admission bumped it.)
+    const same = routes.configure({
+      workSessionId: "wsess-budget", ownerPrincipalId: "user-a", ownerContextId: "owner-a",
+      enabled: true, mode: "isolated_review", maxReviewRounds: 4,
+      expectedRevision: routes.getRouteBySession("wsess-budget")!.revision,
+    });
+    assert.equal(same.routeEpoch, relocked.routeEpoch, "repeating the same budget does not advance the generation");
+  }
+
+  // ── Skill provenance: the budget records which skill configuration set it.
+  //    Changing provenance opens a fresh generation like a budget change.
+  {
+    db.sqlite.prepare("insert into workspace_sessions (id, root, status, mode, managed, created_at, last_used_at) values (?, '/tmp', 'active', 'checkout', 'false', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')").run("ws-route-prov");
+    db.sqlite.prepare("insert into work_sessions (id, workspace_session_id, submitted_by, status, created_at, updated_at) values ('wsess-prov', 'ws-route-prov', 'tester', 'in_progress', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')").run();
+    const prov = routes.configure({
+      workSessionId: "wsess-prov", ownerPrincipalId: "user-a", ownerContextId: "owner-a",
+      enabled: true, mode: "isolated_review", maxReviewRounds: 3,
+      skillId: "nelson-wiggum-loop", skillVersion: "0.2.0", skillConfigSha256: "a".repeat(64),
+    } as Parameters<typeof routes.configure>[0]);
+    const stored = routes.getRouteBySession("wsess-prov")!;
+    assert.equal(stored.skillId, "nelson-wiggum-loop", "the budget records its governing skill");
+    assert.equal(stored.skillVersion, "0.2.0");
+    assert.equal(stored.skillConfigSha256, "a".repeat(64));
+    const reprov = routes.configure({
+      workSessionId: "wsess-prov", ownerPrincipalId: "user-a", ownerContextId: "owner-a",
+      enabled: true, mode: "isolated_review", maxReviewRounds: 3,
+      skillId: "nelson-wiggum-loop", skillVersion: "0.3.0", skillConfigSha256: "b".repeat(64),
+    } as Parameters<typeof routes.configure>[0]);
+    assert.equal(reprov.routeEpoch, prov.routeEpoch + 1, "a skill reconfiguration opens a fresh generation");
+    assert.equal(reprov.skillVersion, "0.3.0");
+    db.sqlite.prepare("insert into workspace_sessions (id, root, status, mode, managed, created_at, last_used_at) values (?, '/tmp', 'active', 'checkout', 'false', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')").run("ws-route-nosill");
+    db.sqlite.prepare("insert into work_sessions (id, workspace_session_id, submitted_by, status, created_at, updated_at) values ('wsess-noskill', 'ws-route-nosill', 'tester', 'in_progress', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')").run();
+    routes.configure({
+      workSessionId: "wsess-noskill", ownerPrincipalId: "user-a", ownerContextId: "owner-a",
+      enabled: true, mode: "isolated_review", maxReviewRounds: 2,
+    });
+    const noskill = routes.getRouteBySession("wsess-noskill")!;
+    assert.equal(noskill.skillId, undefined, "a reviewer-asserted budget records no skill provenance");
+    assert.equal(noskill.skillConfigSha256, undefined);
+    // Malformed provenance fails closed: partial triples and non-digests rejected.
+    assert.throws(() => routes.configure({
+      workSessionId: "wsess-noskill", ownerPrincipalId: "user-a", ownerContextId: "owner-a",
+      enabled: true, mode: "isolated_review", maxReviewRounds: 2, skillId: "nelson-wiggum-loop",
+    } as Parameters<typeof routes.configure>[0]), /all-or-nothing/i, "partial provenance is rejected");
+    assert.throws(() => routes.configure({
+      workSessionId: "wsess-noskill", ownerPrincipalId: "user-a", ownerContextId: "owner-a",
+      enabled: true, mode: "isolated_review", maxReviewRounds: 2,
+      skillId: "nelson-wiggum-loop", skillVersion: "0.2.0", skillConfigSha256: "not-a-digest",
+    } as Parameters<typeof routes.configure>[0]), /hex digest/i, "a malformed config hash is rejected");
+    assert.equal(routes.getRouteBySession("wsess-noskill")!.routeEpoch, noskill.routeEpoch, "rejected provenance leaves the generation untouched");
+  }
+
   // ── P1-08: concurrent initial configuration cannot create duplicate routes.
   {
     const raceDb = openDatabase(join(root, "route-race"));

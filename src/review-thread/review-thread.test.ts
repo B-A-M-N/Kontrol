@@ -128,6 +128,29 @@ try {
   const generatingAttempt = browserJobs.getActiveForThread(activeThread.id)!;
   assert.ok(generatingAttempt.generationStartedAt, "observed generation start is durably timestamped");
   assert.equal(generatingAttempt.generationStartedObservationId, `${observedClaim.attemptId}:chatgpt-dom:start`);
+  // Partial-response observations are idempotent, monotonic, lease-fenced evidence.
+  const partialInput = {
+    attemptId: observedClaim.attemptId, leaseToken: observedClaim.leaseToken,
+    profileId: "profile-thread", browserGeneration: 7,
+    textPrefix: "partial analysis in progress", textSha256: createHash("sha256").update("partial analysis in progress").digest("hex"),
+    provenance: "chatgpt-dom",
+  };
+  const firstPartial = browserJobs.recordPartialObservation(partialInput);
+  assert.equal(firstPartial.changed, true, "the first partial observation for an attempt persists");
+  assert.equal(firstPartial.seq, 1, "partial sequences start at one per attempt");
+  const samePartial = browserJobs.recordPartialObservation(partialInput);
+  assert.equal(samePartial.changed, false, "an identical retransmission is idempotent, not a new observation");
+  assert.equal(samePartial.seq, 1, "idempotent retransmission keeps the sequence");
+  const grownPartial = browserJobs.recordPartialObservation({ ...partialInput, textPrefix: "partial analysis in progress, continued", textSha256: createHash("sha256").update("partial analysis in progress, continued").digest("hex") });
+  assert.equal(grownPartial.changed, true);
+  assert.equal(grownPartial.seq, 2, "grown text advances the monotonic sequence");
+  assert.ok(browserJobs.getActiveForThread(activeThread.id)?.lastProgressAt, "progress observations refresh the attempt liveness timestamp");
+  assert.throws(() => browserJobs.recordPartialObservation({ ...partialInput, leaseToken: "lease-forged" }), /lease|fenced/i,
+    "a forged lease cannot plant partial observations");
+  assert.throws(() => browserJobs.recordPartialObservation({ ...partialInput, textPrefix: "x".repeat(4001), textSha256: createHash("sha256").update("x".repeat(4001)).digest("hex") }), /bound/i,
+    "oversized partial text is rejected before persistence");
+  assert.throws(() => browserJobs.recordPartialObservation({ ...partialInput, textPrefix: "tampered", textSha256: partialInput.textSha256 }), /digest|match/i,
+    "a digest that does not cover the persisted prefix is rejected");
   browserJobs.transition({ attemptId: observedClaim.attemptId, leaseToken: observedClaim.leaseToken, profileId: "profile-thread", browserGeneration: 7, nextStatus: "generation_finished" });
   db.sqlite.prepare("update review_browser_turns set lease_expires_at = ? where id = ?").run("2000-01-01T00:00:00.000Z", observedClaim.attemptId);
   const finishedRecovery = browserJobs.reconcileExpiredAttempts({ now: new Date().toISOString(), limit: 100 });
@@ -168,6 +191,70 @@ try {
   }, "recovery records the reviewer identity and hashes, not the freeform inspection note");
   assert.ok(browserJobs.claim({ messageId: postBoundaryMessage.id, profileId: "profile-thread", browserGeneration: 7 }),
     "a replacement attempt is allowed only after the durable reviewer recovery receipt");
+
+  // A genuinely terminal reviewer failure is an explicit reviewer decision
+  // with structured outcome evidence, never an automatic timeout.
+  const terminalQuestion = agentMessages.post({ workSessionId: "session-thread", kind: "clarification_request", title: "Terminal recovery", body: "Declare unrecoverable." });
+  const terminalMessage = threads.queueAgentMessage({ threadId: activeThread.id, agentMessageId: terminalQuestion.id, kind: "clarification_request", title: terminalQuestion.title, body: terminalQuestion.body })!;
+  // The replacement attempt above still owns the thread fence; expire it so
+  // the terminal scenario starts from a clean, requeued message.
+  const replacementAttempt = browserJobs.getActiveForThread(activeThread.id)!;
+  db.sqlite.prepare("update review_browser_turns set lease_expires_at = ? where id = ?").run("2000-01-01T00:00:00.000Z", replacementAttempt.id);
+  browserJobs.reconcileExpiredAttempts({ now: new Date().toISOString(), limit: 100 });
+  const terminalClaim = browserJobs.claim({ messageId: terminalMessage.id, profileId: "profile-thread", browserGeneration: 7 })!;
+  const terminalInput = {
+    attemptId: terminalClaim.attemptId, reviewThreadId: activeThread.id, routeEpoch: route.routeEpoch,
+    reviewerPrincipalId: "reviewer", classification: "reviewer_unrecoverable" as const, reasonCode: "authentication_unrecoverable",
+    inspectionEvidence: "I inspected the exact bound conversation; reviewer authentication is lost and no safe recovery remains.",
+  };
+  assert.throws(() => browserJobs.recordTerminalOutcome(terminalInput), /lease|active|owner/i,
+    "an attempt with a live dispatch lease cannot be declared terminal");
+  for (const nextStatus of ["browser_ready", "dispatching", "prompt_accepted", "model_generating"] as const) {
+    browserJobs.transition({ attemptId: terminalClaim.attemptId, leaseToken: terminalClaim.leaseToken, profileId: "profile-thread", browserGeneration: 7, nextStatus });
+  }
+  const terminalPartialText = "partial verdict draft";
+  browserJobs.recordPartialObservation({
+    attemptId: terminalClaim.attemptId, leaseToken: terminalClaim.leaseToken,
+    profileId: "profile-thread", browserGeneration: 7,
+    textPrefix: terminalPartialText, textSha256: createHash("sha256").update(terminalPartialText).digest("hex"),
+    provenance: "chatgpt-dom",
+  });
+  db.sqlite.prepare("update review_browser_turns set lease_expires_at = ? where id = ?").run("2000-01-01T00:00:00.000Z", terminalClaim.attemptId);
+  assert.throws(() => browserJobs.recordTerminalOutcome({ ...terminalInput, reviewerPrincipalId: "impostor" }), /reviewer|principal|authority|bound/i,
+    "a worker cannot declare its own review terminal");
+  const terminalOutcome = browserJobs.recordTerminalOutcome(terminalInput);
+  assert.equal(terminalOutcome.classification, "reviewer_unrecoverable");
+  assert.match(terminalOutcome.evidenceSha256, /^[a-f0-9]{64}$/, "the terminal outcome commits to hashed inspection evidence");
+  assert.equal(terminalOutcome.partialSeq, 1, "the terminal outcome binds the latest preserved partial evidence");
+  assert.equal(terminalOutcome.partialComplete, false, "preserved partial text is never presented as a complete verdict");
+  assert.ok(terminalOutcome.lastProgressAt, "the terminal outcome carries the last observed progress timestamp");
+  assert.equal(browserJobs.getActiveForThread(activeThread.id), undefined, "a terminal attempt releases the thread fence");
+  assert.equal(threads.listMessages(activeThread.id).find((message) => message.id === terminalMessage.id)?.status, "failed",
+    "the terminal outcome marks the reviewer message failed so workers never wait on it again");
+  const terminalReceipt = db.sqlite.prepare("select reviewer_principal_id, resolution, evidence_sha256 from review_browser_turn_resolutions where attempt_id = ?")
+    .get(terminalClaim.attemptId) as { reviewer_principal_id: string; resolution: string; evidence_sha256: string };
+  assert.deepEqual(terminalReceipt, {
+    reviewer_principal_id: "reviewer", resolution: "reviewer_unrecoverable", evidence_sha256: terminalOutcome.evidenceSha256,
+  }, "terminal recovery records the reviewer identity and hashes, not the freeform inspection note");
+  assert.throws(() => browserJobs.recordTerminalOutcome(terminalInput), /terminal|failed|reconciled|unavailable/i,
+    "a terminal attempt cannot be declared terminal twice");
+  assert.throws(() => browserJobs.resolveUncertainAttemptForRetry({
+    attemptId: terminalClaim.attemptId, reviewThreadId: activeThread.id, routeEpoch: route.routeEpoch,
+    reviewerPrincipalId: "reviewer", confirmPromptAbsent: true,
+    inspectionEvidence: "A recovery receipt must never resurrect a terminal attempt.",
+  }), /unavailable|reconciled|terminal|failed/i,
+    "the recovery path cannot resurrect a terminal attempt");
+  const terminalRecord = browserJobs.getTerminalOutcome({ reviewThreadId: activeThread.id })!;
+  assert.equal(terminalRecord.attemptId, terminalClaim.attemptId);
+  assert.equal(terminalRecord.classification, "reviewer_unrecoverable");
+  assert.equal(terminalRecord.reasonCode, "authentication_unrecoverable", "the worker-visible outcome carries the verified reason");
+  assert.equal(terminalRecord.reviewerPrincipalId, "reviewer");
+  assert.equal(terminalRecord.attemptState, "failed");
+  assert.equal(terminalRecord.partialSeq, 1);
+  assert.equal(terminalRecord.partialPrefix, terminalPartialText, "the worker-visible outcome carries the preserved partial text");
+  assert.equal(terminalRecord.partialComplete, false, "preserved partial text is never presented as complete");
+  assert.equal(browserJobs.getTerminalOutcome({ reviewThreadId: "thread-unknown" }), undefined,
+    "threads without a terminal outcome expose none");
 
   const claimed = routes.claimHandoff({
     handoffId: first.id, expectedRevision: first.revision, principalId: "reviewer",
@@ -238,6 +325,142 @@ try {
     handoffId: first.id, expectedRevision: replacementRelease.revision, principalId: "replacement-reviewer",
     ownerContextId: "replacement-review-context", reviewThreadId: reboundThread.id,
   }), /not claimable|epoch/i);
+
+  // A terminal outcome can never override a committed reviewer verdict, even
+  // when the browser attempt itself is orphaned and unrecoverable.
+  const fenceRoot = join(root, "terminal-feedback-fence");
+  const fenceDb = openDatabase(fenceRoot);
+  try {
+    fenceDb.sqlite.prepare("insert into workspace_sessions (id, root, status, mode, managed, created_at, last_used_at) values (?, '/tmp', 'active', 'checkout', 'false', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')").run("ws-fence");
+    fenceDb.sqlite.prepare("insert into work_sessions (id, workspace_session_id, submitted_by, status, created_at, updated_at) values (?, 'ws-fence', 'owner', 'in_progress', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')").run("session-fence");
+    const fenceRoutes = createReviewRouteStore(fenceDb);
+    const fenceThreads = createReviewThreadStore(fenceDb);
+    const fenceJobs = createReviewerJobStore(fenceDb);
+    const fenceRoute = fenceRoutes.configure({
+      workSessionId: "session-fence", ownerPrincipalId: "owner", ownerContextId: "owner-context",
+      enabled: true, mode: "isolated_review", maxReviewRounds: 2,
+      deliveryTransport: "native_cdp", browserProfileId: "profile-fence",
+    });
+    const fenceHandoff = fenceRoutes.createHandoff({
+      routeId: fenceRoute.id, workSessionId: "session-fence", submissionId: "submission-fence",
+      reviewEpoch: 1, snapshotKind: "git", snapshotRef: "snapshot-fence", diffSha256: "hash-fence", roundNumber: 1,
+    });
+    const fencePacketJson = JSON.stringify({ version: 1, packetSha256: "packet-fence", requestedDecision: "review submission-fence" });
+    fenceRoutes.setReviewPacket({ handoffId: fenceHandoff.id, payloadJson: fencePacketJson, payloadSha256: createHash("sha256").update(fencePacketJson).digest("hex") });
+    const fenceGrant = fenceThreads.createActivation({ routeId: fenceRoute.id, ownerPrincipalId: "owner", reviewerPrincipalId: "reviewer" });
+    const fenceThread = fenceThreads.activate({
+      activationSecret: fenceGrant.activationSecret, principalId: "reviewer", contextId: "review-context-fence",
+      hostKind: "chatgpt", hostConversationId: "operator-fence-chat",
+    });
+    fenceDb.db.update(reviewThreadsTable).set({
+      browserProfileId: "profile-fence", browserGeneration: 7, browserTargetId: "tab-fence",
+      browserCdpSessionId: "cdp-fence", conversationUrl: "https://chatgpt.com/c/conversation_fence1",
+      conversationKey: "conversation_fence1", conversationFingerprint: "e".repeat(64),
+      conversationBindingRevision: 1, conversationBindingStatus: "bound", conversationBindingAssurance: "browser_observed",
+    }).where(eq(reviewThreadsTable.id, fenceThread.id)).run();
+    const fenceMessage = fenceThreads.listMessages(fenceThread.id).find((item) => item.handoffId === fenceHandoff.id)!;
+    const fenceClaim = fenceJobs.claim({ messageId: fenceMessage.id, profileId: "profile-fence", browserGeneration: 7 })!;
+    for (const nextStatus of ["browser_ready", "dispatching", "prompt_accepted"] as const) {
+      fenceJobs.transition({ attemptId: fenceClaim.attemptId, leaseToken: fenceClaim.leaseToken, profileId: "profile-fence", browserGeneration: 7, nextStatus });
+    }
+    fenceDb.sqlite.prepare("update review_browser_turns set lease_expires_at = ? where id = ?").run("2000-01-01T00:00:00.000Z", fenceClaim.attemptId);
+    const fenceHandoffClaim = fenceRoutes.claimHandoff({
+      handoffId: fenceHandoff.id, expectedRevision: fenceHandoff.revision, principalId: "reviewer",
+      ownerContextId: "review-context-fence", reviewThreadId: fenceThread.id,
+    });
+    fenceRoutes.markHandoffStatus({ handoffId: fenceHandoff.id, expectedRevision: fenceHandoffClaim.revision, nextStatus: "feedback_committed" });
+    assert.throws(() => fenceJobs.recordTerminalOutcome({
+      attemptId: fenceClaim.attemptId, reviewThreadId: fenceThread.id, routeEpoch: fenceRoute.routeEpoch,
+      reviewerPrincipalId: "reviewer", classification: "reviewer_unrecoverable", reasonCode: "authentication_unrecoverable",
+      inspectionEvidence: "The reviewer channel is lost, but a verdict was already committed.",
+    }), /committed|verdict|override/i, "a terminal outcome cannot override a committed reviewer verdict");
+    assert.equal(fenceJobs.getTerminalOutcome({ reviewThreadId: fenceThread.id }), undefined,
+      "a committed verdict is surfaced as feedback, never as a terminal reviewer failure");
+  } finally {
+    fenceDb.close();
+  }
+
+  // A terminal reviewer outcome survives a database/runtime restart with its
+  // evidence, fencing, and verdict-override guarantees intact.
+  const terminalRestartRoot = join(root, "terminal-restart");
+  const terminalRestartDb = openDatabase(terminalRestartRoot);
+  let terminalRestartClosed = false;
+  try {
+    terminalRestartDb.sqlite.prepare("insert into workspace_sessions (id, root, status, mode, managed, created_at, last_used_at) values (?, '/tmp', 'active', 'checkout', 'false', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')").run("ws-restart");
+    terminalRestartDb.sqlite.prepare("insert into work_sessions (id, workspace_session_id, submitted_by, status, created_at, updated_at) values (?, 'ws-restart', 'owner', 'in_progress', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')").run("session-restart");
+    const restartRoutes = createReviewRouteStore(terminalRestartDb);
+    const restartThreads = createReviewThreadStore(terminalRestartDb);
+    const restartJobs = createReviewerJobStore(terminalRestartDb);
+    const restartRoute = restartRoutes.configure({
+      workSessionId: "session-restart", ownerPrincipalId: "owner", ownerContextId: "owner-context",
+      enabled: true, mode: "isolated_review", maxReviewRounds: 2,
+      deliveryTransport: "native_cdp", browserProfileId: "profile-restart",
+    });
+    const restartHandoff = restartRoutes.createHandoff({
+      routeId: restartRoute.id, workSessionId: "session-restart", submissionId: "submission-restart",
+      reviewEpoch: 1, snapshotKind: "git", snapshotRef: "snapshot-restart", diffSha256: "hash-restart", roundNumber: 1,
+    });
+    const restartPacketJson = JSON.stringify({ version: 1, packetSha256: "packet-restart", requestedDecision: "review submission-restart" });
+    restartRoutes.setReviewPacket({ handoffId: restartHandoff.id, payloadJson: restartPacketJson, payloadSha256: createHash("sha256").update(restartPacketJson).digest("hex") });
+    const restartGrant = restartThreads.createActivation({ routeId: restartRoute.id, ownerPrincipalId: "owner", reviewerPrincipalId: "reviewer" });
+    const restartThread = restartThreads.activate({
+      activationSecret: restartGrant.activationSecret, principalId: "reviewer", contextId: "review-context-restart",
+      hostKind: "chatgpt", hostConversationId: "operator-restart-chat",
+    });
+    terminalRestartDb.db.update(reviewThreadsTable).set({
+      browserProfileId: "profile-restart", browserGeneration: 7, browserTargetId: "tab-restart",
+      browserCdpSessionId: "cdp-restart", conversationUrl: "https://chatgpt.com/c/conversation_restart1",
+      conversationKey: "conversation_restart1", conversationFingerprint: "d".repeat(64),
+      conversationBindingRevision: 1, conversationBindingStatus: "bound", conversationBindingAssurance: "browser_observed",
+    }).where(eq(reviewThreadsTable.id, restartThread.id)).run();
+    const restartMessage = restartThreads.listMessages(restartThread.id).find((item) => item.handoffId === restartHandoff.id)!;
+    const restartClaim = restartJobs.claim({ messageId: restartMessage.id, profileId: "profile-restart", browserGeneration: 7 })!;
+    for (const nextStatus of ["browser_ready", "dispatching", "prompt_accepted", "model_generating"] as const) {
+      restartJobs.transition({ attemptId: restartClaim.attemptId, leaseToken: restartClaim.leaseToken, profileId: "profile-restart", browserGeneration: 7, nextStatus });
+    }
+    const restartPartialText = "unrecoverable draft";
+    restartJobs.recordPartialObservation({
+      attemptId: restartClaim.attemptId, leaseToken: restartClaim.leaseToken,
+      profileId: "profile-restart", browserGeneration: 7,
+      textPrefix: restartPartialText, textSha256: createHash("sha256").update(restartPartialText).digest("hex"),
+      provenance: "chatgpt-dom",
+    });
+    terminalRestartDb.sqlite.prepare("update review_browser_turns set lease_expires_at = ? where id = ?").run("2000-01-01T00:00:00.000Z", restartClaim.attemptId);
+    const recordedRestart = restartJobs.recordTerminalOutcome({
+      attemptId: restartClaim.attemptId, reviewThreadId: restartThread.id, routeEpoch: restartRoute.routeEpoch,
+      reviewerPrincipalId: "reviewer", classification: "reviewer_unrecoverable", reasonCode: "conversation_lost",
+      inspectionEvidence: "The bound conversation is gone and the reviewer channel cannot be re-established.",
+    });
+    terminalRestartDb.close();
+    terminalRestartClosed = true;
+    const reopenedDb = openDatabase(terminalRestartRoot);
+    try {
+      const reopenedJobs = createReviewerJobStore(reopenedDb);
+      const reopenedOutcome = reopenedJobs.getTerminalOutcome({ reviewThreadId: restartThread.id })!;
+      assert.equal(reopenedOutcome.attemptId, restartClaim.attemptId);
+      assert.equal(reopenedOutcome.classification, "reviewer_unrecoverable");
+      assert.equal(reopenedOutcome.reasonCode, "conversation_lost");
+      assert.equal(reopenedOutcome.evidenceSha256, recordedRestart.evidenceSha256);
+      assert.equal(reopenedOutcome.partialPrefix, restartPartialText, "preserved partial evidence survives restart");
+      assert.equal(reopenedOutcome.partialComplete, false);
+      assert.equal(reopenedJobs.getActiveForThread(restartThread.id), undefined,
+        "no active browser turn resurrects across restart");
+      assert.throws(() => reopenedJobs.recordTerminalOutcome({
+        attemptId: restartClaim.attemptId, reviewThreadId: restartThread.id, routeEpoch: restartRoute.routeEpoch,
+        reviewerPrincipalId: "reviewer", classification: "reviewer_unrecoverable", reasonCode: "conversation_lost",
+        inspectionEvidence: "A second declaration after restart must still be rejected.",
+      }), /terminal|failed|reconciled|unavailable/i, "terminal fencing survives restart");
+      assert.throws(() => reopenedJobs.resolveUncertainAttemptForRetry({
+        attemptId: restartClaim.attemptId, reviewThreadId: restartThread.id, routeEpoch: restartRoute.routeEpoch,
+        reviewerPrincipalId: "reviewer", confirmPromptAbsent: true,
+        inspectionEvidence: "Recovery after restart must not resurrect a terminal attempt.",
+      }), /unavailable|reconciled|terminal|failed/i, "the recovery path stays fenced after restart");
+    } finally {
+      reopenedDb.close();
+    }
+  } finally {
+    if (!terminalRestartClosed) terminalRestartDb.close();
+  }
 
   // Pending thread state is durable across a database/runtime restart.
   const recoveryRoot = join(root, "restart-recovery");

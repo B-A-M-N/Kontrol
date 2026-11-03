@@ -152,6 +152,35 @@ journal identity:
 }
 ```
 
+The installer auto-appends the reviewer-assertion header to every `tunnel`
+component command that lacks an exactly-parsed one, so the rendered unit runs:
+
+```
+tunnel-client run --profile sample_mcp_with_dcr \
+  --mcp.extra-headers "X-Kontrol-Tunnel-Reviewer: env:KONTROL_TUNNEL_REVIEWER_SECRET"
+```
+
+The header always names `KONTROL_TUNNEL_REVIEWER_SECRET` because that is
+the server's first-precedence credential (`KONTROL_TUNNEL_REVIEWER_SECRET`,
+then `KONTROL_ACP_REVIEWER_SECRET`, then the 0600 auth-file secret). The
+credential is resolved from those same three sources in the same order —
+shared by `scripts/kontrol-tunnel.sh` and `kontrol service install` — and
+when it resolves from the legacy variable or the auth file, install/upgrade
+materializes it as `KONTROL_TUNNEL_REVIEWER_SECRET` into the 0600 service
+EnvironmentFile so the tunnel runtime actually provides what the header
+references. An explicitly configured, exactly-parsed header is left
+untouched; a malformed reviewer header fails install closed instead of
+stacking flags. Adapter components never gain the header. Install/upgrade
+fails closed when authMode is `tunnel` with an ask-capable policy and no
+reviewer secret is resolvable. The secret value itself never enters the unit
+file: `tunnel-client` resolves the `env:` reference from the service
+EnvironmentFile at runtime.
+
+Without that header the tunnel's MCP sessions authenticate as ordinary
+`client` and reviewer-only tools (approval center, session surface) are
+denied — the same failure as running `tunnel-client` by hand without the
+flag.
+
 Component rules: `name` is lowercase letters/digits/dashes (max 39 chars) and
 becomes the unit name; `command` argv entries resolve from PATH (no shells, no
 absolute paths in argv[0]); the token `@ARTIFACT` expands to the installed
@@ -389,8 +418,22 @@ point it at the loopback origin:
 
 ```bash
 tunnel-client run \
-  --mcp.server-url "http://127.0.0.1:7676/mcp"
+  --mcp.server-url "http://127.0.0.1:7676/mcp" \
+  --mcp.extra-headers "X-Kontrol-Tunnel-Reviewer: env:KONTROL_TUNNEL_REVIEWER_SECRET"
 ```
+
+The `--mcp.extra-headers` flag is what gives the WebUI reviewer authority:
+without it every tunneled session arrives as `client` and the approval
+center will not load (`Forbidden: ... requires a different role`). The
+header always names `KONTROL_TUNNEL_REVIEWER_SECRET` (the server's
+first-precedence credential); the managed launcher resolves that variable
+from itself, the legacy `KONTROL_ACP_REVIEWER_SECRET`, or the 0600 auth
+file. The managed launcher (`scripts/kontrol-tunnel.sh`) and the systemd
+component installer add this header automatically; pass it by hand only when
+starting `tunnel-client` directly. Scope note: the header grants reviewer
+authority to any client reaching that trusted tunnel endpoint, so keep the
+tunnel registration and its workspace restricted — it is a transport
+boundary, not individual-user authorization.
 
 The review WebUI is served as a self-contained MCP App resource (its CSS and JS
 are inlined into a single `workspace-app.html`), so the ChatGPT iframe needs no
@@ -402,7 +445,7 @@ localhost fetches.
 
 | Value | Behavior |
 | --- | --- |
-| `minimal` | Default. Exposes `open_workspace`, `read`, structured read-only discovery (`grep`, `glob`, `ls`), `write`, `edit`, and `bash`. Structured discovery does not require shell approval; arbitrary `bash` remains policy-gated. |
+| `minimal` | Default. Exposes `open_workspace`, `read`, structured read-only discovery (`grep`, `glob`, `ls`), `write`, `edit`, `bash`, plus the shared process controls `exec_command` (explicit TTY, timeout, idempotency, policy) and `write_stdin` (separately authorized stdin and PTY resize; pure polls stay read-only). Structured discovery does not require shell approval; arbitrary `bash` remains policy-gated. |
 | `full` | Compatibility alias for the same core tool surface as `minimal`. |
 | `codex` | Experimental. Exposes `open_workspace`, structured read-only `read`/`grep`/`glob`/`ls`, `apply_patch`, `exec_command`, and `write_stdin`. The legacy `write`, `edit`, and `bash` tools remain hidden. |
 
@@ -517,9 +560,10 @@ Supervisor and verification concurrency are bounded independently:
 | `KONTROL_STARTUP_PROFILE` | `dev-fast` | `dev-fast` / `normal` / `release` preflight depth for start-all.sh. Fast development startup is the default; use `normal` or `release` for the complete test gate. |
 | `KONTROL_BETA_SOAK_URL` | Selected profile's endpoint | Optional `./start-all.sh --qualify` target override. Hosted mode requires a non-loopback HTTPS origin with `KONTROL_AUTH_MODE=oauth`; Secure MCP Tunnel mode requires loopback HTTP with `KONTROL_AUTH_MODE=tunnel`. |
 | `KONTROL_BETA_SOAK_TRANSPORT` | Derived from `KONTROL_AUTH_MODE` | `public_https` or `secure_mcp_tunnel`. Explicit selection must match the auth mode. Local HTTP qualification is rejected before the code gate or generation activation. |
-| `KONTROL_BETA_SOAK_HOURS` | `12` | Requested wall-clock soak duration for `start-all.sh --qualify`; the launcher enforces at least 12 hours and honors a larger `KONTROL_BETA_MIN_SOAK_HOURS`. |
+| `KONTROL_BETA_SOAK_HOURS` | `1` | Duration of the MCP continuity workload for `start-all.sh --qualify`; the deployment uptime window is enforced separately by scheduled CI. |
 | `KONTROL_BETA_WORKSPACE_PATH` | Checkout root | Workspace used by soak read, continuity, approval, and resource exercises. The runner removes its uniquely named continuity marker after each exercise. |
 | `KONTROL_BETA_SOAK_REPORT` | `<checkout>/beta-soak.json` | Atomic progress and final report path. |
+| `KONTROL_BETA_DEPLOYMENT_UPTIME_RECEIPT` | `<checkout>/deployment-uptime-qualification.json` | Signed CI receipt for the exact active generation's 12-hour uptime; required by combined stable-beta gates. |
 | `KONTROL_BETA_SOAK_LOG` | `<stateDir>/beta-soak.log` | Background soak session log path. |
 | `KONTROL_BETA_APPROVAL_CADENCE` | `60` | Number of soak iterations between approval-resume exercises. |
 | `KONTROL_BETA_SSE_PROBE_CADENCE` | Once per hour, based on soak interval | Number of soak iterations between dual-session GET/POST SSE probes. Each probe verifies repeated heartbeat bytes and a terminal JSON-RPC response. |

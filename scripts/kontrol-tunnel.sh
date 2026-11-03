@@ -36,6 +36,22 @@ if [[ -z "${KONTROL_TUNNEL_REVIEWER_SECRET:-}" && -n "${KONTROL_ACP_REVIEWER_SEC
   export KONTROL_TUNNEL_REVIEWER_SECRET="$KONTROL_ACP_REVIEWER_SECRET"
 fi
 
+# The tunnel always asserts reviewer authority with KONTROL_TUNNEL_REVIEWER_SECRET
+# (the server's first-precedence credential). Resolve it from the dedicated
+# variable, the legacy ACP reviewer secret, or the 0600 auth file — never
+# assume the legacy environment variable exists. The value travels only in
+# the process environment toward tunnel-client's env: reference.
+if [[ -z "${KONTROL_TUNNEL_REVIEWER_SECRET:-}" ]]; then
+  auth_file_secret="$(
+    node -e 'const fs=require("node:fs");try{const auth=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(typeof auth.tunnelReviewerSecret==="string"?auth.tunnelReviewerSecret:"")}catch{process.exit(1)}' \
+      "${KONTROL_CONFIG_DIR:-$HOME/.kontrol}/auth.json" 2>/dev/null || true
+  )"
+  if [[ -n "${auth_file_secret:-}" ]]; then
+    export KONTROL_TUNNEL_REVIEWER_SECRET="$auth_file_secret"
+  fi
+  unset auth_file_secret
+fi
+
 # Ask-capability is computed by the same compiled policy loader used by the
 # server. This keeps secure-baseline defaults, aliases, and strict malformed
 # value handling identical across both startup paths.
@@ -56,7 +72,12 @@ if ! EFFECTIVE_POLICY_JSON="$("${POLICY_COMMAND[@]}" config effective-policy --j
   echo "ERROR: effective policy could not be loaded; refusing to start the tunnel." >&2
   exit 1
 fi
-if [[ -z "${KONTROL_TUNNEL_REVIEWER_SECRET:-}" ]] && ! node -e 'const fs=require("node:fs"); const value=JSON.parse(fs.readFileSync(0,"utf8")); process.exit(value.canAsk ? 0 : 1)' <<<"$EFFECTIVE_POLICY_JSON"; then
+if [[ -z "${KONTROL_TUNNEL_REVIEWER_SECRET:-}" ]] \
+  && node -e '
+    const fs = require("node:fs");
+    const policy = JSON.parse(fs.readFileSync(0,"utf8"));
+    process.exit(policy.canAsk === true ? 0 : 1);
+  ' <<<"$EFFECTIVE_POLICY_JSON"; then
   echo "ERROR: KONTROL_AUTH_MODE=tunnel with an ask-capable policy requires a reviewer credential." >&2
   echo "       Set KONTROL_TUNNEL_REVIEWER_SECRET (or KONTROL_ACP_REVIEWER_SECRET), or use a" >&2
   echo "       non-interactive policy posture (KONTROL_POLICY_MODE=allow). Ask-gated tools" >&2

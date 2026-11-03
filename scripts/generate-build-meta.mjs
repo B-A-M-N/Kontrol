@@ -104,8 +104,8 @@ for (const entry of workspaceAppHistory) {
 // runtime dependencies this candidate was built and qualified against, from
 // the lockfile of the build environment. The packaging stage pins the
 // published package.json to these exact versions, so installing
-// @b-a-m-n/kontrol@X later resolves the same dependency closure the 12-hour
-// soak qualified — a caret range in the published manifest would qualify one
+// @b-a-m-n/kontrol@X later resolves the same dependency closure exercised by
+// qualification — a caret range in the published manifest would qualify one
 // closure and ship another.
 function resolvedRuntimeDependencies() {
   let lock;

@@ -1,0 +1,522 @@
+{
+  "kind": "kontrol-ingress-qualification-matrix",
+  "version": 1,
+  "generatedAt": "2026-10-25T23:36:12.934Z",
+  "buildId": "548c861bd2209f72",
+  "configSha256": null,
+  "qualified": false,
+  "tierSummary": {
+    "unit": {
+      "required": 7,
+      "passed": 7,
+      "failed": 0,
+      "unverified": 0
+    },
+    "local_integration": {
+      "required": 5,
+      "passed": 5,
+      "failed": 0,
+      "unverified": 0
+    },
+    "real_tailnet": {
+      "required": 1,
+      "passed": 0,
+      "failed": 0,
+      "unverified": 1
+    },
+    "public_internet": {
+      "required": 5,
+      "passed": 0,
+      "failed": 0,
+      "unverified": 5
+    },
+    "operational": {
+      "required": 0,
+      "passed": 0,
+      "failed": 0,
+      "unverified": 0
+    }
+  },
+  "scenarios": [
+    {
+      "id": "serve-mapping-exact-match",
+      "title": "Correct Serve mapping",
+      "area": "mapping",
+      "expectation": "Exact route match and authenticated MCP request from a tailnet client",
+      "requiredScope": "tailnet",
+      "requiredTier": "real_tailnet",
+      "deployment": true,
+      "status": "source_verified",
+      "evidenceTier": null,
+      "evidenceScope": null,
+      "evidenceSource": "none",
+      "reason": "the source-level guard passed, but real_tailnet/tailnet evidence is still required",
+      "guards": [
+        {
+          "command": "node --import tsx src/ingress/profile-status.test.ts",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 1290
+        }
+      ]
+    },
+    {
+      "id": "serve-wrong-host-port-path",
+      "title": "Wrong Serve host/port/path",
+      "area": "mapping",
+      "expectation": "Mismatch; never READY",
+      "requiredScope": "loopback",
+      "requiredTier": "unit",
+      "deployment": false,
+      "status": "pass",
+      "evidenceTier": "unit",
+      "evidenceScope": "loopback",
+      "evidenceSource": "guard",
+      "guards": [
+        {
+          "command": "node --import tsx src/ingress/profile-status.test.ts",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 1604
+        }
+      ]
+    },
+    {
+      "id": "funnel-public-authenticated",
+      "title": "Funnel enabled publicly",
+      "area": "availability",
+      "expectation": "Authenticated HTTPS works from a non-tailnet client",
+      "requiredScope": "public",
+      "requiredTier": "public_internet",
+      "deployment": true,
+      "status": "source_verified",
+      "evidenceTier": null,
+      "evidenceScope": null,
+      "evidenceSource": "none",
+      "reason": "the source-level guard passed, but public_internet/public evidence is still required",
+      "guards": [
+        {
+          "command": "node --import tsx src/server/public-mcp-app.test.ts",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 14982
+        }
+      ]
+    },
+    {
+      "id": "funnel-to-peer-listener-rejected",
+      "title": "Funnel accidentally targeting the peer listener",
+      "area": "security",
+      "expectation": "Configuration rejected",
+      "requiredScope": "loopback",
+      "requiredTier": "unit",
+      "deployment": false,
+      "status": "pass",
+      "evidenceTier": "unit",
+      "evidenceScope": "loopback",
+      "evidenceSource": "guard",
+      "guards": [
+        {
+          "command": "node --import tsx src/ingress/validate.test.ts",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 1162
+        },
+        {
+          "command": "node --import tsx src/ingress/validate-config.test.ts",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 1292
+        }
+      ]
+    },
+    {
+      "id": "funnel-removed-during-sse",
+      "title": "Funnel removed during SSE",
+      "area": "transport",
+      "expectation": "Classified transport loss; no false execution completion",
+      "requiredScope": "public",
+      "requiredTier": "public_internet",
+      "deployment": true,
+      "status": "source_verified",
+      "evidenceTier": null,
+      "evidenceScope": null,
+      "evidenceSource": "none",
+      "reason": "the source-level guard passed, but public_internet/public evidence is still required",
+      "guards": [
+        {
+          "command": "node scripts/analyze-mcp-stream-failure.test.mjs",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 223
+        }
+      ]
+    },
+    {
+      "id": "caddy-forbidden-route-negative",
+      "title": "Caddy proxies forbidden routes",
+      "area": "security",
+      "expectation": "Explicit negative test fails (the bridge returns its own 404)",
+      "requiredScope": "loopback",
+      "requiredTier": "local_integration",
+      "deployment": false,
+      "status": "pass",
+      "evidenceTier": "local_integration",
+      "evidenceScope": "loopback",
+      "evidenceSource": "guard",
+      "guards": [
+        {
+          "command": "node --import tsx src/ingress/bridge-asset.test.ts",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 1282
+        },
+        {
+          "command": "node scripts/qualify-caddy-bridge.test.mjs",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 68
+        },
+        {
+          "command": "node scripts/bridge-route-isolation.test.mjs",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 194
+        },
+        {
+          "command": "node --import tsx scripts/qualify-caddy-bridge.mjs --config deploy/bridge/Caddyfile.example --bridge-node local-qualification --public-host kontrol.example.com --upstream kontrol-node.tail-scale.ts.net:9443 --build-id local-qualification --receipt .tmp-scratch/ingress-caddy-qualification.json",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 1774
+        },
+        {
+          "command": "node scripts/bridge-route-isolation.mjs --config deploy/bridge/Caddyfile.example --build-id local-qualification --receipt .tmp-scratch/ingress-bridge-isolation.json",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 3860
+        }
+      ]
+    },
+    {
+      "id": "forged-forwarded-and-x-kontrol-headers",
+      "title": "Forged forwarded and X-Kontrol-* headers",
+      "area": "security",
+      "expectation": "No authority escalation",
+      "requiredScope": "public",
+      "requiredTier": "public_internet",
+      "deployment": true,
+      "status": "source_verified",
+      "evidenceTier": null,
+      "evidenceScope": null,
+      "evidenceSource": "none",
+      "reason": "the source-level guard passed, but public_internet/public evidence is still required",
+      "guards": [
+        {
+          "command": "node --import tsx src/ingress/proxy-context.test.ts",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 1655
+        },
+        {
+          "command": "node --import tsx src/ingress/host-policy.test.ts",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 766
+        }
+      ]
+    },
+    {
+      "id": "peer-credential-revoked-mid-session",
+      "title": "Peer credential revoked mid-session",
+      "area": "security",
+      "expectation": "Existing privileged transport fenced",
+      "requiredScope": "loopback",
+      "requiredTier": "local_integration",
+      "deployment": false,
+      "status": "pass",
+      "evidenceTier": "local_integration",
+      "evidenceScope": "loopback",
+      "evidenceSource": "guard",
+      "guards": [
+        {
+          "command": "node --import tsx src/peer-listener.test.ts",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 16727
+        }
+      ]
+    },
+    {
+      "id": "oauth-token-wrong-origin-resource",
+      "title": "OAuth token used on the wrong origin/resource",
+      "area": "security",
+      "expectation": "Denied",
+      "requiredScope": "loopback",
+      "requiredTier": "unit",
+      "deployment": false,
+      "status": "pass",
+      "evidenceTier": "unit",
+      "evidenceScope": "loopback",
+      "evidenceSource": "guard",
+      "guards": [
+        {
+          "command": "node --import tsx src/oauth-provider-guard.test.ts",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 2177
+        },
+        {
+          "command": "node scripts/lib/mcp-endpoint-selector.test.mjs",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 156
+        }
+      ]
+    },
+    {
+      "id": "bridge-upstream-disconnected-core-healthy",
+      "title": "Bridge upstream disconnected",
+      "area": "availability",
+      "expectation": "Bridge degraded; the Kontrol core stays healthy",
+      "requiredScope": "loopback",
+      "requiredTier": "local_integration",
+      "deployment": false,
+      "status": "pass",
+      "evidenceTier": "local_integration",
+      "evidenceScope": "loopback",
+      "evidenceSource": "guard",
+      "guards": [
+        {
+          "command": "node --import tsx src/ingress/health-store.test.ts",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 503
+        },
+        {
+          "command": "node --import tsx src/ingress/qualification.integration.test.ts",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 7200
+        }
+      ]
+    },
+    {
+      "id": "corrupted-peer-job-storage",
+      "title": "Corrupted peer-job storage",
+      "area": "durability",
+      "expectation": "Dispatch blocked, prior evidence retained",
+      "requiredScope": "loopback",
+      "requiredTier": "unit",
+      "deployment": false,
+      "status": "pass",
+      "evidenceTier": "unit",
+      "evidenceScope": "loopback",
+      "evidenceSource": "guard",
+      "guards": [
+        {
+          "command": "node --import tsx src/peer/jobs/store.test.ts",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 1513
+        }
+      ]
+    },
+    {
+      "id": "connection-lost-after-mutation-dispatch",
+      "title": "Connection lost after mutation dispatch",
+      "area": "durability",
+      "expectation": "Uncertain operation reconciled; not blindly replayed",
+      "requiredScope": "loopback",
+      "requiredTier": "unit",
+      "deployment": false,
+      "status": "pass",
+      "evidenceTier": "unit",
+      "evidenceScope": "loopback",
+      "evidenceSource": "guard",
+      "guards": [
+        {
+          "command": "node --import tsx src/mutation-receipts.test.ts",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 2256
+        }
+      ]
+    },
+    {
+      "id": "concurrent-clients-switching-routes",
+      "title": "Concurrent clients switching routes",
+      "area": "recovery",
+      "expectation": "No shared transport identity or cross-session state",
+      "requiredScope": "loopback",
+      "requiredTier": "unit",
+      "deployment": false,
+      "status": "pass",
+      "evidenceTier": "unit",
+      "evidenceScope": "loopback",
+      "evidenceSource": "guard",
+      "guards": [
+        {
+          "command": "node scripts/lib/mcp-endpoint-selector.test.mjs",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 164
+        }
+      ]
+    },
+    {
+      "id": "runtime-restart-multiple-listeners",
+      "title": "Runtime restart with multiple listeners",
+      "area": "recovery",
+      "expectation": "All configured listeners restored or startup fails cleanly",
+      "requiredScope": "loopback",
+      "requiredTier": "local_integration",
+      "deployment": false,
+      "status": "pass",
+      "evidenceTier": "local_integration",
+      "evidenceScope": "loopback",
+      "evidenceSource": "guard",
+      "guards": [
+        {
+          "command": "node --import tsx src/server/startup-recovery.test.ts",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 5803
+        }
+      ]
+    },
+    {
+      "id": "credential-rotation-during-reconnect",
+      "title": "Credential rotation during reconnect",
+      "area": "security",
+      "expectation": "Fresh credentials and authority used",
+      "requiredScope": "loopback",
+      "requiredTier": "unit",
+      "deployment": false,
+      "status": "pass",
+      "evidenceTier": "unit",
+      "evidenceScope": "loopback",
+      "evidenceSource": "guard",
+      "guards": [
+        {
+          "command": "node --import tsx src/peer/credentials.test.ts",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 282
+        }
+      ]
+    },
+    {
+      "id": "sse-idle-timeout-and-45s-post",
+      "title": "SSE idle timeout and 45-second POST",
+      "area": "transport",
+      "expectation": "Byte-level streaming evidence across the actual HTTPS chain",
+      "requiredScope": "public",
+      "requiredTier": "public_internet",
+      "deployment": true,
+      "status": "source_verified",
+      "evidenceTier": null,
+      "evidenceScope": null,
+      "evidenceSource": "none",
+      "reason": "the source-level guard passed, but public_internet/public evidence is still required",
+      "guards": [
+        {
+          "command": "node --import tsx src/server/mcp-sse-heartbeat.test.ts",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 542
+        },
+        {
+          "command": "node scripts/probe-ingress-bridge.test.mjs",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 1736
+        }
+      ]
+    },
+    {
+      "id": "packaged-installation-bridge-assets",
+      "title": "Packaged installation",
+      "area": "packaging",
+      "expectation": "Exact bridge assets and configuration included",
+      "requiredScope": "loopback",
+      "requiredTier": "local_integration",
+      "deployment": false,
+      "status": "pass",
+      "evidenceTier": "local_integration",
+      "evidenceScope": "loopback",
+      "evidenceSource": "guard",
+      "guards": [
+        {
+          "command": "npm run test:package-release",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 97248
+        }
+      ]
+    },
+    {
+      "id": "external-tls-or-dns-failure",
+      "title": "External TLS or DNS failure",
+      "area": "availability",
+      "expectation": "Accurate profile-specific failure classification",
+      "requiredScope": "public",
+      "requiredTier": "public_internet",
+      "deployment": true,
+      "status": "source_verified",
+      "evidenceTier": null,
+      "evidenceScope": null,
+      "evidenceSource": "none",
+      "reason": "the source-level guard passed, but public_internet/public evidence is still required",
+      "guards": [
+        {
+          "command": "node --import tsx src/ingress/tailscale-status.test.ts",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 668
+        },
+        {
+          "command": "node --import tsx src/ingress/health-store.test.ts",
+          "passed": true,
+          "exitCode": 0,
+          "signal": null,
+          "durationMs": 626
+        }
+      ]
+    }
+  ],
+  "blockers": [
+    "serve-mapping-exact-match: source_verified (the source-level guard passed, but real_tailnet/tailnet evidence is still required)",
+    "funnel-public-authenticated: source_verified (the source-level guard passed, but public_internet/public evidence is still required)",
+    "funnel-removed-during-sse: source_verified (the source-level guard passed, but public_internet/public evidence is still required)",
+    "forged-forwarded-and-x-kontrol-headers: source_verified (the source-level guard passed, but public_internet/public evidence is still required)",
+    "sse-idle-timeout-and-45s-post: source_verified (the source-level guard passed, but public_internet/public evidence is still required)",
+    "external-tls-or-dns-failure: source_verified (the source-level guard passed, but public_internet/public evidence is still required)"
+  ]
+}

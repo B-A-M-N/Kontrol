@@ -41,7 +41,7 @@ export function normalizeBuildId(value) {
 
 export function readReceipt(receiptPath) {
   if (!existsSync(receiptPath)) {
-    fail(`no final qualification receipt at ${receiptPath}. Publication requires a completed 12-hour soak and gate:beta:final.`);
+    fail(`no final qualification receipt at ${receiptPath}. Publication requires the qualified deployment uptime and continuity evidence from gate:beta:final.`);
   }
   let receipt;
   try {

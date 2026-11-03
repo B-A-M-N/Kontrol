@@ -16,7 +16,7 @@
 // corrupting the checkout.
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { runQualificationProcess } from "./lib/qualification-process.mjs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -44,9 +44,9 @@ if (explicitCandidate && !skipBuild) {
 }
 
 // P0 (fail-closed publication): publishing is only possible for an EXACT
-// qualified candidate. The 12-hour soak qualifies one immutable artifact; a
-// fresh build has never been soaked, so the "build if necessary" branch is
-// removed from the publish path entirely. Publication requires:
+// qualified candidate. Deployment and continuity evidence qualify one
+// immutable artifact; a fresh build has not earned that evidence, so the
+// "build if necessary" branch is removed from the publish path. Publication requires:
 //   --publish --skip-build --candidate <qualified-candidate-dir>
 //   KONTROL_RELEASE_BUILD_ID=<qualified buildId>
 // and the full release-verify gate (combined qualified receipt, receipt
@@ -70,8 +70,8 @@ if (publish || verifyOnly) {
 }
 
 // Release coupling: when invoked under a release buildId, the staged
-// candidate must BE that candidate. A rebuild is never acceptable (the
-// 12-hour soak qualifies an exact artifact), so any mismatch is fatal.
+// candidate must BE that candidate. A rebuild is never acceptable because
+// qualification is bound to an exact artifact, so any mismatch is fatal.
 const releaseBuildId = process.env.KONTROL_RELEASE_BUILD_ID;
 if (skipBuild && releaseBuildId) {
   // Enforced after the build result is read below.
@@ -80,17 +80,27 @@ const buildResultPath = process.env.KONTROL_BUILD_RESULT_PATH
   ? resolve(root, process.env.KONTROL_BUILD_RESULT_PATH)
   : join(root, ".kontrol-build-result.json");
 
-function run(command, args, options = {}) {
-  const result = spawnSync(command, args, {
+const stageRunId = process.env.KONTROL_BETA_RUN_ID ?? `package-stage-${Date.now().toString(36)}`;
+// Build steps run under the shared qualification executor with an absolute
+// deadline: a hung npm build can no longer stall staging silently.
+async function run(command, args, options = {}) {
+  const receipt = await runQualificationProcess({
+    runId: stageRunId,
+    phaseId: options.phase ?? [command, ...args].join(" ").slice(0, 80),
+    command,
+    args,
     cwd: options.cwd ?? root,
     env: buildToolEnvironment(process.env, { overrides: options.env ?? {} }),
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
+    deadlineMs: options.deadlineMs ?? 10 * 60_000,
   });
-  if (result.status !== 0) {
-    throw new Error(`${command} ${args.join(" ")} failed (exit ${result.status}):\n${result.stderr || result.stdout}`);
+  if (receipt.status !== "PASSED") {
+    throw new Error(
+      `${command} ${args.join(" ")} ${receipt.status.toLowerCase()} ` +
+      `(exit ${receipt.exitCode ?? "n/a"}${receipt.signal ? `/${receipt.signal}` : ""}` +
+      `${receipt.timedOut ? ` after ${receipt.deadlineMs}ms` : ""}):\n${receipt.outputTail}`,
+    );
   }
-  return result.stdout;
+  return receipt.outputTail;
 }
 
 // 1. Build the immutable candidate (or reuse a just-produced build result, or
@@ -114,7 +124,7 @@ if (explicitCandidate) {
   }
 } else {
   if (!skipBuild) {
-    run("npm", ["run", "build"], { env: { KONTROL_BUILD_RESULT_PATH: buildResultPath } });
+    await run("npm", ["run", "build"], { env: { KONTROL_BUILD_RESULT_PATH: buildResultPath } });
   }
   if (!existsSync(buildResultPath)) {
     throw new Error(`no build result at ${buildResultPath}; run \`npm run build\` first (or drop --skip-build)`);
@@ -223,10 +233,9 @@ delete stagedPackageJson.scripts.postpack;
 delete stagedPackageJson.scripts.prepublishOnly;
 
 // P0 (published dependency closure): pin the published dependencies to the
-// EXACT versions recorded in the candidate's build identity — the closure the
-// soak actually qualified. A caret range would let a later `npm install`
-// resolve newer dependency releases than anything the 12-hour soak exercised,
-// so @b-a-m-n/kontrol@X would no longer identify the qualified runtime.
+// EXACT versions recorded in the candidate's build identity — the dependency
+// closure exercised during qualification. A caret range could let a later
+// `npm install` resolve a different runtime than the qualified candidate.
 const buildIdentity = JSON.parse(readFileSync(join(candidatePath, "build-meta.json"), "utf8"));
 if (buildIdentity.dependencies && typeof buildIdentity.dependencies === "object") {
   const declared = stagedPackageJson.dependencies ?? {};
@@ -274,7 +283,7 @@ if (!publish) {
   mkdirSync(packDestination, { recursive: true });
   packArgs.push("--pack-destination", packDestination);
 }
-run("npm", packArgs, { cwd: stagedPkg });
+await run("npm", packArgs, { cwd: stagedPkg });
 
 if (publish) {
   console.log(`[package-stage] published ${stagedPackageJson.name}@${stagedPackageJson.version} from staged tree ${stagedPkg} (candidate ${buildResult.buildId})`);

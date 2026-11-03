@@ -86,7 +86,7 @@ if [[ "$QUALIFY_MODE" == "1" ]]; then
     const requested = Number(process.argv[1]);
     const minimum = Number(process.argv[2]);
     process.exit(Number.isFinite(requested) && requested > 0 && Number.isFinite(minimum) && minimum > 0 ? 0 : 1);
-  ' "${KONTROL_BETA_SOAK_HOURS:-12}" "${KONTROL_BETA_MIN_SOAK_HOURS:-12}"; then
+  ' "${KONTROL_BETA_SOAK_HOURS:-1}" "${KONTROL_BETA_MIN_SOAK_HOURS:-1}"; then
     echo "ERROR: KONTROL_BETA_SOAK_HOURS and KONTROL_BETA_MIN_SOAK_HOURS must be positive numbers." >&2
     exit 1
   fi
@@ -553,13 +553,13 @@ update_dist_projection() {
 
 start_beta_soak_monitor() {
   local configured_hours minimum_hours hours soak_url workspace_path read_path report_path log_path soak_transport
-  configured_hours="${KONTROL_BETA_SOAK_HOURS:-12}"
-  minimum_hours="${KONTROL_BETA_MIN_SOAK_HOURS:-12}"
+  configured_hours="${KONTROL_BETA_SOAK_HOURS:-1}"
+  minimum_hours="${KONTROL_BETA_MIN_SOAK_HOURS:-1}"
   if ! hours="$(node -e '
     const requested = Number(process.argv[1]);
     const minimum = Number(process.argv[2]);
     if (!Number.isFinite(requested) || requested <= 0 || !Number.isFinite(minimum) || minimum <= 0) process.exit(1);
-    process.stdout.write(String(Math.max(12, requested, minimum)));
+    process.stdout.write(String(Math.max(requested, minimum)));
   ' "$configured_hours" "$minimum_hours")"; then
     echo "ERROR: KONTROL_BETA_SOAK_HOURS and KONTROL_BETA_MIN_SOAK_HOURS must be positive numbers." >&2
     return 1
@@ -688,6 +688,51 @@ if [[ "$START_CRUSH_ADAPTER" == "true" ]]; then
   echo "[*] Coding agent: CRUSH ($CRUSH_BIN)"
 fi
 
+# Muse Code and MuseFI run through the generic ACP stdio duplex adapter as
+# two independent profiles. They are opt-in (START_MUSE_ADAPTER /
+# START_MUSEFI_ADAPTER, default false): each gets its own adapter port, agent
+# name, state root, and child environment. The experimental ACP gate must be
+# enabled in the launched agent's environment via ACP_STDIO_AGENT_ENV_JSON —
+# safeEnv() and the child-env allowlist both refuse names containing "ACP",
+# so the allowlist can never carry the experimental gate.
+MUSE_ACP_PORT="${MUSE_ACP_PORT:-9922}"
+MUSEFI_ACP_PORT="${MUSEFI_ACP_PORT:-9923}"
+MUSE_ADAPTER_LOG="${TMPDIR:-/tmp}/kontrol-adapter-muse.log"
+MUSEFI_ADAPTER_LOG="${TMPDIR:-/tmp}/kontrol-adapter-musefi.log"
+START_MUSE_ADAPTER="${START_MUSE_ADAPTER:-false}"
+START_MUSEFI_ADAPTER="${START_MUSEFI_ADAPTER:-false}"
+
+# check_muse_acp <bin-var-name> <label>: resolve the binary and prove its
+# experimental ACP entry point exists. Fail closed when explicitly enabled.
+check_muse_acp() {
+  local bin_var_name="$1" label="$2"
+  local bin_path="${!bin_var_name:-}"
+  if [[ -z "$bin_path" ]]; then
+    bin_path="$(command -v "$3" 2>/dev/null || true)"
+  fi
+  if [[ -z "$bin_path" || ! -x "$bin_path" ]]; then
+    echo "ERROR: ${label} binary not executable: ${bin_path:-<not found>}. Set $1 to the agent executable, or set START_${label}_ADAPTER=false." >&2
+    return 1
+  fi
+  local acp_help
+  acp_help="$(MUSE_EXPERIMENTAL_ACP=on "$bin_path" acp --help 2>&1 || true)"
+  if ! grep -q "Agent Client Protocol (ACP v1)" <<<"$acp_help"; then
+    echo "ERROR: ${label} binary does not expose an ACP v1 interface (MUSE_EXPERIMENTAL_ACP=on $bin_path acp --help)." >&2
+    return 1
+  fi
+  printf -v "$bin_var_name" "%s" "$bin_path"
+}
+
+if [[ "$START_MUSE_ADAPTER" == "true" ]]; then
+  if ! check_muse_acp MUSE_BIN "MUSE" "muse"; then return 1; fi
+  echo "[*] Coding agent: Muse Code ACP ($MUSE_BIN)"
+fi
+
+if [[ "$START_MUSEFI_ADAPTER" == "true" ]]; then
+  if ! check_muse_acp MUSEFI_BIN "MUSEFI" "musefi"; then return 1; fi
+  echo "[*] Coding agent: MuseFI ACP ($MUSEFI_BIN)"
+fi
+
 if [[ "$START_HERMES_ADAPTER" != "false" ]]; then
   HERMES_COMMAND="${HERMES_BIN:-hermes}"
   HERMES_ACP_CHECK_COMMAND=()
@@ -730,6 +775,15 @@ fi
 # required Hermes generation is pinned in KONTROL_ACP_AGENTS here.
 if [[ "$START_HERMES_ADAPTER" == "true" ]]; then
   REQUIRED_AGENT_CONFIG="${REQUIRED_AGENT_CONFIG:+$REQUIRED_AGENT_CONFIG,}hermes-agent=http://127.0.0.1:${HERMES_ACP_PORT}"
+fi
+# Opt-in Muse profiles pin their own agent names. The smoke step below proves
+# each adapter is reachable, authenticated, and negotiating ACP before the
+# probe asserts it dispatchable; a failed smoke aborts boot (fail closed).
+if [[ "$START_MUSE_ADAPTER" == "true" ]]; then
+  REQUIRED_AGENT_CONFIG="${REQUIRED_AGENT_CONFIG:+$REQUIRED_AGENT_CONFIG,}muse-code=http://127.0.0.1:${MUSE_ACP_PORT}"
+fi
+if [[ "$START_MUSEFI_ADAPTER" == "true" ]]; then
+  REQUIRED_AGENT_CONFIG="${REQUIRED_AGENT_CONFIG:+$REQUIRED_AGENT_CONFIG,}musefi=http://127.0.0.1:${MUSEFI_ACP_PORT}"
 fi
 if [[ -n "$REQUIRED_AGENT_CONFIG" ]]; then
   export KONTROL_ACP_AGENTS="$REQUIRED_AGENT_CONFIG"
@@ -898,6 +952,28 @@ if [[ "$START_HERMES_ADAPTER" == "true" || "$START_HERMES_ADAPTER" == "auto" ]];
       return 1
     fi
   fi
+fi
+
+# launch_muse_adapter <Label> <session> <port> <bin> <agent-name> <log>:
+# start one generic stdio duplex adapter instance for a Muse profile with an
+# isolated state root, agent name, and child environment. The child inherits
+# only the sanitized base plus the allowlisted experimental ACP gate.
+launch_muse_adapter() {
+  local label="$1" session="$2" port="$3" bin="$4" agent_name="$5" log="$6"
+  echo "[*] Starting ${label} ACP adapter on 127.0.0.1:${port} ..."
+  tmux new-session -d -s "$session" -c "$DESKTOP_PWD" "set -a && source ${ENV_FILE_QUOTED} && set +a && ${GENERATION_EXPORT} exec env ACP_STDIO_AGENT_NAME=${agent_name} ACP_STDIO_AGENT_DESCRIPTION='${label} (experimental ACP v1) via generic stdio duplex adapter' ACP_STDIO_COMMAND='${bin}' ACP_STDIO_ARGS_JSON='[\"acp\"]' ACP_STDIO_ADAPTER_PORT=${port} KONTROL_STATE_DIR='${KONTROL_STATE_DIR}/adapters/stdio-${agent_name}' ACP_STDIO_AGENT_ENV_JSON='{\"MUSE_EXPERIMENTAL_ACP\":\"on\"}' node scripts/acp-stdio-duplex-adapter.mjs > '$log' 2>&1"
+  LAUNCHED_SESSIONS+=("$session")
+  wait_adapter_health "$label" "$port" "$session" "$log" || return 1
+  smoke_adapter "$label" "$port" "$agent_name" "$session" || return 1
+  EXPECTED_AGENT_ARGS+=(--agent "${agent_name}=http://127.0.0.1:${port}")
+}
+
+if [[ "$START_MUSE_ADAPTER" == "true" ]]; then
+  launch_muse_adapter "Muse" "kontrol-adapter-muse" "$MUSE_ACP_PORT" "$MUSE_BIN" "muse-code" "$MUSE_ADAPTER_LOG" || return 1
+fi
+
+if [[ "$START_MUSEFI_ADAPTER" == "true" ]]; then
+  launch_muse_adapter "MuseFI" "kontrol-adapter-musefi" "$MUSEFI_ACP_PORT" "$MUSEFI_BIN" "musefi" "$MUSEFI_ADAPTER_LOG" || return 1
 fi
 
 # Prove the registry and the real MCP tool path after adapters have registered.

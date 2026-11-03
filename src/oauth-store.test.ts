@@ -147,6 +147,11 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 104, name: "scheduled-job-peer-pull-target" },
       { version: 105, name: "durable-agent-reply-dispatch-ack" },
       { version: 106, name: "startup-recovery-selective-indexes" },
+      { version: 107, name: "review-browser-durable-auth-ownership" },
+      { version: 108, name: "review-browser-launch-diagnostics" },
+      { version: 109, name: "review-route-skill-provenance" },
+      { version: 110, name: "review-browser-partial-observations" },
+      { version: 111, name: "review-browser-terminal-outcome" },
     ]);
   } finally {
     database.close();
