@@ -6,7 +6,7 @@
 // stable-beta receipt.
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { MINIMUM_DEPLOYMENT_UPTIME_MS, validateBetaDeploymentUptimeReceipt, validateBetaFaultMatrix } from "./beta-soak-contract.mjs";
@@ -210,7 +210,13 @@ async function runEvidencePhase(id, command, args, evidence) {
   return passed;
 }
 
-const dirtyPaths = gitStatus();
+// The gate's own controller lease lives next to the receipt by design (it
+// serializes concurrent gate runs). It is gate runtime state, never source,
+// so the cleanliness probe excludes exactly the lease file this gate owns;
+// any other untracked or modified path still fails the check.
+const dirtyPaths = gitStatus().filter(
+  (entry) => entry.slice(3) !== relative(root, leasePath),
+);
 const cleanPass = dirtyPaths.length === 0;
 receipt.source = {
   started: {
