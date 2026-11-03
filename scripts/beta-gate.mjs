@@ -6,7 +6,7 @@
 // stable-beta receipt.
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { MINIMUM_DEPLOYMENT_UPTIME_MS, validateBetaDeploymentUptimeReceipt, validateBetaFaultMatrix } from "./beta-soak-contract.mjs";
@@ -88,7 +88,15 @@ receipt.runId = gateRunId;
 // gate; a dead controller's unsettled "running" phases are reconciled to
 // "interrupted" before this run appends its own evidence. A receipt can
 // never again retain a permanent "running" status across gate restarts.
-const leasePath = `${receiptPath}.controller-lease.json`;
+// The controller lease lives outside the checkout in the machine-local temp
+// area: it is gate runtime state, and a lease file inside the repo would be
+// counted by every git-status cleanliness probe and by the candidate's own
+// gitDirty tally, making the gate fail its own source-identity check by
+// construction. The probes additionally exclude the lease by exact name so a
+// receipt path overridden back into the tree still cannot pollute them.
+const leaseDir = join(tmpdir(), "kontrol-beta-gate-leases");
+mkdirSync(leaseDir, { recursive: true });
+const leasePath = join(leaseDir, `${basename(receiptPath)}.controller-lease.json`);
 {
   const lease = acquireControllerLease({
     leasePath, runId: gateRunId, receiptPath,
