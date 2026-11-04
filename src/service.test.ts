@@ -10,7 +10,7 @@ import { captureMigrationBackup } from "./db/deployment-backup.js";
 import { acquireDeploymentLock, releaseDeploymentLock } from "./deployment-lock.js";
 import { readInstalledPort } from "./service.js";
 import { LATEST_SCHEMA_VERSION } from "./db/migrations.js";
-import { readServiceBuild, renderServiceComponentUnit, renderUserServiceUnit, requireTunnelReviewerWiring, runServiceCommand, servicePaths, withTunnelReviewerAuth } from "./service.js";
+import { probeTunnelChannel, readServiceBuild, recoverTunnel, renderServiceComponentUnit, renderUserServiceUnit, requireTunnelReviewerWiring, runServiceCommand, servicePaths, waitForCoreReady, withTunnelReviewerAuth } from "./service.js";
 import { writeKontrolAuth, writeKontrolConfig } from "./user-config.js";
 
 const root = mkdtempSync(join(tmpdir(), "kontrol-service-test-"));
@@ -252,9 +252,12 @@ try {
     // Install's daemon-reload happens once after the whole unit set lands.
     assert.ok(calls.some((call) => call === "daemon-reload"), "daemon-reload after component install");
 
-    // Status reports the target and each configured component.
+    // Status reports the target and each configured component. Units are
+    // stubbed inactive: fixture component names collide with real
+    // production units on a live machine, and the tunnel channel probe
+    // must never touch a non-fixture endpoint from a hermetic test.
     calls.length = 0;
-    await runServiceCommand(["status"], env, { ...dependencies, requireSystemd: () => undefined });
+    await runServiceCommand(["status"], env, { ...dependencies, requireSystemd: () => undefined, probeUnit: () => "inactive" as const });
     assert.ok(calls.some((call) => call.includes("kontrol.target") && call.includes("kontrol-hermes.service") && call.includes("kontrol-tunnel.service")), `status calls: ${calls.join(" | ")}`);
 
     // Removing a component from the configuration deletes its unit at install.
@@ -801,9 +804,9 @@ try {
       assert.equal(existsSync(join(dirname(servicePaths(env).unitPath), "kontrol-tunnel.service")), false, "failed install removes the units it added");
     }
 
-    // 11. A systemd-active auxiliary that accepts no connections degrades
-    // status: functional readiness is probed over real TCP, not inferred
-    // from unit state.
+    // 11. A systemd-active tunnel whose health endpoint is unreachable
+    // degrades status: the MCP channel cannot be operational when its
+    // admin surface does not answer.
     {
       const env = gateEnv("status-aux-down");
       const coreServer = createHttpServer((_req, res) => {
@@ -833,14 +836,15 @@ try {
         writeFileSync(join(fixturePaths.stateDir, "server.identity.json"), JSON.stringify({ buildId: installed.buildId, artifactPath: installed.artifactPath }));
         const report = await captureStatus(env, deps);
         assert.match(report, /kontrol service status: DEGRADED/);
-        assert.match(report, new RegExp(`not reachable on 127\\.0\\.0\\.1:${deadPort}`));
+        assert.match(report, new RegExp(`MCP channel not operational on 127\\.0\\.0\\.1:${deadPort}`));
       } finally {
         await new Promise<void>((resolve) => coreServer.close(() => resolve()));
       }
     }
 
     // 12. Full functional readiness through real local endpoints reports
-    // READY: live HTTP core plus a reachable auxiliary, identity matched.
+    // READY: live HTTP core plus an operational tunnel MCP channel,
+    // identity matched. A merely TCP-reachable tunnel is not enough.
     {
       const env = gateEnv("status-ready");
       const coreServer = createHttpServer((_req, res) => {
@@ -849,7 +853,10 @@ try {
       });
       await new Promise<void>((resolve) => coreServer.listen(0, "127.0.0.1", () => resolve()));
       const corePort = (coreServer.address() as { port: number }).port;
-      const tunnelServer = createTcpServer();
+      const tunnelServer = createHttpServer((_req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end('{"channels":[{"name":"main","enabled":true,"probe_status":"ok"}]}');
+      });
       await new Promise<void>((resolve) => tunnelServer.listen(0, "127.0.0.1", () => resolve()));
       const tunnelPort = (tunnelServer.address() as { port: number }).port;
       try {
@@ -870,7 +877,7 @@ try {
         const report = await captureStatus(env, deps);
         assert.match(report, /kontrol service status: READY/);
         assert.match(report, new RegExp(`readiness port ${corePort} \\(installed environment\\)`));
-        assert.match(report, new RegExp(`tunnel \\(kontrol-tunnel\\.service\\): active, endpoint 127\\.0\\.0\\.1:${tunnelPort} reachable \\(TCP transport only`));
+        assert.match(report, new RegExp(`tunnel \\(kontrol-tunnel\\.service\\): active, tunnel MCP channel operational \\(127\\.0\\.0\\.1:${tunnelPort}\\)`));
       } finally {
         await new Promise<void>((resolve) => coreServer.close(() => resolve()));
         await new Promise<void>((resolve) => tunnelServer.close(() => resolve()));
@@ -1118,8 +1125,10 @@ try {
     }
 
     // 15. Readiness is evidence-explicit, never silently fully qualified: a
-    // required auxiliary without a port stays READY on systemd state, but
-    // the report says its qualification is systemd-only.
+    // required adapter auxiliary without a port stays READY on systemd
+    // state, but the report says its qualification is systemd-only.
+    // (Tunnel components always get the HTTP channel probe — default port
+    // 8080 when unconfigured — so a tunnel can never be systemd-only.)
     {
       const env = gateEnv("status-state-only");
       const coreServer = createHttpServer((_req, res) => {
@@ -1131,7 +1140,7 @@ try {
       try {
         mkdirSync(join(gateRoot, "status-state-only"), { recursive: true });
         writeFileSync(join(gateRoot, "status-state-only", "environment"), `PORT=${corePort}\n`, { mode: 0o600 });
-        writeKontrolConfig({ serviceComponents: [{ name: "tunnel", kind: "tunnel", command: ["tunnel-client", "run"] }] }, env);
+        writeKontrolConfig({ serviceComponents: [{ name: "cache", kind: "adapter", command: ["node", "agent.js"] }] }, env);
         const deps: GateDeps = {
           currentArtifactPath: () => freshArtifact,
           requireSystemd: () => undefined,
@@ -1145,8 +1154,434 @@ try {
         writeFileSync(join(fixturePaths.stateDir, "server.identity.json"), JSON.stringify({ buildId: installed.buildId, artifactPath: installed.artifactPath }));
         const report = await captureStatus(env, deps);
         assert.match(report, /kontrol service status: READY/);
-        assert.match(report, /tunnel \(kontrol-tunnel\.service\): active, systemd state only; no functional probe configured/);
+        assert.match(report, /cache \(kontrol-cache\.service\): active, systemd state only; no functional probe configured/);
         assert.match(report, /core readiness verified; all required components active/);
+      } finally {
+        await new Promise<void>((resolve) => coreServer.close(() => resolve()));
+      }
+    }
+
+    // 18. Tunnel startup gate fails closed when the core is unavailable:
+    // connection refused rejects with the endpoint and the bound.
+    {
+      const stateDir = join(gateRoot, "gate-down", "state");
+      mkdirSync(stateDir, { recursive: true });
+      const deadListener = createTcpServer();
+      await new Promise<void>((resolve) => deadListener.listen(0, "127.0.0.1", () => resolve()));
+      const deadPort = (deadListener.address() as { port: number }).port;
+      await new Promise<void>((resolve) => deadListener.close(() => resolve()));
+      const started = Date.now();
+      await assert.rejects(
+        () => waitForCoreReady({ stateDir, port: deadPort, timeoutMs: 200, intervalMs: 10 }),
+        (error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          return /core was not ready within 200ms/.test(message)
+            && new RegExp(`127\\.0\\.0\\.1:${deadPort}`).test(message);
+        },
+        "unavailable core rejects with endpoint and bound",
+      );
+      assert.ok(Date.now() - started < 5_000, "the gate never blocks indefinitely");
+    }
+
+    // 19. The gate resolves once the core becomes ready after a delay, and
+    // 20. rejects within a finite bound when the core never becomes ready.
+    {
+      const stateDir = join(gateRoot, "gate-delayed", "state");
+      mkdirSync(stateDir, { recursive: true });
+      let calls = 0;
+      const flakyFetch = (async () => {
+        calls += 1;
+        if (calls <= 2) throw new Error("connect ECONNREFUSED");
+        return { ok: true, status: 200, json: async () => ({ ok: true }) } as unknown as Response;
+      }) as unknown as typeof fetch;
+      await waitForCoreReady({ stateDir, port: 1, fetchImpl: flakyFetch, timeoutMs: 5_000, intervalMs: 5 });
+      assert.equal(calls, 3, "the gate polls until the core answers");
+      const neverFetch = (async () => { throw new Error("connect ECONNREFUSED"); }) as unknown as typeof fetch;
+      const started = Date.now();
+      await assert.rejects(
+        () => waitForCoreReady({ stateDir, port: 1, fetchImpl: neverFetch, timeoutMs: 150, intervalMs: 5 }),
+        /core was not ready within 150ms/,
+      );
+      assert.ok(Date.now() - started < 5_000, "a never-ready core still fails within a finite bound");
+    }
+
+    // 21. The gate requires HTTP 200 + ok=true and the exact expected
+    // build: wrong payloads and identity drift fail closed.
+    {
+      const stateDir = join(gateRoot, "gate-identity", "state");
+      mkdirSync(stateDir, { recursive: true });
+      const okFetch = (async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) } as unknown as Response)) as unknown as typeof fetch;
+      await waitForCoreReady({ stateDir, port: 1, fetchImpl: okFetch, timeoutMs: 500, intervalMs: 5 });
+      const notOkFetch = (async () => ({ ok: true, status: 200, json: async () => ({ ok: false }) } as unknown as Response)) as unknown as typeof fetch;
+      await assert.rejects(
+        () => waitForCoreReady({ stateDir, port: 1, fetchImpl: notOkFetch, timeoutMs: 100, intervalMs: 5 }),
+        /ok !== true/,
+        "ok=false never passes the gate",
+      );
+      writeFileSync(join(stateDir, "server.identity.json"), JSON.stringify({ buildId: "build-other", artifactPath: "/other" }));
+      await assert.rejects(
+        () => waitForCoreReady({ stateDir, port: 1, fetchImpl: okFetch, timeoutMs: 100, intervalMs: 5, expectedBuildId: "build-expected", expectedArtifactPath: "/expected" }),
+        /does not match expected build-expected/,
+        "identity drift fails closed",
+      );
+      writeFileSync(join(stateDir, "server.identity.json"), JSON.stringify({ buildId: "build-expected", artifactPath: "/expected" }));
+      await waitForCoreReady({ stateDir, port: 1, fetchImpl: okFetch, timeoutMs: 500, intervalMs: 5, expectedBuildId: "build-expected", expectedArtifactPath: "/expected" });
+    }
+
+    // 22. Only tunnel units carry the startup gate: adapters and the core
+    // render no ExecStartPre, so no unrelated unit changes behavior.
+    {
+      const tunnelUnit = renderServiceComponentUnit(
+        { name: "t", kind: "tunnel", command: ["tunnel-client", "run"] },
+        { artifactPath: "/a", buildId: "b", environmentFile: "/e", workingDirectory: "/w" },
+      );
+      assert.match(tunnelUnit, /ExecStartPre=\/usr\/bin\/env node "\/a\/cli\.js" service wait-core-ready --timeout-ms 60000/);
+      const adapterUnit = renderServiceComponentUnit(
+        { name: "a", kind: "adapter", command: ["agent"] },
+        { artifactPath: "/a", buildId: "b", environmentFile: "/e", workingDirectory: "/w" },
+      );
+      assert.doesNotMatch(adapterUnit, /ExecStartPre/);
+      const coreUnit = renderUserServiceUnit({
+        serviceName: "kontrol-core.service",
+        artifactPath: "/a",
+        buildId: "b",
+        schemaVersion: 1,
+        maxReadableSchemaVersion: 1,
+        deploymentId: "d",
+        stateDir: "/s",
+        environmentFile: "/e",
+        workingDirectory: "/w",
+      });
+      assert.doesNotMatch(coreUnit, /ExecStartPre/);
+    }
+
+    // 22b. The channel probe parses the live /api/status shape: an enabled
+    // main channel with a non-failed probe is operational; a disabled or
+    // failed one is not; transport failures are unreachable, never healthy.
+    {
+      const body = (payload: unknown) => ({
+        ok: true,
+        status: 200,
+        json: async () => payload,
+      }) as unknown as Response;
+      const fetchOf = (payload: unknown) => (async () => body(payload)) as unknown as typeof fetch;
+      const liveDisabled = await probeTunnelChannel(1, fetchOf({
+        channels: [{ name: "main", enabled: false, server_kind: "external", transport_kind: "http-streamable", probe_status: "failed", probe_error: "dial tcp: connection refused", reason: "initial mcp probe failed" }],
+      }));
+      assert.equal(liveDisabled.reachable, true);
+      assert.equal(liveDisabled.operational, false);
+      assert.equal(liveDisabled.mainEnabled, false);
+      assert.equal(liveDisabled.probeStatus, "failed");
+      assert.match(liveDisabled.detail ?? "", /main\.enabled=false/);
+      const liveEnabled = await probeTunnelChannel(1, fetchOf({ channels: [{ name: "main", enabled: true, probe_status: "ok" }] }));
+      assert.equal(liveEnabled.operational, true);
+      const unreachable = await probeTunnelChannel(1, (async () => { throw new Error("connect ECONNREFUSED"); }) as unknown as typeof fetch);
+      assert.equal(unreachable.reachable, false);
+      assert.equal(unreachable.operational, undefined);
+      const nonJson = await probeTunnelChannel(1, (async () => ({ ok: true, status: 200, json: async () => { throw new Error("bad json"); } })) as unknown as typeof fetch);
+      assert.equal(nonJson.reachable, true);
+      assert.equal(nonJson.operational, false);
+    }
+
+    // 23. Status distinguishes the layers: core ready, tunnel process
+    // alive, but the MCP channel disabled reports DEGRADED (never READY)
+    // with the channel — not the process — named as the failure.
+    {
+      const env = gateEnv("status-channel-down");
+      const coreServer = createHttpServer((_req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end('{"ok":true}');
+      });
+      await new Promise<void>((resolve) => coreServer.listen(0, "127.0.0.1", () => resolve()));
+      const corePort = (coreServer.address() as { port: number }).port;
+      try {
+        mkdirSync(join(gateRoot, "status-channel-down"), { recursive: true });
+        writeFileSync(join(gateRoot, "status-channel-down", "environment"), `PORT=${corePort}\n`, { mode: 0o600 });
+        writeKontrolConfig({ serviceComponents: [{ name: "tunnel", kind: "tunnel", command: ["tunnel-client", "run"] }] }, env);
+        const deps: GateDeps = {
+          currentArtifactPath: () => freshArtifact,
+          requireSystemd: () => undefined,
+          systemctl: () => undefined,
+          waitForReady: async () => undefined,
+          probeUnit: () => "active",
+          probeTunnelChannel: async () => ({
+            reachable: true,
+            operational: false,
+            mainEnabled: false,
+            probeStatus: "failed",
+            detail: "main.enabled=false probe_status=failed reason=initial mcp probe failed",
+          }),
+        };
+        await runServiceCommand(["install"], env, deps);
+        const fixturePaths = servicePaths(env);
+        const installed = JSON.parse(readFileSync(fixturePaths.statePath, "utf8")) as { buildId: string; artifactPath: string };
+        writeFileSync(join(fixturePaths.stateDir, "server.identity.json"), JSON.stringify({ buildId: installed.buildId, artifactPath: installed.artifactPath }));
+        const report = await captureStatus(env, deps);
+        assert.match(report, /kontrol service status: DEGRADED/);
+        assert.doesNotMatch(report, /kontrol service status: READY/);
+        assert.match(report, /MCP channel not operational/);
+        assert.match(report, /main\.enabled=false/);
+        assert.doesNotMatch(report, /has not confirmed/, "core readiness itself is verified; only the channel failed");
+      } finally {
+        await new Promise<void>((resolve) => coreServer.close(() => resolve()));
+      }
+    }
+
+    // 24. Recovery restarts only the tunnel unit when the core is ready
+    // but the channel is disabled: exactly one restart, core and adapters
+    // untouched, unit/environment bytes and reviewer header preserved.
+    {
+      const env = gateEnv("recover-once");
+      const coreServer = createHttpServer((_req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end('{"ok":true}');
+      });
+      await new Promise<void>((resolve) => coreServer.listen(0, "127.0.0.1", () => resolve()));
+      const corePort = (coreServer.address() as { port: number }).port;
+      try {
+        mkdirSync(join(gateRoot, "recover-once"), { recursive: true });
+        writeFileSync(join(gateRoot, "recover-once", "environment"), `PORT=${corePort}\n`, { mode: 0o600 });
+        writeKontrolConfig({
+          serviceComponents: [
+            { name: "tunnel", kind: "tunnel", command: ["tunnel-client", "run", "--mcp.extra-headers", "X-Kontrol-Tunnel-Reviewer: env:KONTROL_ACP_REVIEWER_SECRET"] },
+            { name: "cache", kind: "adapter", command: ["node", "agent.js"] },
+          ],
+        }, env);
+        const systemctlCalls: string[][] = [];
+        const deps: GateDeps = {
+          currentArtifactPath: () => freshArtifact,
+          requireSystemd: () => undefined,
+          systemctl: (_paths, args) => { systemctlCalls.push(args); },
+          waitForReady: async () => undefined,
+          probeUnit: () => "active",
+        };
+        await runServiceCommand(["install"], env, deps);
+        const fixturePaths = servicePaths(env);
+        const installed = JSON.parse(readFileSync(fixturePaths.statePath, "utf8")) as { buildId: string; artifactPath: string };
+        writeFileSync(join(fixturePaths.stateDir, "server.identity.json"), JSON.stringify({ buildId: installed.buildId, artifactPath: installed.artifactPath }));
+        const unitDir = dirname(fixturePaths.unitPath);
+        const before = new Map<string, string>();
+        for (const file of [fixturePaths.unitPath, join(unitDir, "kontrol-tunnel.service"), join(unitDir, "kontrol-cache.service"), join(gateRoot, "recover-once", "environment")]) {
+          before.set(file, readFileSync(file, "utf8"));
+        }
+        assert.match(before.get(join(unitDir, "kontrol-tunnel.service")) ?? "", /X-Kontrol-Tunnel-Reviewer/, "reviewer assertion is installed inline");
+        const observedPorts: number[] = [];
+        let channelCalls = 0;
+        systemctlCalls.length = 0;
+        const result = await recoverTunnel(servicePaths(env), deps, env, {
+          settleTimeoutMs: 2_000,
+          settleIntervalMs: 5,
+          probeChannel: async (healthPort: number) => {
+            observedPorts.push(healthPort);
+            channelCalls += 1;
+            return channelCalls === 1
+              ? { reachable: true, operational: false, mainEnabled: false, probeStatus: "failed", detail: "main.enabled=false probe_status=failed" }
+              : { reachable: true, operational: true, mainEnabled: true, probeStatus: "ok", detail: "main channel enabled (probe ok)" };
+          },
+        });
+        assert.equal(result.outcome, "recovered");
+        assert.equal(result.restartedUnit, "kontrol-tunnel.service");
+        assert.deepEqual(systemctlCalls, [["restart", "kontrol-tunnel.service"]], "exactly one restart, core and adapters never addressed");
+        assert.deepEqual(observedPorts, [8080, 8080], "tunnel without an explicit port probes the default health port");
+        for (const [file, bytes] of before) {
+          assert.equal(readFileSync(file, "utf8"), bytes, `recovery rewrites no files: ${file}`);
+        }
+        assert.match(readFileSync(join(unitDir, "kontrol-tunnel.service"), "utf8"), /X-Kontrol-Tunnel-Reviewer/, "reviewer authorization survives recovery");
+      } finally {
+        await new Promise<void>((resolve) => coreServer.close(() => resolve()));
+      }
+    }
+
+    // 25. Recovery leaves the tunnel untouched while the core is down, and
+    // recovers once the core returns: no restart storm during an outage.
+    {
+      const env = gateEnv("recover-core-down");
+      const deadListener = createTcpServer();
+      await new Promise<void>((resolve) => deadListener.listen(0, "127.0.0.1", () => resolve()));
+      const corePort = (deadListener.address() as { port: number }).port;
+      await new Promise<void>((resolve) => deadListener.close(() => resolve()));
+      mkdirSync(join(gateRoot, "recover-core-down"), { recursive: true });
+      writeFileSync(join(gateRoot, "recover-core-down", "environment"), `PORT=${corePort}\n`, { mode: 0o600 });
+      writeKontrolConfig({ serviceComponents: [{ name: "tunnel", kind: "tunnel", command: ["tunnel-client", "run"] }] }, env);
+      const systemctlCalls: string[][] = [];
+      const deps: GateDeps = {
+        currentArtifactPath: () => freshArtifact,
+        requireSystemd: () => undefined,
+        systemctl: (_paths, args) => { systemctlCalls.push(args); },
+        waitForReady: async () => undefined,
+        probeUnit: () => "active",
+      };
+      await runServiceCommand(["install"], env, deps);
+      const fixturePaths = servicePaths(env);
+      const installed = JSON.parse(readFileSync(fixturePaths.statePath, "utf8")) as { buildId: string; artifactPath: string };
+      writeFileSync(join(fixturePaths.stateDir, "server.identity.json"), JSON.stringify({ buildId: installed.buildId, artifactPath: installed.artifactPath }));
+      systemctlCalls.length = 0;
+      const disabled = { reachable: true, operational: false, mainEnabled: false, probeStatus: "failed", detail: "main.enabled=false" };
+      const down = await recoverTunnel(servicePaths(env), deps, env, { probeChannel: async () => disabled });
+      assert.equal(down.outcome, "core-not-ready");
+      assert.deepEqual(systemctlCalls, [], "no restart while the core is down");
+      const coreServer = createHttpServer((_req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end('{"ok":true}');
+      });
+      await new Promise<void>((resolve) => coreServer.listen(corePort, "127.0.0.1", () => resolve()));
+      try {
+        let channelCalls = 0;
+        const up = await recoverTunnel(servicePaths(env), deps, env, {
+          settleTimeoutMs: 2_000,
+          settleIntervalMs: 5,
+          probeChannel: async () => {
+            channelCalls += 1;
+            return channelCalls === 1 ? disabled : { reachable: true, operational: true, detail: "main channel enabled (probe ok)" };
+          },
+        });
+        assert.equal(up.outcome, "recovered");
+        assert.deepEqual(systemctlCalls, [["restart", "kontrol-tunnel.service"]]);
+      } finally {
+        await new Promise<void>((resolve) => coreServer.close(() => resolve()));
+      }
+    }
+
+    // 26. Recovery refuses to restart once the attempt budget is spent
+    // inside the window: bounded backoff, no restart storm.
+    {
+      const env = gateEnv("recover-budget");
+      const coreServer = createHttpServer((_req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end('{"ok":true}');
+      });
+      await new Promise<void>((resolve) => coreServer.listen(0, "127.0.0.1", () => resolve()));
+      const corePort = (coreServer.address() as { port: number }).port;
+      try {
+        mkdirSync(join(gateRoot, "recover-budget"), { recursive: true });
+        writeFileSync(join(gateRoot, "recover-budget", "environment"), `PORT=${corePort}\n`, { mode: 0o600 });
+        writeKontrolConfig({ serviceComponents: [{ name: "tunnel", kind: "tunnel", command: ["tunnel-client", "run"] }] }, env);
+        const systemctlCalls: string[][] = [];
+        const deps: GateDeps = {
+          currentArtifactPath: () => freshArtifact,
+          requireSystemd: () => undefined,
+          systemctl: (_paths, args) => { systemctlCalls.push(args); },
+          waitForReady: async () => undefined,
+          probeUnit: () => "active",
+        };
+        await runServiceCommand(["install"], env, deps);
+        const fixturePaths = servicePaths(env);
+        const installed = JSON.parse(readFileSync(fixturePaths.statePath, "utf8")) as { buildId: string; artifactPath: string };
+        writeFileSync(join(fixturePaths.stateDir, "server.identity.json"), JSON.stringify({ buildId: installed.buildId, artifactPath: installed.artifactPath }));
+        systemctlCalls.length = 0;
+        const now = Date.now();
+        writeFileSync(
+          join(fixturePaths.stateDir, "tunnel-recovery.json"),
+          JSON.stringify({ attempts: [now, now - 60_000, now - 120_000].map((stamp) => new Date(stamp).toISOString()) }),
+        );
+        await assert.rejects(
+          () => recoverTunnel(servicePaths(env), deps, env, {
+            probeChannel: async () => ({ reachable: true, operational: false, detail: "still down" }),
+          }),
+          /recovery budget exhausted/,
+        );
+        assert.deepEqual(systemctlCalls, [], "exhausted budget performs no restart");
+      } finally {
+        await new Promise<void>((resolve) => coreServer.close(() => resolve()));
+      }
+    }
+
+    // 27. An observed healthy channel clears the attempt journal, and
+    // 28. recovery with no tunnel configured is a no-op without restarts.
+    {
+      const env = gateEnv("recover-reset");
+      const coreServer = createHttpServer((_req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end('{"ok":true}');
+      });
+      await new Promise<void>((resolve) => coreServer.listen(0, "127.0.0.1", () => resolve()));
+      const corePort = (coreServer.address() as { port: number }).port;
+      try {
+        mkdirSync(join(gateRoot, "recover-reset"), { recursive: true });
+        writeFileSync(join(gateRoot, "recover-reset", "environment"), `PORT=${corePort}\n`, { mode: 0o600 });
+        writeKontrolConfig({ serviceComponents: [{ name: "tunnel", kind: "tunnel", command: ["tunnel-client", "run"] }] }, env);
+        const systemctlCalls: string[][] = [];
+        const deps: GateDeps = {
+          currentArtifactPath: () => freshArtifact,
+          requireSystemd: () => undefined,
+          systemctl: (_paths, args) => { systemctlCalls.push(args); },
+          waitForReady: async () => undefined,
+          probeUnit: () => "active",
+        };
+        await runServiceCommand(["install"], env, deps);
+        const fixturePaths = servicePaths(env);
+        const installed = JSON.parse(readFileSync(fixturePaths.statePath, "utf8")) as { buildId: string; artifactPath: string };
+        writeFileSync(join(fixturePaths.stateDir, "server.identity.json"), JSON.stringify({ buildId: installed.buildId, artifactPath: installed.artifactPath }));
+        systemctlCalls.length = 0;
+        writeFileSync(join(fixturePaths.stateDir, "tunnel-recovery.json"), JSON.stringify({ attempts: [new Date().toISOString()] }));
+        const reset = await recoverTunnel(servicePaths(env), deps, env, {
+          probeChannel: async () => ({ reachable: true, operational: true, detail: "main channel enabled (probe ok)" }),
+        });
+        assert.equal(reset.outcome, "already-operational");
+        assert.deepEqual(JSON.parse(readFileSync(join(fixturePaths.stateDir, "tunnel-recovery.json"), "utf8")), { attempts: [] });
+        assert.deepEqual(systemctlCalls, [], "a healthy channel needs no restart");
+      } finally {
+        await new Promise<void>((resolve) => coreServer.close(() => resolve()));
+      }
+      const bareEnv = gateEnv("recover-no-tunnel");
+      mkdirSync(join(gateRoot, "recover-no-tunnel"), { recursive: true });
+      writeFileSync(join(gateRoot, "recover-no-tunnel", "environment"), "PORT=9\n", { mode: 0o600 });
+      writeKontrolConfig({ serviceComponents: [] }, bareEnv);
+      const bareCalls: string[][] = [];
+      await runServiceCommand(["install"], bareEnv, {
+        currentArtifactPath: () => freshArtifact,
+        requireSystemd: () => undefined,
+        systemctl: (_paths, args) => { bareCalls.push(args); },
+        waitForReady: async () => undefined,
+      });
+      bareCalls.length = 0;
+      const noop = await recoverTunnel(servicePaths(bareEnv), {
+        requireSystemd: () => undefined,
+        systemctl: (_paths, args) => { bareCalls.push(args); },
+      }, bareEnv);
+      assert.equal(noop.outcome, "already-operational");
+      assert.deepEqual(bareCalls, [], "no tunnel means no restart");
+    }
+
+    // 29. Recovery serializes on the deployment lock: a live holder fails
+    // the second caller closed instead of stacking a second restart.
+    {
+      const env = gateEnv("recover-locked");
+      const coreServer = createHttpServer((_req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end('{"ok":true}');
+      });
+      await new Promise<void>((resolve) => coreServer.listen(0, "127.0.0.1", () => resolve()));
+      const corePort = (coreServer.address() as { port: number }).port;
+      try {
+        mkdirSync(join(gateRoot, "recover-locked"), { recursive: true });
+        writeFileSync(join(gateRoot, "recover-locked", "environment"), `PORT=${corePort}\n`, { mode: 0o600 });
+        writeKontrolConfig({ serviceComponents: [{ name: "tunnel", kind: "tunnel", command: ["tunnel-client", "run"] }] }, env);
+        const systemctlCalls: string[][] = [];
+        const deps: GateDeps = {
+          currentArtifactPath: () => freshArtifact,
+          requireSystemd: () => undefined,
+          systemctl: (_paths, args) => { systemctlCalls.push(args); },
+          waitForReady: async () => undefined,
+          probeUnit: () => "active",
+        };
+        await runServiceCommand(["install"], env, deps);
+        const fixturePaths = servicePaths(env);
+        const installed = JSON.parse(readFileSync(fixturePaths.statePath, "utf8")) as { buildId: string; artifactPath: string };
+        writeFileSync(join(fixturePaths.stateDir, "server.identity.json"), JSON.stringify({ buildId: installed.buildId, artifactPath: installed.artifactPath }));
+        systemctlCalls.length = 0;
+        const held = await acquireDeploymentLock(fixturePaths.stateDir, { operation: "test-holder", deploymentId: "test", pid: process.pid });
+        try {
+          await assert.rejects(
+            () => recoverTunnel(servicePaths(env), deps, env, {
+              probeChannel: async () => ({ reachable: true, operational: false, detail: "still down" }),
+            }),
+            /already in progress/,
+          );
+          assert.deepEqual(systemctlCalls, [], "a fenced-out recovery performs no restart");
+        } finally {
+          await releaseDeploymentLock(fixturePaths.stateDir, held.record.token);
+        }
       } finally {
         await new Promise<void>((resolve) => coreServer.close(() => resolve()));
       }

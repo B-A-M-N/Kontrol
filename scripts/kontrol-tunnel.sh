@@ -95,6 +95,15 @@ case "${1:-run}" in
     exit 0
     ;;
   run)
+    # Bounded core-readiness gate for direct/script starts (systemd units
+    # carry the same gate as ExecStartPre). Ordering the tunnel after the
+    # core is not readiness: without this wait the tunnel's single initial
+    # MCP probe can race a still-starting core and permanently disable its
+    # channel. Fails closed within KONTROL_TUNNEL_CORE_WAIT_MS (60s).
+    if ! "${POLICY_COMMAND[@]}" service wait-core-ready --timeout-ms "${KONTROL_TUNNEL_CORE_WAIT_MS:-60000}"; then
+      echo "ERROR: core was not ready; refusing to start the tunnel with a doomed initial probe." >&2
+      exit 1
+    fi
     exec tunnel-client run "${TUNNEL_ARGS[@]}"
     ;;
   --doctor|doctor)

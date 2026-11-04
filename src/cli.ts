@@ -1210,9 +1210,14 @@ async function runDoctor(options: { strict?: boolean } = {}): Promise<void> {
     const expectedMcp = config.authMode === "tunnel" ? mcp.status === 200 : mcp.status === 401;
     doctorResult("Local MCP initialize", expectedMcp ? "PASS" : mcp.status === 0 ? "UNAVAILABLE" : "FAIL", mcp.text);
     if (config.authMode === "tunnel") {
-      const tunnelHealth = await probe("http://127.0.0.1:8080/healthz");
+      // The health base URL is overridable so qualification fixtures can
+      // point the probe at an isolated endpoint instead of whatever happens
+      // to listen on the production default (a fixture must never report
+      // the health of an unrelated live tunnel as its own result).
+      const tunnelHealthBase = (process.env.KONTROL_TUNNEL_HEALTH_URL ?? "http://127.0.0.1:8080").replace(/\/+$/, "");
+      const tunnelHealth = await probe(`${tunnelHealthBase}/healthz`);
       doctorResult("Tunnel process", tunnelHealth.status === 200 ? "PASS" : tunnelHealth.status === 0 ? "UNAVAILABLE" : "FAIL", tunnelHealth.text);
-      const tunnelReady = await probe("http://127.0.0.1:8080/readyz");
+      const tunnelReady = await probe(`${tunnelHealthBase}/readyz`);
       doctorResult("Tunnel MCP initialize", tunnelReady.status === 200 ? "PASS" : tunnelReady.status === 0 ? "UNAVAILABLE" : "FAIL", tunnelReady.text);
       doctorResult("Tunnel MCP auth", "PASS", "delegated; no local bearer header");
     } else {
@@ -1393,7 +1398,7 @@ function printHelp(): void {
       "  kontrol config get      Print persisted config",
       "  kontrol config set publicBaseUrl <url|null>",
       "  kontrol config effective-policy --json",
-      "  kontrol service install|start|stop|restart|upgrade|status|logs|uninstall",
+      "  kontrol service install|start|stop|restart|upgrade|status|logs|uninstall|wait-core-ready|recover-tunnel",
       "  kontrol snapshots stats|gc",
       "  kontrol review-loop status|on|off|pause|resume --session <workSessionId>",
       "  kontrol review submit [--message <text>] [--client-mutation-id <stable-id>] [--no-wait]   Submit from an agent PTY and await feedback",

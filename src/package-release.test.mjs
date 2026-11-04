@@ -161,10 +161,16 @@ try {
 
   const servicePort = await unusedTcpPort();
   const serviceState = join(tmp, "installed-state");
+  // Fixture ownership for the tunnel health probe: the doctor must not read
+  // the ambient production tunnel on 127.0.0.1:8080. Point it at an
+  // unbound port so both tunnel checks report UNAVAILABLE instead of
+  // mistaking unrelated live state for the fixture's result.
+  const tunnelHealthPort = await unusedTcpPort();
   const serviceEnv = testHarnessEnvironment(process.env, { overrides: {
     HOST: "127.0.0.1",
     PORT: String(servicePort),
     KONTROL_AUTH_MODE: "tunnel",
+    KONTROL_TUNNEL_HEALTH_URL: `http://127.0.0.1:${tunnelHealthPort}`,
     KONTROL_ALLOWED_ROOTS: installPrefix,
     KONTROL_ALLOWED_HOSTS: "127.0.0.1,localhost",
     KONTROL_PUBLIC_BASE_URL: `http://127.0.0.1:${servicePort}`,
@@ -493,6 +499,11 @@ async function exerciseInstalledServiceLifecycle(installedPkg, tmpRoot) {
   const dependencies = {
     currentArtifactPath: () => join(installedPkg, "dist"),
     requireSystemd: () => undefined,
+    // Fixture ownership for stop verification: the stubbed systemctl never
+    // starts real units, so nothing is ever active. Without this stub the
+    // check shells to the ambient systemd manager, where an unrelated live
+    // stack (notably the fixed-name kontrol.target) would fail the fixture.
+    probeUnitActive: () => false,
     systemctl: (servicePaths, args) => {
       calls.push(args.join(" "));
       if (args[0] !== "start") return;

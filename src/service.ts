@@ -68,13 +68,15 @@ export interface ServiceCommandDependencies {
   probeUnit?: (unit: string) => UnitProbeState;
   /** Test seam for auxiliary endpoint reachability (status verdict). */
   probeComponentEndpoint?: (unit: string, port: number) => Promise<{ reachable: boolean; detail?: string }>;
+  /** Test seam for the tunnel MCP channel probe (status + recovery). */
+  probeTunnelChannel?: (healthPort: number) => Promise<TunnelChannelState>;
   /** Test seam for persistent enablement probes (member reconciliation). */
   probeUnitEnabled?: (unit: string) => boolean | null;
 }
 
 interface DeploymentRecord {
   deploymentId: string;
-  operation: "install" | "start" | "stop" | "restart" | "upgrade" | "uninstall";
+  operation: "install" | "start" | "stop" | "restart" | "upgrade" | "uninstall" | "recover-tunnel";
   stage: "prepare" | "prepared" | "stop" | "activate" | "rollback" | "commit" | "rollback_failed" | "failed";
   previous?: InstalledServiceState;
   candidate?: InstalledServiceState;
@@ -721,6 +723,7 @@ export function renderServiceComponentUnit(component: KontrolServiceComponent, o
   const command = component.kind === "tunnel" ? withTunnelReviewerAuth(component.command) : component.command;
   return renderComponentServiceUnit({
     serviceName: componentServiceName(component.name),
+    kind: component.kind,
     description: component.kind === "tunnel"
       ? `Kontrol Secure MCP Tunnel (${component.name})`
       : `Kontrol ACP adapter (${component.name})`,
@@ -736,6 +739,7 @@ export function renderComponentServiceUnit(options: {
   serviceName: string;
   description: string;
   command: string[];
+  kind: "adapter" | "tunnel";
   artifactPath: string;
   buildId: string;
   environmentFile: string;
@@ -747,6 +751,18 @@ export function renderComponentServiceUnit(options: {
     const substituted = part.replaceAll("@ARTIFACT", options.artifactPath);
     return /[\s"]/.test(substituted) ? systemdQuote(substituted) : substituted;
   }).join(" ");
+  const artifactCli = join(options.artifactPath, "cli.js");
+  // Tunnel-only startup gate: After= orders the tunnel after the core unit,
+  // but ordering is not readiness — without this gate a slow or restarting
+  // core makes the tunnel's single initial MCP probe fail, permanently
+  // disabling its channel (tunnel-client never re-probes). The gate fails
+  // closed within a finite timeout so systemd records a failed start and
+  // retries under the unit's existing burst limits instead of running a
+  // permanently degraded tunnel. Adapters manage their own startup and are
+  // intentionally not gated here.
+  const startupGate = options.kind === "tunnel"
+    ? [`ExecStartPre=/usr/bin/env node ${systemdQuote(artifactCli)} service wait-core-ready --timeout-ms ${TUNNEL_CORE_WAIT_TIMEOUT_MS}`]
+    : [];
   return [
     "[Unit]",
     `Description=${options.description}`,
@@ -766,6 +782,7 @@ export function renderComponentServiceUnit(options: {
     `EnvironmentFile=${options.environmentFile}`,
     `Environment=${systemdQuote(`KONTROL_LAUNCHER=systemd`)}`,
     `Environment=${systemdQuote(`KONTROL_EXPECTED_BUILD_ID=${options.buildId}`)}`,
+    ...startupGate,
     `ExecStart=/usr/bin/env ${execArgs}`,
     "Restart=on-failure",
     "RestartSec=5",
@@ -1112,6 +1129,16 @@ export interface InstalledPort {
 
 export const DEFAULT_SERVICE_PORT = 7676;
 
+/** Default tunnel-client health/admin port (tunnel-client's own default). */
+export const DEFAULT_TUNNEL_HEALTH_PORT = 8080;
+
+/**
+ * Default bound for the tunnel startup gate: long enough for a slow core
+ * (migrations, cold start) while fitting inside systemd's default 90s
+ * start timeout so an overrun fails closed instead of hanging the stack.
+ */
+export const TUNNEL_CORE_WAIT_TIMEOUT_MS = 60_000;
+
 /**
  * Readiness probe port from the installed service environment, never from
  * the invoking CLI process environment: the installed unit and the probe
@@ -1161,6 +1188,119 @@ function probeComponentEndpoint(_name: string, port: number, timeoutMs = 1500): 
     socket.once("timeout", () => fail("connection timed out"));
     socket.once("error", (error) => fail(error instanceof Error ? error.message : String(error)));
   });
+}
+
+export interface CoreReadyWaitOptions {
+  /** Directory holding server.identity.json (the core's live identity). */
+  stateDir: string;
+  /** Installed core HTTP port. */
+  port: number;
+  /** Expected deployed core build; identity mismatch fails closed when set. */
+  expectedBuildId?: string;
+  /** Expected artifact path; checked alongside the build id when set. */
+  expectedArtifactPath?: string;
+  /** Finite bound; never blocks indefinitely. */
+  timeoutMs?: number;
+  /** Delay between probes. */
+  intervalMs?: number;
+  /** Per-attempt HTTP timeout. */
+  attemptTimeoutMs?: number;
+  fetchImpl?: typeof fetch;
+}
+
+/**
+ * Bounded startup gate for the tunnel: waits for the core to answer
+ * /core-readyz with HTTP 200 + ok=true and (when expected identity is
+ * given) the exact deployed build. Ordering (After=) is not readiness —
+ * this is what stops the tunnel's single initial MCP probe from racing a
+ * still-starting core. Throws a descriptive error on timeout; never blocks
+ * indefinitely.
+ */
+export async function waitForCoreReady(options: CoreReadyWaitOptions): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? TUNNEL_CORE_WAIT_TIMEOUT_MS;
+  const intervalMs = options.intervalMs ?? 500;
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const endpoint = `http://127.0.0.1:${options.port}/core-readyz`;
+  const deadline = Date.now() + timeoutMs;
+  let lastDetail = "no attempts made";
+  for (;;) {
+    try {
+      const response = await fetchImpl(endpoint, { signal: AbortSignal.timeout(options.attemptTimeoutMs ?? 2_000) });
+      if (response.ok) {
+        const body = await response.json() as { ok?: boolean };
+        if (body.ok === true) {
+          if (options.expectedBuildId === undefined) return;
+          const identity = readJson<{ buildId?: string; artifactPath?: string }>(join(options.stateDir, "server.identity.json"));
+          if (identity?.buildId === options.expectedBuildId
+            && (options.expectedArtifactPath === undefined || identity.artifactPath === options.expectedArtifactPath)) return;
+          lastDetail = `core is ready but live identity ${identity?.buildId ?? "unknown"} does not match expected ${options.expectedBuildId}`;
+        } else {
+          lastDetail = "core answered but ok !== true";
+        }
+      } else {
+        lastDetail = `core answered HTTP ${response.status}`;
+      }
+    } catch (error) {
+      lastDetail = error instanceof Error ? error.message : String(error);
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`core was not ready within ${timeoutMs}ms (GET ${endpoint}): ${lastDetail}`);
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, intervalMs));
+  }
+}
+
+export interface TunnelChannelState {
+  /** The tunnel health endpoint answered. */
+  reachable: boolean;
+  /** The main MCP channel is enabled with a non-failed probe. */
+  operational?: boolean;
+  /** Raw main-channel enabled flag, when observed. */
+  mainEnabled?: boolean;
+  /** Raw main-channel probe status, when observed. */
+  probeStatus?: string;
+  /** Human-readable detail for verdicts and diagnostics (no secrets). */
+  detail?: string;
+}
+
+/**
+ * Application-level tunnel probe: unlike a TCP connect (process alive) or
+ * systemd state, this reports whether the main MCP channel is actually
+ * operational. A process-alive tunnel with a disabled channel is the exact
+ * failure mode Restart=on-failure cannot see.
+ */
+export async function probeTunnelChannel(
+  healthPort: number,
+  fetchImpl: typeof fetch = fetch,
+  timeoutMs = 2_000,
+): Promise<TunnelChannelState> {
+  const endpoint = `http://127.0.0.1:${healthPort}/api/status`;
+  let response: Response;
+  try {
+    response = await fetchImpl(endpoint, { signal: AbortSignal.timeout(timeoutMs) });
+  } catch (error) {
+    return { reachable: false, detail: error instanceof Error ? error.message : String(error) };
+  }
+  if (!response.ok) return { reachable: false, detail: `health endpoint answered HTTP ${response.status}` };
+  let body: { channels?: Array<{ name?: string; enabled?: boolean; probe_status?: string; probe_error?: string; reason?: string }> };
+  try {
+    body = await response.json() as typeof body;
+  } catch {
+    return { reachable: true, operational: false, detail: "health endpoint answered but /api/status is not JSON" };
+  }
+  const main = Array.isArray(body.channels) ? body.channels.find((channel) => channel?.name === "main") : undefined;
+  if (!main) return { reachable: true, operational: false, detail: "no main channel in /api/status" };
+  const operational = main.enabled === true && main.probe_status !== "failed";
+  const detail = operational
+    ? `main channel enabled (probe ${main.probe_status ?? "unknown"})`
+    : `main.enabled=${String(main.enabled)} probe_status=${main.probe_status ?? "unknown"}${main.probe_error ? ` probe_error=${main.probe_error.slice(0, 200)}` : ""}${main.reason ? ` reason=${main.reason.slice(0, 200)}` : ""}`;
+  return {
+    reachable: true,
+    operational,
+    ...(main.enabled !== undefined ? { mainEnabled: main.enabled } : {}),
+    ...(main.probe_status !== undefined ? { probeStatus: main.probe_status } : {}),
+    detail,
+  };
 }
 
 /** Bounded core-readiness check against the installed endpoint + identity. */
@@ -1321,6 +1461,141 @@ async function uninstall(paths: ServicePaths, dependencies: ServiceCommandDepend
 }
 
 /**
+ * Window and budget for tunnel recovery attempts. Restarts are the only
+ * mutation and each one is journaled; once the budget is spent inside the
+ * window, recovery refuses to act until an attempt ages out or a healthy
+ * probe clears the journal. This bounds the worst case to 3 restarts per
+ * 15 minutes no matter how often the command is invoked.
+ */
+export const TUNNEL_RECOVERY_WINDOW_MS = 15 * 60_000;
+export const TUNNEL_RECOVERY_MAX_ATTEMPTS = 3;
+export const TUNNEL_RECOVERY_SETTLE_TIMEOUT_MS = 30_000;
+
+export type TunnelRecoverOutcome = "already-operational" | "recovered" | "core-not-ready";
+
+export interface TunnelRecoverResult {
+  outcome: TunnelRecoverOutcome;
+  reason: string;
+  /** Unit that was restarted (only ever the tunnel unit, never the core). */
+  restartedUnit?: string;
+}
+
+export interface TunnelRecoverOptions {
+  /** Bound for the post-restart channel settle wait. */
+  settleTimeoutMs?: number;
+  /** Post-restart channel poll interval. */
+  settleIntervalMs?: number;
+  /** Test seam for the tunnel channel probe. */
+  probeChannel?: (healthPort: number) => Promise<TunnelChannelState>;
+}
+
+interface TunnelRecoveryJournal {
+  attempts: string[];
+}
+
+function readRecoveryJournal(stateDir: string): TunnelRecoveryJournal {
+  const journal = readJson<TunnelRecoveryJournal>(join(stateDir, "tunnel-recovery.json"));
+  if (!journal || !Array.isArray(journal.attempts)) return { attempts: [] };
+  const cutoff = Date.now() - TUNNEL_RECOVERY_WINDOW_MS;
+  return { attempts: journal.attempts.filter((stamp) => Number.isFinite(Date.parse(stamp)) && Date.parse(stamp) >= cutoff) };
+}
+
+/**
+ * Bounded tunnel-channel recovery through the deployment lock. Restarts only
+ * the tunnel unit — never the core, never any adapter — and only when the
+ * core is independently READY (restarting the tunnel while the core is down
+ * cannot help and would burn the budget). Concurrent invocations serialize
+ * on the deployment lock; a live holder fails the second caller closed
+ * instead of stacking a second restart. Unit files, the environment file,
+ * and credentials are never rewritten by this path, so reviewer
+ * authorization structurally survives recovery.
+ */
+export async function recoverTunnel(
+  paths: ServicePaths,
+  dependencies: ServiceCommandDependencies,
+  env: NodeJS.ProcessEnv = process.env,
+  options: TunnelRecoverOptions = {},
+): Promise<TunnelRecoverResult> {
+  return withDeploymentLock(paths, "recover-tunnel", async (_lock, deploymentId) => {
+    const installed = readInstalledState(paths);
+    if (!installed) throw new Error("No installed Kontrol service; run `kontrol service install` first.");
+    const record = makeRecord(deploymentId, "recover-tunnel", installed);
+    writeDeploymentRecord(paths, record);
+    try {
+      const tunnels = readServiceComponents(env).filter((component) => component.kind === "tunnel");
+      if (tunnels.length === 0) {
+        const result = { outcome: "already-operational", reason: "no tunnel component configured; nothing to recover" } as const;
+        updateDeploymentRecord(paths, record, { stage: "commit" });
+        return result;
+      }
+      if (tunnels.length > 1) {
+        throw new Error(`refusing tunnel recovery with ${tunnels.length} tunnel components configured (${tunnels.map((t) => t.name).join(", ")}); disambiguate first`);
+      }
+      const tunnel = tunnels[0]!;
+      const tunnelUnit = componentServiceName(tunnel.name);
+      const healthPort = tunnel.port ?? DEFAULT_TUNNEL_HEALTH_PORT;
+      if (!(await probeCoreReady(paths, installed))) {
+        const result = {
+          outcome: "core-not-ready",
+          reason: "core is not ready with the exact installed identity; tunnel left untouched (restarting it cannot help while the core is down)",
+        } as const;
+        updateDeploymentRecord(paths, record, { stage: "commit" });
+        return result;
+      }
+      const probeChannel = options.probeChannel ?? ((port: number) => probeTunnelChannel(port));
+      if ((await probeChannel(healthPort)).operational === true) {
+        writeJsonAtomic(join(paths.stateDir, "tunnel-recovery.json"), { attempts: [] } satisfies TunnelRecoveryJournal);
+        const result = { outcome: "already-operational", reason: `tunnel MCP channel is operational on 127.0.0.1:${healthPort}` } as const;
+        updateDeploymentRecord(paths, record, { stage: "commit" });
+        return result;
+      }
+      const journal = readRecoveryJournal(paths.stateDir);
+      if (journal.attempts.length >= TUNNEL_RECOVERY_MAX_ATTEMPTS) {
+        throw new Error(
+          `tunnel recovery budget exhausted (${journal.attempts.length} attempts within ${TUNNEL_RECOVERY_WINDOW_MS / 60_000} minutes); `
+          + "investigate the tunnel and core logs instead of restarting again",
+        );
+      }
+      // The only mutation on this path: restart the single tunnel unit.
+      // systemd guarantees at most one instance; the core and all adapters
+      // are never addressed here.
+      systemctl(paths, ["restart", tunnelUnit], dependencies);
+      const settleTimeoutMs = options.settleTimeoutMs ?? TUNNEL_RECOVERY_SETTLE_TIMEOUT_MS;
+      const settleIntervalMs = options.settleIntervalMs ?? 1_000;
+      const deadline = Date.now() + settleTimeoutMs;
+      let lastDetail = "no post-restart probe completed";
+      for (;;) {
+        const state = await probeChannel(healthPort);
+        if (state.operational === true) {
+          writeJsonAtomic(join(paths.stateDir, "tunnel-recovery.json"), { attempts: [] } satisfies TunnelRecoveryJournal);
+          const result = {
+            outcome: "recovered",
+            reason: `tunnel unit restarted and MCP channel is operational on 127.0.0.1:${healthPort}`,
+            restartedUnit: tunnelUnit,
+          } as const;
+          updateDeploymentRecord(paths, record, { stage: "commit" });
+          return result;
+        }
+        lastDetail = state.detail ?? "channel not operational";
+        if (Date.now() >= deadline) break;
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, settleIntervalMs));
+      }
+      writeJsonAtomic(
+        join(paths.stateDir, "tunnel-recovery.json"),
+        { attempts: [...journal.attempts, new Date().toISOString()] } satisfies TunnelRecoveryJournal,
+      );
+      throw new Error(`tunnel unit restarted but MCP channel is still not operational: ${lastDetail}`);
+    } catch (error) {
+      updateDeploymentRecord(paths, record, {
+        stage: "failed",
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+  });
+}
+
+/**
  * Authoritative aggregate verdict over the installed systemd stack. Unlike
  * raw `systemctl status` text, this binds the installed build, the live
  * process identity, the live database schema, and every required component
@@ -1381,7 +1656,21 @@ async function runStatus(paths: ServicePaths, dependencies: ServiceCommandDepend
     const state = states.get(c.name) ?? "unknown";
     let failed = state === "failed";
     let detail = state === "failed" || state === "unknown" ? `systemd reports ${state}` : undefined;
-    if (c.name !== "core" && state === "active" && c.port !== undefined) {
+    if (c.name !== "core" && state === "active" && c.kind === "tunnel") {
+      // Tunnel components get the application-level channel probe: a
+      // process-alive tunnel with a disabled MCP channel is degraded, not
+      // ready. TCP reachability alone cannot see that failure mode.
+      const healthPort = c.port ?? DEFAULT_TUNNEL_HEALTH_PORT;
+      const channel = dependencies.probeTunnelChannel
+        ? await dependencies.probeTunnelChannel(healthPort)
+        : await probeTunnelChannel(healthPort);
+      if (channel.operational === true) {
+        qualification.set(c.name, `tunnel MCP channel operational (127.0.0.1:${healthPort})`);
+      } else {
+        failed = true;
+        detail = `tunnel process alive but MCP channel not operational on 127.0.0.1:${healthPort} (${channel.detail ?? "no detail"})`;
+      }
+    } else if (c.name !== "core" && state === "active" && c.port !== undefined) {
       const endpoint = dependencies.probeComponentEndpoint
         ? await dependencies.probeComponentEndpoint(c.systemdUnit, c.port)
         : await probeComponentEndpoint(c.systemdUnit, c.port);
@@ -1478,7 +1767,30 @@ export async function runServiceCommand(args: string[], env: NodeJS.ProcessEnv =
     }
     return;
   }
-  if (args.length > 1) throw new Error(`Usage: kontrol service ${command ?? "install|start|stop|restart|upgrade|status|logs|uninstall"}`);
+  if (command === "wait-core-ready") {
+    const timeoutFlag = args.indexOf("--timeout-ms");
+    const timeoutMs = timeoutFlag === -1 ? TUNNEL_CORE_WAIT_TIMEOUT_MS : Number(args[timeoutFlag + 1]);
+    if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) throw new Error("Usage: kontrol service wait-core-ready [--timeout-ms N]");
+    const installed = readInstalledState(paths);
+    if (!installed) throw new Error("No installed Kontrol service; run `kontrol service install` first.");
+    await waitForCoreReady({
+      stateDir: paths.stateDir,
+      port: readInstalledPort(paths),
+      expectedBuildId: installed.buildId,
+      expectedArtifactPath: installed.artifactPath,
+      timeoutMs,
+    });
+    console.log(`core ready: build ${installed.buildId}`);
+    return;
+  }
+  if (command === "recover-tunnel") {
+    if (args.length > 1) throw new Error("Usage: kontrol service recover-tunnel");
+    requireSystemd(dependencies);
+    const result = await recoverTunnel(paths, dependencies, env);
+    console.log([`tunnel recovery: ${result.outcome}`, `reason: ${result.reason}`].join("\n"));
+    return;
+  }
+  if (args.length > 1) throw new Error(`Usage: kontrol service ${command ?? "install|start|stop|restart|upgrade|status|logs|uninstall|wait-core-ready|recover-tunnel"}`);
   if (command === "install") return install(paths, dependencies, env);
   if (command === "start") return activate(paths, "start", dependencies, env);
   if (command === "stop") return activate(paths, "stop", dependencies, env);
@@ -1517,5 +1829,5 @@ export async function runServiceCommand(args: string[], env: NodeJS.ProcessEnv =
     if (result.status !== 0) throw new Error(`journalctl --user -f -u ${units.join(" -u ")} failed with status ${result.status ?? "unknown"}`);
     return;
   }
-  throw new Error("Usage: kontrol service unit|install|start|stop|restart|upgrade|status|logs|uninstall");
+  throw new Error("Usage: kontrol service unit|install|start|stop|restart|upgrade|status|logs|uninstall|wait-core-ready|recover-tunnel");
 }
