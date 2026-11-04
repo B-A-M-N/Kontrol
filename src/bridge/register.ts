@@ -18,6 +18,7 @@ import { registerScheduleTools } from "./schedule-tools.js";
 import { registerReplyTools } from "./reply-tools.js";
 import { registerHandoffTools } from "./handoff-tools.js";
 import { registerAgentTools } from "./agent-tools.js";
+import { registerWorkResultTools } from "./work-result-tools.js";
 
 export function registerBridgeTools(server: McpServer, config: BridgeConfig): void {
   registerSessionTools(server, config);
@@ -32,6 +33,7 @@ export function registerBridgeTools(server: McpServer, config: BridgeConfig): vo
   registerReplyTools(server, config);
   registerHandoffTools(server, config);
   registerAgentTools(server, config);
+  registerWorkResultTools(server, config);
 }
 
   // Initial delegation has one model-facing path: discover_agents followed by
