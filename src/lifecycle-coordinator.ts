@@ -48,6 +48,7 @@ export const MANAGED_TMUX_SESSIONS = [
   "kontrol-adapter-hermes",
   "kontrol-adapter-muse",
   "kontrol-adapter-musefi",
+  "kontrol-adapter-openmuse",
   "kontrol-beta-soak",
 ] as const;
 

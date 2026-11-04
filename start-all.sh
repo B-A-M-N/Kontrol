@@ -688,19 +688,25 @@ if [[ "$START_CRUSH_ADAPTER" == "true" ]]; then
   echo "[*] Coding agent: CRUSH ($CRUSH_BIN)"
 fi
 
-# Muse Code and MuseFI run through the generic ACP stdio duplex adapter as
-# two independent profiles. They are opt-in (START_MUSE_ADAPTER /
-# START_MUSEFI_ADAPTER, default false): each gets its own adapter port, agent
-# name, state root, and child environment. The experimental ACP gate must be
-# enabled in the launched agent's environment via ACP_STDIO_AGENT_ENV_JSON —
-# safeEnv() and the child-env allowlist both refuse names containing "ACP",
-# so the allowlist can never carry the experimental gate.
+# Muse Code, MuseFI, and OpenMuse run through the generic ACP stdio duplex
+# adapter as three independent profiles. They are opt-in (START_MUSE_ADAPTER /
+# START_MUSEFI_ADAPTER / START_OPENMUSE_ADAPTER, default false): each gets its
+# own adapter port, agent name, state root, and child environment. The
+# experimental ACP gate must be enabled in the launched agent's environment
+# via ACP_STDIO_AGENT_ENV_JSON — safeEnv() and the child-env allowlist both
+# refuse names containing "ACP", so the allowlist can never carry the
+# experimental gate. OpenMuse is the OpenRouter free/stealth-only profile
+# (~/.config/muse-open, X-FI-Local-Client: openmuse); it never shares MuseFI's
+# config home, sessions, or agent identity.
 MUSE_ACP_PORT="${MUSE_ACP_PORT:-9922}"
 MUSEFI_ACP_PORT="${MUSEFI_ACP_PORT:-9923}"
+OPENMUSE_ACP_PORT="${OPENMUSE_ACP_PORT:-9924}"
 MUSE_ADAPTER_LOG="${TMPDIR:-/tmp}/kontrol-adapter-muse.log"
 MUSEFI_ADAPTER_LOG="${TMPDIR:-/tmp}/kontrol-adapter-musefi.log"
+OPENMUSE_ADAPTER_LOG="${TMPDIR:-/tmp}/kontrol-adapter-openmuse.log"
 START_MUSE_ADAPTER="${START_MUSE_ADAPTER:-false}"
 START_MUSEFI_ADAPTER="${START_MUSEFI_ADAPTER:-false}"
+START_OPENMUSE_ADAPTER="${START_OPENMUSE_ADAPTER:-false}"
 
 # check_muse_acp <bin-var-name> <label>: resolve the binary and prove its
 # experimental ACP entry point exists. Fail closed when explicitly enabled.
@@ -731,6 +737,11 @@ fi
 if [[ "$START_MUSEFI_ADAPTER" == "true" ]]; then
   if ! check_muse_acp MUSEFI_BIN "MUSEFI" "musefi"; then return 1; fi
   echo "[*] Coding agent: MuseFI ACP ($MUSEFI_BIN)"
+fi
+
+if [[ "$START_OPENMUSE_ADAPTER" == "true" ]]; then
+  if ! check_muse_acp OPENMUSE_BIN "OPENMUSE" "openmuse"; then return 1; fi
+  echo "[*] Coding agent: OpenMuse ACP ($OPENMUSE_BIN)"
 fi
 
 if [[ "$START_HERMES_ADAPTER" != "false" ]]; then
@@ -784,6 +795,9 @@ if [[ "$START_MUSE_ADAPTER" == "true" ]]; then
 fi
 if [[ "$START_MUSEFI_ADAPTER" == "true" ]]; then
   REQUIRED_AGENT_CONFIG="${REQUIRED_AGENT_CONFIG:+$REQUIRED_AGENT_CONFIG,}musefi=http://127.0.0.1:${MUSEFI_ACP_PORT}"
+fi
+if [[ "$START_OPENMUSE_ADAPTER" == "true" ]]; then
+  REQUIRED_AGENT_CONFIG="${REQUIRED_AGENT_CONFIG:+$REQUIRED_AGENT_CONFIG,}openmuse=http://127.0.0.1:${OPENMUSE_ACP_PORT}"
 fi
 if [[ -n "$REQUIRED_AGENT_CONFIG" ]]; then
   export KONTROL_ACP_AGENTS="$REQUIRED_AGENT_CONFIG"
@@ -974,6 +988,10 @@ fi
 
 if [[ "$START_MUSEFI_ADAPTER" == "true" ]]; then
   launch_muse_adapter "MuseFI" "kontrol-adapter-musefi" "$MUSEFI_ACP_PORT" "$MUSEFI_BIN" "musefi" "$MUSEFI_ADAPTER_LOG" || return 1
+fi
+
+if [[ "$START_OPENMUSE_ADAPTER" == "true" ]]; then
+  launch_muse_adapter "OpenMuse" "kontrol-adapter-openmuse" "$OPENMUSE_ACP_PORT" "$OPENMUSE_BIN" "openmuse" "$OPENMUSE_ADAPTER_LOG" || return 1
 fi
 
 # Prove the registry and the real MCP tool path after adapters have registered.

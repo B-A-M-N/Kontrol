@@ -44,10 +44,10 @@ import {
 
 // ── Exact tmux ownership: no prefix collisions ──
 {
-  for (const session of ["kontrol-server", "kontrol-tunnel", "kontrol-supervisor", "kontrol-adapter", "kontrol-adapter-crush", "kontrol-adapter-hermes", "kontrol-adapter-muse", "kontrol-adapter-musefi", "kontrol-beta-soak"]) {
+  for (const session of ["kontrol-server", "kontrol-tunnel", "kontrol-supervisor", "kontrol-adapter", "kontrol-adapter-crush", "kontrol-adapter-hermes", "kontrol-adapter-muse", "kontrol-adapter-musefi", "kontrol-adapter-openmuse", "kontrol-beta-soak"]) {
     assert.equal(isManagedTmuxSession(session), true, session);
   }
-  assert.equal(MANAGED_TMUX_SESSIONS.length, 9);
+  assert.equal(MANAGED_TMUX_SESSIONS.length, 10);
   for (const innocent of ["kontrol-server-x", "xkontrol-server", "kontrol-adapter-evil", "my-session", "kontrol-stdio-rogue"]) {
     assert.equal(isManagedTmuxSession(innocent), false, innocent);
   }

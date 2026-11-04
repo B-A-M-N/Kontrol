@@ -47,7 +47,7 @@ import {
 import { registerPolicyTools } from "../policy-tools.js";
 import { registerPeerStatusTool } from "../peer/peer-tools.js";
 import { registerIngressManagementTool } from "../ingress/ingress-tools.js";
-import { registerBridgeTools } from "../acp-bridge.js";
+import { registerBridgeToolsFront, registerBridgeToolsBack } from "../acp-bridge.js";
 // P1.3 decomposition: shared helpers live in focused modules. The names are
 // re-exported below so existing importers of ./mcp/workspace-server.js keep
 // working unchanged.
@@ -309,6 +309,77 @@ export function createMcpServer(
 
   registerWorkspaceAppResources(server, config, onWorkspaceAppResource);
 
+  // Front bridge slice (sessions/dispatch/messaging/result/events/review)
+  // registers BEFORE the workspace core tools: tools/list order is
+  // registration order and capped hosts (ChatGPT, ~55 tools) keep the first
+  // entries. The front slice is ~30 tools, so open_workspace — the first
+  // workspace tool — lands inside the first 55 together with every critical
+  // workflow tool. The back slice (continuation/mission/supervisor/schedule/
+  // handoff) registers after the workspace tools below. Guarded by
+  // mcp-tool-surface-contract.test.ts.
+  let bridgeConfig: Parameters<typeof registerBridgeToolsFront>[1] | undefined;
+  if (workSessions && config.acpEnabled && eventStore && reviewWorkflow && liveWaiters) {
+    bridgeConfig = {
+      db,
+      workspaces,
+      workSessions,
+      agentPtyBindingsForWorkSession: (workSessionId) => processSessions.listAgentPtyBindings(workSessionId)
+        .map(({ processSessionId, agentName, processGeneration, outputCursor, status, createdAt, finishedAt }) => ({
+          processSessionId, agentName, processGeneration, outputCursor, status, createdAt, finishedAt,
+        })),
+      observeAgentPty: (input) => {
+        const observation = processSessions.observeAgentPty(input);
+        if (!observation) return undefined;
+        const { ownerPrincipalId: _ownerPrincipalId, ...binding } = observation.binding;
+        return { ...observation, binding };
+      },
+      reviewCheckpoints,
+      agentRegistry: agentRegistry!,
+      eventStore,
+      continuationManager: continuationManager!,
+      dispatchOutbox,
+      reviewWorkflow,
+      missionLedger,
+      supervisorRuns,
+      onSupervisorResume,
+      onScheduledJobCreated,
+      agentMessages,
+      approvalRequests,
+      knownAgents: config.acpKnownAgents,
+      adapterSecret: config.acpAdapterSecret,
+      // P1 #10: pass server config to bridge so search_skills has access to skill paths.
+      serverConfig: config,
+      // Role is derived from the AUTHENTICATED envelope only. A connection is a
+      // WORKER solely when a signed worker token verified (see
+      // connectionContext.authenticatedRole); an ordinary MCP client is
+      // "client". Reviewer authority requires the separate reviewer credential.
+      // This lets the SAME bridge tool set enforce
+      // reviewer-only vs worker-only server-side without registering the tools
+      // twice — and crucially, a caller cannot gain worker rights by sending an
+      // unsigned X-Kontrol-Work-Session header (P0 #3).
+      principalRole: connectionContext?.authenticatedRole ?? "client",
+      principalId: mutationPrincipalId,
+      connectionContext,
+      mutationReceipts,
+      connectionContinuationId: connectionContext?.continuationId,
+      connectionWorkSessionId: connectionContext?.workSessionId,
+      connectionMcpSessionId: connectionContext?.mcpSessionId,
+      connectionConversationId: connectionContext?.conversationId,
+      connectionWorkspaceLeaseNonce: connectionContext?.workspaceLeaseNonce,
+      liveWaiters,
+      onPhaseTiming,
+      scheduledJobs,
+      reconcileScheduledJob,
+      reviewRoutes,
+      reviewBrowserController,
+      reviewThreads,
+      reviewBrowserJobs,
+      qualificationEvidence,
+      toolSurfaceVersion: mcpToolSurface.version,
+    };
+    registerBridgeToolsFront(server, bridgeConfig);
+  }
+
   const workspaceToolNames = registerWorkspaceTools(server, {
     config,
     workspaces,
@@ -335,6 +406,10 @@ export function createMcpServer(
     },
     scheduledJobFor: (workSessionId: string) => scheduledJobs?.getByWorkSessionId(workSessionId),
   });
+
+  // Back bridge slice (continuation/mission/supervisor/schedule/handoff):
+  // after the workspace tools, outside the ChatGPT 55-tool window.
+  if (bridgeConfig) registerBridgeToolsBack(server, bridgeConfig);
 
   // Process polling is available in every tool mode. This is the recovery
   // surface for a minimal-mode bash call whose original HTTP request ended.
@@ -552,67 +627,6 @@ export function createMcpServer(
     principalRole: connectionContext?.authenticatedRole ?? "client",
   });
 
-  if (workSessions && config.acpEnabled && eventStore && reviewWorkflow && liveWaiters) {
-    const bridgeConfig: Parameters<typeof registerBridgeTools>[1] = {
-      db,
-      workspaces,
-      workSessions,
-      agentPtyBindingsForWorkSession: (workSessionId) => processSessions.listAgentPtyBindings(workSessionId)
-        .map(({ processSessionId, agentName, processGeneration, outputCursor, status, createdAt, finishedAt }) => ({
-          processSessionId, agentName, processGeneration, outputCursor, status, createdAt, finishedAt,
-        })),
-      observeAgentPty: (input) => {
-        const observation = processSessions.observeAgentPty(input);
-        if (!observation) return undefined;
-        const { ownerPrincipalId: _ownerPrincipalId, ...binding } = observation.binding;
-        return { ...observation, binding };
-      },
-      reviewCheckpoints,
-      agentRegistry: agentRegistry!,
-      eventStore,
-      continuationManager: continuationManager!,
-      dispatchOutbox,
-      reviewWorkflow,
-      missionLedger,
-      supervisorRuns,
-      onSupervisorResume,
-      onScheduledJobCreated,
-      agentMessages,
-      approvalRequests,
-      knownAgents: config.acpKnownAgents,
-      adapterSecret: config.acpAdapterSecret,
-      // P1 #10: pass server config to bridge so search_skills has access to skill paths.
-      serverConfig: config,
-      // Role is derived from the AUTHENTICATED envelope only. A connection is a
-      // WORKER solely when a signed worker token verified (see
-      // connectionContext.authenticatedRole); an ordinary MCP client is
-      // "client". Reviewer authority requires the separate reviewer credential.
-      // This lets the SAME bridge tool set enforce
-      // reviewer-only vs worker-only server-side without registering the tools
-      // twice — and crucially, a caller cannot gain worker rights by sending an
-      // unsigned X-Kontrol-Work-Session header (P0 #3).
-      principalRole: connectionContext?.authenticatedRole ?? "client",
-      principalId: mutationPrincipalId,
-      connectionContext,
-      mutationReceipts,
-      connectionContinuationId: connectionContext?.continuationId,
-      connectionWorkSessionId: connectionContext?.workSessionId,
-      connectionMcpSessionId: connectionContext?.mcpSessionId,
-      connectionConversationId: connectionContext?.conversationId,
-      connectionWorkspaceLeaseNonce: connectionContext?.workspaceLeaseNonce,
-      liveWaiters,
-      onPhaseTiming,
-      scheduledJobs,
-      reconcileScheduledJob,
-      reviewRoutes,
-      reviewBrowserController,
-      reviewThreads,
-      reviewBrowserJobs,
-      qualificationEvidence,
-      toolSurfaceVersion: mcpToolSurface.version,
-    };
-    registerBridgeTools(server, bridgeConfig);
-  }
 
   const catalogObservationAvailable = toolListDescriptorObservation.finalizeRegistration();
   const descriptorCacheAvailable = toolListCacheInstallation.finalizeRegistration();

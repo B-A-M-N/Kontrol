@@ -20,20 +20,41 @@ import { registerHandoffTools } from "./handoff-tools.js";
 import { registerAgentTools } from "./agent-tools.js";
 import { registerWorkResultTools } from "./work-result-tools.js";
 
-export function registerBridgeTools(server: McpServer, config: BridgeConfig): void {
+/**
+ * Front slice: the ChatGPT-facing workflow (sessions, dispatch, messaging,
+ * agent discovery, result intake, events, review). Registration order is the
+ * tools/list order and capped hosts (ChatGPT, ~55 tools) keep the first
+ * entries, so this slice registers BEFORE the workspace tools in
+ * workspace-server.ts — that puts open_workspace (the first workspace tool)
+ * and every critical workflow tool within the first 55. Guarded by
+ * mcp-tool-surface-contract.test.ts (critical tools within 55).
+ */
+export function registerBridgeToolsFront(server: McpServer, config: BridgeConfig): void {
   registerSessionTools(server, config);
-  registerReviewTools(server, config);
+  registerDelegationTools(server, config);
+  registerMessageTools(server, config);
+  registerReplyTools(server, config);
+  registerAgentTools(server, config);
+  registerWorkResultTools(server, config);
   registerEventTools(server, config);
+  registerReviewTools(server, config);
+}
+
+/**
+ * Back slice: continuation, missions, supervisor, scheduling, and handoff.
+ * Not on the ChatGPT dispatch path; registers after the workspace tools.
+ */
+export function registerBridgeToolsBack(server: McpServer, config: BridgeConfig): void {
   registerContinuationTools(server, config);
   registerMissionTools(server, config);
   registerSupervisorTools(server, config);
-  registerDelegationTools(server, config);
-  registerMessageTools(server, config);
   registerScheduleTools(server, config);
-  registerReplyTools(server, config);
   registerHandoffTools(server, config);
-  registerAgentTools(server, config);
-  registerWorkResultTools(server, config);
+}
+
+export function registerBridgeTools(server: McpServer, config: BridgeConfig): void {
+  registerBridgeToolsFront(server, config);
+  registerBridgeToolsBack(server, config);
 }
 
   // Initial delegation has one model-facing path: discover_agents followed by

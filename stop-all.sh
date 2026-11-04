@@ -43,7 +43,7 @@ fi
 # src/lifecycle-coordinator.ts; lifecycle-coordinator.test.ts asserts they
 # match). Exact-match selectors (=name) below guarantee we never signal an
 # unrelated session by prefix collision.
-SESSIONS=("kontrol-server" "kontrol-tunnel" "kontrol-supervisor" "kontrol-adapter" "kontrol-adapter-crush" "kontrol-adapter-hermes" "kontrol-adapter-muse" "kontrol-adapter-musefi" "kontrol-beta-soak")
+SESSIONS=("kontrol-server" "kontrol-tunnel" "kontrol-supervisor" "kontrol-adapter" "kontrol-adapter-crush" "kontrol-adapter-hermes" "kontrol-adapter-muse" "kontrol-adapter-musefi" "kontrol-adapter-openmuse" "kontrol-beta-soak")
 if [[ "$CORE_ONLY" == "1" ]]; then
   SESSIONS=("kontrol-server")
 fi

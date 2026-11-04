@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-// P1 item 7: Muse Code and MuseFI run as two independent profiles on the
-// generic ACP stdio duplex adapter. This test proves, with two live adapter
-// instances and a fixture ACP agent each:
-//   1. distinct registration names (muse-code-test / musefi-test) and ports;
+// P1 item 7: Muse Code, MuseFI, and OpenMuse run as three independent
+// profiles on the generic ACP stdio duplex adapter. This test proves, with
+// three live adapter instances and a fixture ACP agent each:
+//   1. distinct registration names (muse-code-test / musefi-test /
+//      openmuse-test) and ports;
 //   2. the experimental gate (MUSE_EXPERIMENTAL_ACP) reaches the agent child
 //      only through the adapter child-env allowlist (safeEnv would strip it);
 //   3. a dispatch to one profile never reaches the other (no silent reroute);
@@ -30,8 +31,8 @@ const freePort = () => new Promise((resolve, reject) => {
     probe.close(() => resolve(typeof address === "object" && address ? address.port : 0));
   });
 });
-const [portA, portB] = [await freePort(), await freePort()];
-assert.ok(portA > 0 && portB > 0 && portA !== portB, "two distinct loopback ports are available");
+const [portA, portB, portC] = [await freePort(), await freePort(), await freePort()];
+assert.ok(portA > 0 && portB > 0 && portC > 0 && portA !== portB && portB !== portC && portA !== portC, "three distinct loopback ports are available");
 
 // Minimal fixture ACP v1 agent: answers the handshake, records what the
 // adapter sends it, and records whether the experimental gate survived.
@@ -128,6 +129,7 @@ const spawnProfile = (tag, port, experimentalGate) => {
 const instances = {
   "muse-code-test": spawnProfile("muse-code-test", portA, "on"),
   "musefi-test": spawnProfile("musefi-test", portB, undefined),
+  "openmuse-test": spawnProfile("openmuse-test", portC, "on"),
 };
 const postRuns = async (instance, body) => {
   const res = await fetch(`http://127.0.0.1:${instance.port}/runs`, {
@@ -164,17 +166,20 @@ try {
   }
 
   // 1. Distinct registration identities, one per profile.
-  assert.deepEqual([...seenRegistrations].sort(), ["muse-code-test", "musefi-test"],
-    "both profiles register under their own agent names");
+  assert.deepEqual([...seenRegistrations].sort(), ["muse-code-test", "musefi-test", "openmuse-test"],
+    "all three profiles register under their own agent names");
 
   // 2. Dispatch one task per profile; each fixture agent spawns on demand.
   const taskA = `muse-code probe ${Date.now()}`;
   const taskB = `musefi probe ${Date.now()}`;
+  const taskC = `openmuse probe ${Date.now()}`;
   const dispatchedA = await postRuns(instances["muse-code-test"], dispatchBody("muse-isolation-a", taskA));
   assert.equal(dispatchedA.status, 202,
     `muse-code dispatch accepted (got ${dispatchedA.status} ${JSON.stringify(dispatchedA.json).slice(0, 300)}; adapter: ${instances["muse-code-test"].outputTail()})`);
   const dispatchedB = await postRuns(instances["musefi-test"], dispatchBody("muse-isolation-b", taskB));
   assert.equal(dispatchedB.status, 202, `musefi dispatch accepted (got ${dispatchedB.status})`);
+  const dispatchedC = await postRuns(instances["openmuse-test"], dispatchBody("muse-isolation-c", taskC));
+  assert.equal(dispatchedC.status, 202, `openmuse dispatch accepted (got ${dispatchedC.status})`);
   const promptsSeen = (tag) => readFileSync(instances[tag].logPath, "utf8").split("\n")
     .filter((line) => line.trim().length > 0).map((line) => JSON.parse(line))
     .filter((record) => record.method === "session/prompt").map((record) => record.text);
@@ -188,10 +193,19 @@ try {
   };
   await waitFor(() => promptsSeen("muse-code-test").includes(taskA), "the muse-code prompt");
   await waitFor(() => promptsSeen("musefi-test").includes(taskB), "the musefi prompt");
+  await waitFor(() => promptsSeen("openmuse-test").includes(taskC), "the openmuse prompt");
 
   // 3. No silent reroute: each fixture saw only its own profile's task.
-  assert.ok(!promptsSeen("muse-code-test").includes(taskB), "the muse-code fixture never saw the musefi dispatch");
-  assert.ok(!promptsSeen("musefi-test").includes(taskA), "the musefi fixture never saw the muse-code dispatch");
+  for (const [tag, own, others] of [
+    ["muse-code-test", taskA, [taskB, taskC]],
+    ["musefi-test", taskB, [taskA, taskC]],
+    ["openmuse-test", taskC, [taskA, taskB]],
+  ]) {
+    assert.ok(promptsSeen(tag).includes(own), `${tag} saw its own dispatch`);
+    for (const other of others) {
+      assert.ok(!promptsSeen(tag).includes(other), `${tag} never saw another profile's dispatch`);
+    }
+  }
 
   // 4. The experimental gate reaches the agent child through the allowlist,
   // per instance: on for muse-code-test, absent for musefi-test.
@@ -201,10 +215,13 @@ try {
     "allowlisted MUSE_EXPERIMENTAL_ACP=on reaches the muse-code child");
   assert.equal(readEnvLog("musefi-test")[0]?.MUSE_EXPERIMENTAL_ACP, null,
     "an unset gate stays unset for the musefi child (per-instance passthrough, no leakage)");
+  assert.equal(readEnvLog("openmuse-test")[0]?.MUSE_EXPERIMENTAL_ACP, "on",
+    "allowlisted MUSE_EXPERIMENTAL_ACP=on reaches the openmuse child");
 
   // 5. Dispatch receipts live in per-profile state roots.
   const receiptsA = join(root, "state", "muse-code-test", "adapters", "stdio-duplex", "dispatch-receipts.json");
   const receiptsB = join(root, "state", "musefi-test", "adapters", "stdio-duplex", "dispatch-receipts.json");
+  const receiptsC = join(root, "state", "openmuse-test", "adapters", "stdio-duplex", "dispatch-receipts.json");
   assert.ok(existsSync(receiptsA), "muse-code receipts persist under its own state root");
   assert.ok(readFileSync(receiptsA, "utf8").includes("muse-isolation-a"),
     "the muse-code receipt records the muse-code dispatch key");
@@ -215,6 +232,16 @@ try {
     "the musefi receipt store never records the muse-code dispatch key");
   assert.ok(!readFileSync(receiptsA, "utf8").includes("muse-isolation-b"),
     "the muse-code receipt store never records the musefi dispatch key");
+  assert.ok(existsSync(receiptsC), "openmuse receipts persist under its own state root");
+  assert.ok(readFileSync(receiptsC, "utf8").includes("muse-isolation-c"),
+    "the openmuse receipt records the openmuse dispatch key");
+  for (const [label, path] of [["muse-code", receiptsA], ["musefi", receiptsB]]) {
+    assert.ok(!readFileSync(path, "utf8").includes("muse-isolation-c"),
+      `the ${label} receipt store never records the openmuse dispatch key`);
+  }
+  assert.ok(!readFileSync(receiptsC, "utf8").includes("muse-isolation-a")
+    && !readFileSync(receiptsC, "utf8").includes("muse-isolation-b"),
+    "the openmuse receipt store never records another profile's dispatch key");
 
   // 5b. Terminal completion is recorded from the authoritative end_turn
   // while each profile's agent child is still alive: the fixture never
@@ -236,8 +263,10 @@ try {
     "muse-code run completes while its agent child stays alive");
   assert.ok(await completedBy(instances["musefi-test"], "muse-isolation-b"),
     "musefi run completes while its agent child stays alive");
+  assert.ok(await completedBy(instances["openmuse-test"], "muse-isolation-c"),
+    "openmuse run completes while its agent child stays alive");
 
-  console.log("acp-muse-profiles.test.mjs: two profiles isolated (names, env, routing, state) — passed");
+  console.log("acp-muse-profiles.test.mjs: three profiles isolated (names, env, routing, state) — passed");
 
   // 6. Malformed or credential-bearing agent env is rejected at startup,
   // before any registration or dispatch side effect.
