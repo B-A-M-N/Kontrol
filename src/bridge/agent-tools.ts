@@ -7,10 +7,11 @@
  */
 import type { McpServer } from "@modelcontextprotocol/server";
 import type { BridgeConfig } from "./context.js";
-import { callRemoteAgent, probeAgent, selectHealthyAgent } from "../acp-gateway.js";
+import { probeAgent } from "../acp-gateway.js";
+import { dispatchToRegisteredAgent } from "./dispatch-service.js";
 import { loadSkillIndex } from "../skills.js";
 import { registerMutationAppTool } from "./app-tool.js";
-import { acquireCheckoutModifyLease, checkoutLeaseMetadata, forbidden, isReviewer, liveOwnerContextId, livePrincipalId, requireWorkSessionRead, resolveDelegationContext, workSessionInstructions } from "./shared.js";
+import { forbidden, isReviewer, resolveDelegationContext } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod/v4";
 
@@ -123,86 +124,45 @@ export function registerAgentTools(server: McpServer, config: BridgeConfig): voi
       if (resolved.error || !resolved.workspaceSessionId) {
         return { content: [{ type: "text" as const, text: resolved.error ?? "Unknown workspace." }], isError: true };
       }
-      workspaceSessionId = resolved.workspaceSessionId;
-      workSessionId = resolved.workSessionId;
-
-      const selection = await selectHealthyAgent(config.agentRegistry.listAlive(), {
-        name: agentName,
-        role: "agent",
-        adapterSecret: config.adapterSecret,
+      const result = await dispatchToRegisteredAgent(config, {
+        task,
+        workspaceSessionId: resolved.workspaceSessionId,
+        workSessionId: resolved.workSessionId,
+        agentName,
+        dispatchIntent,
+        // Legacy call_acp_agent reuse semantics: an existing non-terminal
+        // session may be reused without the strict review-gate checks that
+        // submit_to_coding_agent enforces. Terminal sessions still fail closed.
+        allowNonReviewSessionReuse: true,
       });
-      if (!selection.agent) {
-        const reason = `No healthy dispatchable registered ACP agent named "${agentName}".`;
+      const displayName = result.agentName ?? agentName;
+      if (result.status === "unavailable") {
         if (dispatchIntent === "optional_assist") {
           return {
-            content: [{ type: "text" as const, text: `${reason} Continue in the direct workspace; no alternate ACP route was attempted.` }],
-            structuredContent: { status: "unavailable", retryable: false, fallback: "direct_workspace", reason },
+            content: [{ type: "text" as const, text: result.text ?? result.reason ?? "No healthy agent available." }],
+            structuredContent: { status: "unavailable", retryable: false, fallback: "direct_workspace", reason: result.reason },
           };
         }
-        return { content: [{ type: "text" as const, text: reason }], isError: true };
+        return { content: [{ type: "text" as const, text: result.text ?? result.reason ?? "No healthy agent available." }], isError: true };
       }
-      const createdWorkSession = !workSessionId;
-      const wsId = workSessionId ?? config.workSessions.create({
-        workspaceSessionId,
-        submittedBy: "webui",
-        title: task.slice(0, 80),
-        completionPolicy: "webui_approval_required",
-        ownerContextId: liveOwnerContextId(config) ?? config.principalId,
-        principalId: livePrincipalId(config),
-      }).id;
-      const leaseError = await acquireCheckoutModifyLease(config, workspaceSessionId, wsId);
-      if (leaseError) {
-        if (!workSessionId) config.workSessions.updateStatus(wsId, "cancelled");
-        return leaseError;
-      }
-
-      try {
-        const result = await callRemoteAgent(
-          { agentRegistry: config.agentRegistry, workspaces: config.workspaces, workSessions: config.workSessions, eventStore: config.eventStore, adapterSecret: config.adapterSecret },
-          {
-            agentUrl: selection.agent.url,
-            agentName,
-            agentId: selection.agent.id,
-            task: `${task}\n\n${workSessionInstructions(wsId, selection.agent)}`,
-            workspaceSessionId,
-            workSessionId: wsId,
-            ...checkoutLeaseMetadata(config, wsId),
-            mode: "async",
-            fireAndForget: true,
-          },
-        );
-
-        if (result.status === "failed") {
-          if (createdWorkSession) config.workSessions.updateStatus(wsId, "failed");
-          config.workSessions.releaseWorkspaceLeasesForSession(wsId);
-          config.eventStore.appendEvent({ type: "agent.dispatch.failed", sessionId: wsId, payload: { runId: result.runId, reason: result.error ?? "ACP dispatch failed" } });
-          return {
-            content: [{ type: "text" as const, text: `${agentName}: failed\n${result.error ?? "(no error detail)"}` }],
-            structuredContent: { runId: result.runId, workSessionId: wsId, workspaceSessionId, status: result.status, dispatchStatus: "accepted", workerStatus: "unknown", outcomeObserved: false, output: result.output, error: result.error },
-            isError: true,
-          };
-        }
-        if (result.status === "uncertain") {
-          config.eventStore.appendEvent({
-            type: "agent.dispatch.uncertain",
-            sessionId: wsId,
-            payload: { runId: result.runId, reason: result.error ?? "ACP dispatch acceptance is uncertain." },
-          });
-          return {
-            content: [{ type: "text" as const, text: `${agentName}: dispatch acceptance is uncertain. Run ${result.runId} remains attached to work session ${wsId} while Kontrol reconciles the original launch.` }],
-            structuredContent: { runId: result.runId, workSessionId: wsId, workspaceSessionId, status: "uncertain", dispatchStatus: "uncertain", workerStatus: "unknown", outcomeObserved: false, output: result.output, error: result.error, retryable: false },
-          };
-        }
+      if (result.status === "failed") {
         return {
-          content: [{ type: "text" as const, text: `${agentName}: ${result.status}\n${result.output.slice(0, 5000)}${result.error ? `\nError: ${result.error}` : ""}` }],
-          structuredContent: { runId: result.runId, workSessionId: wsId, workspaceSessionId, status: result.status, dispatchStatus: "accepted", workerStatus: "unknown", outcomeObserved: false, output: result.output, error: result.error },
+          content: [{ type: "text" as const, text: `${displayName}: failed\n${result.error ?? "(no error detail)"}` }],
+          structuredContent: { runId: result.runId, workSessionId: result.workSessionId, workspaceSessionId: result.workspaceSessionId, status: result.status, dispatchStatus: "failed", workerStatus: "unknown", outcomeObserved: false, output: result.output, error: result.error },
+          isError: true,
         };
-      } catch (error) {
-        if (createdWorkSession) config.workSessions.updateStatus(wsId, "failed");
-        config.workSessions.releaseWorkspaceLeasesForSession(wsId);
-        config.eventStore.appendEvent({ type: "agent.dispatch.failed", sessionId: wsId, payload: { reason: error instanceof Error ? error.message : String(error) } });
-        return { content: [{ type: "text" as const, text: `Failed: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
+      if (result.status === "uncertain") {
+        return {
+          content: [{ type: "text" as const, text: result.text ?? `${displayName}: dispatch acceptance is uncertain.` }],
+          structuredContent: { runId: result.runId, workSessionId: result.workSessionId, workspaceSessionId: result.workspaceSessionId, status: "uncertain", dispatchStatus: "uncertain", workerStatus: "unknown", outcomeObserved: false, output: result.output, error: result.error, retryable: false },
+        };
+      }
+      const output = result.output ?? "";
+      return {
+        content: [{ type: "text" as const, text: `${displayName}: ${result.status}\n${output.slice(0, 5000)}${result.error ? `\nError: ${result.error}` : ""}` }],
+        structuredContent: { runId: result.runId, workSessionId: result.workSessionId, workspaceSessionId: result.workspaceSessionId, status: result.status, dispatchStatus: "accepted", workerStatus: "unknown", outcomeObserved: false, output, error: result.error },
+      };
     },
   );
 

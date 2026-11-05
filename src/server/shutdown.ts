@@ -95,7 +95,39 @@ export function createShutdownController(deps: ShutdownDeps): Pick<RunningServer
     closePromise = (async () => {
       stage = "CLOSING";
       const errors: Array<{ phase: string; error: unknown }> = [];
+      // P0-C: a timed-out promise is not a cancelled operation. Phases with
+      // outstanding durable-state ownership are critical: once one fails,
+      // every later durable-store close is fenced (skipped) so teardown can
+      // never close a store underneath still-running work. The supervisor is
+      // expected to terminate the fenced generation; the rejection below
+      // names the unfinished phase and every fenced store.
+      const CRITICAL_PHASES = new Set([
+        "review-checkpoints",
+        "event-store",
+        "continuations",
+        "dispatch-outbox",
+        "process-sessions",
+        "work-sessions",
+        "workspace-store",
+        "database",
+      ]);
+      // Closing one of these stores while an earlier critical phase is still
+      // (possibly) running is the use-after-close this fencing prevents.
+      const STORE_CLOSE_PHASES = new Set([
+        "event-store",
+        "continuations",
+        "dispatch-outbox",
+        "work-sessions",
+        "workspace-store",
+        "database",
+      ]);
+      let criticalFailure: string | null = null;
+      const fencedStores: string[] = [];
       const phase = async (name: string, action: () => unknown, timeoutMs = 5_000): Promise<void> => {
+        if (criticalFailure && STORE_CLOSE_PHASES.has(name)) {
+          fencedStores.push(name);
+          return;
+        }
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
           await Promise.race([
@@ -106,6 +138,9 @@ export function createShutdownController(deps: ShutdownDeps): Pick<RunningServer
           ]);
         } catch (error) {
           errors.push({ phase: name, error });
+          if (CRITICAL_PHASES.has(name) && !criticalFailure) {
+            criticalFailure = name;
+          }
         } finally {
           if (timer) clearTimeout(timer);
         }
@@ -159,8 +194,13 @@ export function createShutdownController(deps: ShutdownDeps): Pick<RunningServer
       await phase("agent-registry", () => deps.agentRegistry.close());
       await phase("integrity", () => deps.integrity.stop());
       await phase("database", () => deps.db.close());
-      if (errors.length > 0) {
-        throw new AggregateError(errors.map(({ error }) => error), `Kontrol shutdown completed with ${errors.length} failed phase(s)`);
+      if (criticalFailure || errors.length > 0) {
+        const fenced = fencedStores.length > 0 ? ` fenced store close(s): ${fencedStores.join(", ")}` : "";
+        throw new AggregateError(
+          errors.map(({ error }) => error),
+          `Kontrol shutdown completed with ${errors.length} failed phase(s)` +
+          (criticalFailure ? `; critical phase "${criticalFailure}" unfinished — dependent stores left open for supervisor termination;${fenced}` : ""),
+        );
       }
     })().finally(() => {
       closed = true;

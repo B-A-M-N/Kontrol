@@ -12,17 +12,11 @@ import { REQUIRED_REVIEW_THREAD_TOOLS } from "./lib/review-thread-tool-manifest.
 
 const repositoryRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
+// Hermetic synthetic identity for the probe's fixture repo: the release
+// probe must not depend on the operator's git config (absent under
+// neutral-home qualification).
 function configuredGitIdentity() {
-  const value = (key) => {
-    const result = spawnSync("git", ["config", "--get", key], {
-      cwd: repositoryRoot,
-      encoding: "utf8",
-    });
-    const configured = result.status === 0 ? result.stdout.trim() : "";
-    if (!configured) throw new Error(`release probe requires configured Git ${key} in ${repositoryRoot}`);
-    return configured;
-  };
-  return { name: value("user.name"), email: value("user.email") };
+  return { name: "Kontrol Test", email: "kontrol-test@example.invalid" };
 }
 
 function unusedTcpPort() {
@@ -185,7 +179,9 @@ async function bootSmoke(artifactPath, buildId) {
   const port = await unusedTcpPort();
   const identity = configuredGitIdentity();
   writeFileSync(join(smokeRoot, "README.md"), "# release probe fixture\n");
-  for (const args of [["init"], ["config", "user.email", identity.email], ["config", "user.name", identity.name], ["add", "README.md"], ["commit", "-m", "release probe fixture"]]) {
+  // Hermetic fixture: neutralize machine-global git hooks for the synthetic
+  // identity commit (same precedent as git-runner.test.ts).
+  for (const args of [["init"], ["config", "user.email", identity.email], ["config", "user.name", identity.name], ["add", "README.md"], ["-c", "core.hooksPath=/dev/null", "commit", "-m", "release probe fixture"]]) {
     const result = spawnSync("git", args, { cwd: smokeRoot, encoding: "utf8" });
     if (result.status !== 0) throw new Error(`git fixture setup failed: ${result.stderr || result.stdout}`);
   }

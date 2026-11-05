@@ -1,7 +1,7 @@
-// Real wall-clock stable-beta soak runner.
+// Real wall-clock continuity workload for a deployed stable-beta candidate.
 //
 // This intentionally does not choose a default duration. Operators must make
-// the time commitment explicit (for example --hours 12), and the report keeps
+// the workload time explicit (for example --hours 1), and the report keeps
 // enough counters to distinguish a clean run from an interrupted or partially
 // reachable run. Every MCP transport opened by the soak is closed; continuity
 // is exercised by opening a fresh transport on each iteration.

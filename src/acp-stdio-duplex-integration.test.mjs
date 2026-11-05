@@ -151,6 +151,15 @@ try {
     "the terminal lifecycle event carries the exact attempt-scoped ACP report");
   assert.equal(terminalEvent?.dispatch_idempotency_key, "stdio-normal-dispatch");
   assert.equal(terminalEvent?.attempt_number, 1);
+  const healthAfterNegotiation = await (await fetch(`http://127.0.0.1:${adapterPort}/health`)).json();
+  assert.equal(healthAfterNegotiation.ok, true, "adapter health stays servable after negotiation");
+  assert.equal(typeof healthAfterNegotiation.active, "number", "health exposes the active run count");
+  assert.ok(Array.isArray(healthAfterNegotiation.negotiatedVersions)
+    && healthAfterNegotiation.negotiatedVersions.length > 0
+    && healthAfterNegotiation.negotiatedVersions.every((version) => version === 1 || version === 2),
+    `health exposes the negotiated ACP version; observed: ${JSON.stringify(healthAfterNegotiation.negotiatedVersions)}`);
+  assert.equal(healthAfterNegotiation.sessionLoadSupported, true,
+    "health exposes the negotiated session capability after a load-capable handshake");
   assert.ok(terminalEvent?.event_id, "terminal delivery has a stable attempt-scoped identity");
   const missingStopReasonResponse = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
     method: "POST",
@@ -195,6 +204,16 @@ try {
     assert.equal(terminal?.type, "failed", `${stopReason} must fail and never be reported as successful completion`);
     assert.match(JSON.stringify(terminal?.payload), new RegExp(`stopReason: ${stopReason}`));
   }
+  const healthAfterFailures = await (await fetch(`http://127.0.0.1:${adapterPort}/health`)).json();
+  assert.equal(typeof healthAfterFailures.lastFailure?.category, "string",
+    "health exposes the last failure category after terminal failures");
+  assert.ok(healthAfterFailures.lastFailure.category.length > 0, "the failure category is non-empty");
+  assert.equal(typeof healthAfterFailures.lastFailure?.at, "string",
+    "health exposes when the last failure was recorded");
+  assert.equal(typeof healthAfterFailures.lastFailure?.id, "string",
+    "health exposes a diagnostic correlation id for the last failure");
+  assert.ok(!("detail" in (healthAfterFailures.lastFailure ?? {})),
+    "externally readable health never carries raw failure text (tokens, paths, prompt content stay in logs)");
   const deadlineForAcknowledgement = Date.now() + 5_000;
   while (Date.now() < deadlineForAcknowledgement) {
     const pendingTerminalEvents = JSON.parse(await readFile(join(state, "terminal-spool.json"), "utf8"));
@@ -211,7 +230,7 @@ try {
   assert.equal(replayResponse.status, 202, "an identical idempotency retry returns the existing execution receipt");
   assert.equal((await replayResponse.json()).replayed, true);
   adapter.kill("SIGTERM");
-  await new Promise((resolve) => adapter.once("exit", resolve));
+  await Promise.race([new Promise((resolve) => adapter.once("exit", resolve)), new Promise((resolve) => setTimeout(resolve, 10_000))]);
   adapter = spawnAdapter();
   const restartedAdapterDeadline = Date.now() + 5_000;
   let restartedAdapterReady = false;
@@ -398,7 +417,7 @@ try {
     "invalid grants never launch; sandbox execution does not alter the host-side launch marker");
 
   adapter.kill("SIGTERM");
-  await new Promise((resolve) => adapter.once("exit", resolve));
+  await Promise.race([new Promise((resolve) => adapter.once("exit", resolve)), new Promise((resolve) => setTimeout(resolve, 10_000))]);
   adapter = spawnAdapter(true);
   const v2ReadyDeadline = Date.now() + 5_000;
   let v2Ready = false;
@@ -470,7 +489,7 @@ try {
   assert.ok(v2SessionMethods.some((entry) => entry.method === "session/resume" && entry.sessionId === "agent-session-v2"),
     "ACP v2 uses session/resume rather than the removed session/load method");
   adapter.kill("SIGTERM");
-  await new Promise((resolve) => adapter.once("exit", resolve));
+  await Promise.race([new Promise((resolve) => adapter.once("exit", resolve)), new Promise((resolve) => setTimeout(resolve, 10_000))]);
   adapter = spawnAdapter(true, false, v2BusyChildCode);
   const busyReadyDeadline = Date.now() + 5_000;
   let busyReady = false;
@@ -507,7 +526,7 @@ try {
   assert.deepEqual(JSON.parse(await readFile(v2BusyLogPath, "utf8")), { promptBeforeIdle: false },
     "Kontrol waits for the current foreground turn to become idle before sending another prompt");
   adapter.kill("SIGTERM");
-  await new Promise((resolve) => adapter.once("exit", resolve));
+  await Promise.race([new Promise((resolve) => adapter.once("exit", resolve)), new Promise((resolve) => setTimeout(resolve, 10_000))]);
   adapter = spawnAdapter(true, true);
   const fallbackReadyDeadline = Date.now() + 5_000;
   let fallbackReady = false;
@@ -537,10 +556,231 @@ try {
   }
   assert.ok(events.some((event) => event.dispatch_idempotency_key === "stdio-v2-fallback-dispatch" && event.type === "completed"),
     "v1 fallback retains v1 prompt-response completion semantics");
+  adapter.kill("SIGTERM");
+  await Promise.race([new Promise((resolve) => adapter.once("exit", resolve)), new Promise((resolve) => setTimeout(resolve, 10_000))]);
+  const noLoadChildCode = childCode.replace("agentCapabilities:{loadSession:true}", "agentCapabilities:{}");
+  assert.ok(noLoadChildCode !== childCode, "no-load fixture actually drops the loadSession capability");
+  adapter = spawnAdapter(false, false, noLoadChildCode);
+  const noLoadReadyDeadline = Date.now() + 5_000;
+  let noLoadReady = false;
+  while (Date.now() < noLoadReadyDeadline) {
+    try {
+      const health = await fetch(`http://127.0.0.1:${adapterPort}/health`);
+      if (health.ok) { noLoadReady = true; break; }
+    } catch { /* no-load-session adapter is still starting */ }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(noLoadReady, "adapter restarts with a v1-only agent that cannot load sessions");
+  const noLoadBody = {
+    ...normalBody,
+    parent_run_id: "stdio-no-load-run",
+    session_id: "stdio-no-load-work-session",
+    attempt_number: 1,
+    dispatch_idempotency_key: "stdio-no-load-dispatch",
+    input: [{ parts: [{ content: "establish a provider session without load support" }] }],
+  };
+  const noLoadResponse = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer " + "adapter-secret" },
+    body: JSON.stringify(noLoadBody),
+  });
+  assert.equal(noLoadResponse.status, 202, "a v1 agent without loadSession still serves a first turn");
+  const noLoadDeadline = Date.now() + 5_000;
+  while (Date.now() < noLoadDeadline && !events.some((event) => event.dispatch_idempotency_key === "stdio-no-load-dispatch" && event.type === "completed")) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(events.some((event) => event.dispatch_idempotency_key === "stdio-no-load-dispatch" && event.type === "completed"),
+    "the first turn completes and records its provider binding");
+  const sessionsBeforeNoLoadContinuation = (await readFile(sessionLogPath, "utf8")).trim().split("\n")
+    .map((line) => JSON.parse(line)).filter((entry) => entry.method === "session/new").length;
+  const noLoadContinuationResponse = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer " + "adapter-secret" },
+    body: JSON.stringify({
+      ...noLoadBody,
+      parent_run_id: "stdio-no-load-continuation-run",
+      attempt_number: 2,
+      dispatch_idempotency_key: "stdio-no-load-continuation-dispatch",
+      continuation_id: "stdio-no-load-continuation-id",
+      input: [{ parts: [{ content: "continue the unloadable provider conversation" }] }],
+    }),
+  });
+  assert.equal(noLoadContinuationResponse.status, 202, "continuation acceptance is distinct from provider session restore");
+  const noLoadContinuationDeadline = Date.now() + 5_000;
+  while (Date.now() < noLoadContinuationDeadline && !events.some((event) =>
+    event.dispatch_idempotency_key === "stdio-no-load-continuation-dispatch" && event.type === "failed")) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const noLoadContinuationFailure = events.find((event) =>
+    event.dispatch_idempotency_key === "stdio-no-load-continuation-dispatch" && event.type === "failed");
+  assert.match(String(noLoadContinuationFailure?.error ?? noLoadContinuationFailure?.payload?.error),
+    /continuation_session_unsupported/,
+    "a v1 agent without loadSession is explicitly non-resumable, never silently restarted");
+  const sessionsAfterNoLoadContinuation = (await readFile(sessionLogPath, "utf8")).trim().split("\n")
+    .map((line) => JSON.parse(line)).filter((entry) => entry.method === "session/new").length;
+  assert.equal(sessionsAfterNoLoadContinuation, sessionsBeforeNoLoadContinuation,
+    "a refused continuation never creates a replacement provider conversation");
+  // Persistent ACP agents stay alive after end_turn (real servers do not
+  // exit after every prompt). Terminal completion must be recorded from the
+  // authoritative protocol response, not from process exit.
+  const persistentCleanupPath = join(state, "persistent-cleanup.jsonl");
+  const persistentChildCode = `const fs=require("node:fs");let b="";process.stdin.setEncoding("utf8");process.on("SIGTERM",()=>{try{fs.appendFileSync(${JSON.stringify(persistentCleanupPath)},JSON.stringify({sigtermReceived:true})+"\\n")}catch{};process.exit(0)});process.stdin.on("data",c=>{b+=c;for(const line of b.split(/\\r?\\n/).slice(0,-1)){const m=JSON.parse(line);const send=(x)=>process.stdout.write(JSON.stringify(x)+"\\n");if(m.method==="initialize")send({jsonrpc:"2.0",id:m.id,result:{protocolVersion:1,agentCapabilities:{loadSession:true}}});else if(m.method==="session/new")send({jsonrpc:"2.0",id:m.id,result:{sessionId:"agent-session-persistent"}});else if(m.method==="session/load")send({jsonrpc:"2.0",id:m.id,result:{sessionId:m.params.sessionId}});else if(m.method==="session/prompt"){send({jsonrpc:"2.0",method:"session/update",params:{sessionId:"agent-session-persistent",update:{sessionUpdate:"agent_message_chunk",messageId:"persistent-message-1",content:{type:"text",text:"persistent agent report"}}}});send({jsonrpc:"2.0",id:m.id,result:{sessionId:"agent-session-persistent",stopReason:"end_turn"}})}}b=b.split(/\\r?\\n/).at(-1)||""})`;
+  adapter.kill("SIGTERM");
+  await Promise.race([new Promise((resolve) => adapter.once("exit", resolve)), new Promise((resolve) => setTimeout(resolve, 10_000))]);
+  adapter = spawnAdapter(false, true, persistentChildCode);
+  const persistentReadyDeadline = Date.now() + 5_000;
+  let persistentReady = false;
+  while (Date.now() < persistentReadyDeadline) {
+    try {
+      const health = await fetch(`http://127.0.0.1:${adapterPort}/health`);
+      if (health.ok) { persistentReady = true; break; }
+    } catch { /* persistent-profile adapter is still starting */ }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(persistentReady, "adapter restarts for persistent-agent qualification");
+  const persistentKey = "stdio-persistent-dispatch";
+  const persistentResponse = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer " + "adapter-secret" },
+    body: JSON.stringify({
+      ...normalBody,
+      parent_run_id: "stdio-persistent-run",
+      session_id: "stdio-persistent-work-session",
+      workspace_lease_nonce: "stdio-persistent-lease",
+      workspace_lease_expires_at: new Date(Date.now() + 120_000).toISOString(),
+      attempt_number: 1,
+      dispatch_idempotency_key: persistentKey,
+      input: [{ parts: [{ content: "persistent task" }] }],
+    }),
+  });
+  assert.equal(persistentResponse.status, 202, "a persistent agent dispatch is accepted");
+  const persistentDeadline = Date.now() + 5_000;
+  while (Date.now() < persistentDeadline && !events.some((event) => event.dispatch_idempotency_key === persistentKey && event.type === "completed")) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const persistentTerminal = events.find((event) => event.dispatch_idempotency_key === persistentKey && event.type === "completed");
+  assert.ok(persistentTerminal, "authoritative end_turn finalizes the run while the ACP child is still alive");
+  assert.equal(persistentTerminal.payload.final_output, "persistent agent report",
+    "the terminal event carries the persistent agent's report");
+  assert.equal(events.filter((event) => event.dispatch_idempotency_key === persistentKey && ["completed", "failed", "cancelled"].includes(event.type)).length, 1,
+    "exactly one terminal outcome is recorded for the persistent run");
+  const cleanupDeadline = Date.now() + 10_000;
+  let cleanupObserved = false;
+  while (Date.now() < cleanupDeadline) {
+    try {
+      const cleanup = await readFile(persistentCleanupPath, "utf8");
+      if (cleanup.includes("sigtermReceived")) { cleanupObserved = true; break; }
+    } catch { /* marker not written yet */ }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.ok(cleanupObserved, "the adapter performs bounded child cleanup after recording completion");
+  adapter.kill("SIGTERM");
+  await Promise.race([new Promise((resolve) => adapter.once("exit", resolve)), new Promise((resolve) => setTimeout(resolve, 10_000))]);
+  // P1.6: capability claims are scoped to the agent executable generation.
+  // Replacing the agent executable mid-process must invalidate stale claims:
+  // a v2/load-capable agent followed by a v1-only agent must not leave v2
+  // or loadSession advertised as current capability.
+  const agentCodePath = join(state, "generation-agent-code.js");
+  const agentWrapperPath = join(state, "generation-agent-wrapper.sh");
+  // Minimal v1 agent without session-load support. Self-contained (not the
+  // shared fixture) so the protocol version is unambiguous.
+  const v1NoLoadCode = `let buf="";process.stdin.setEncoding("utf8");process.stdin.on("data",(c)=>{buf+=c;const lines=buf.split(/\\r?\\n/);buf=lines.pop();for(const line of lines){if(!line.trim())continue;const m=JSON.parse(line);const send=(x)=>process.stdout.write(JSON.stringify(x)+"\\n");if(m.method==="initialize")send({jsonrpc:"2.0",id:m.id,result:{protocolVersion:1,agentCapabilities:{}}});else if(m.method==="session/new")send({jsonrpc:"2.0",id:m.id,result:{sessionId:"agent-session-gen-v1"}});else if(m.method==="session/prompt"){send({jsonrpc:"2.0",id:m.id,result:{sessionId:m.params.sessionId,stopReason:"end_turn",content:[{type:"text",text:"gen v1 turn"}]}});setTimeout(()=>process.exit(0),20)}}});`;
+  const writeWrapper = async (kind) => {
+    await writeFile(agentCodePath, kind === "v1-no-load" ? v1NoLoadCode : childCode);
+    await writeFile(agentWrapperPath,
+      `#!/bin/sh\n# generation-fixture ${kind} ${Date.now()}\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(agentCodePath)}\n`,
+      { mode: 0o700 });
+  };
+  await writeWrapper("v2");
+  const generationAdapterPort = await new Promise((resolve) => {
+    const probe = createServer();
+    probe.listen(0, "127.0.0.1", () => {
+      const port = probe.address().port;
+      probe.close(() => resolve(port));
+    });
+  });
+  const spawnGenerationAdapter = () => spawn(process.execPath, ["scripts/acp-stdio-duplex-adapter.mjs"], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      KONTROL_ACP_URL: `http://127.0.0.1:${controlPort}/acp`,
+      KONTROL_ACP_AGENT_SECRET: "agent-secret",
+      KONTROL_ACP_ADAPTER_SECRET: "adapter-secret",
+      KONTROL_ACP_AGENT_STATE_FILE: join(state, "generation-identity.json"),
+      KONTROL_STDIO_DISPATCH_RECEIPTS: join(state, "generation-dispatch-receipts.json"),
+      KONTROL_STDIO_OWNED_PROCESSES: join(state, "generation-owned-processes.json"),
+      KONTROL_STDIO_EVENT_SPOOL: join(state, "generation-event-spool.json"),
+      KONTROL_STDIO_TERMINAL_SPOOL: join(state, "generation-terminal-spool.json"),
+      KONTROL_STDIO_SESSION_BINDINGS: join(state, "generation-session-bindings.json"),
+      KONTROL_BWRAP: bubblewrapPath,
+      KONTROL_ALLOWED_ROOTS: workspaceRoot,
+      ACP_STDIO_AGENT_NAME: "stdio-generation-agent",
+      ACP_STDIO_COMMAND: agentWrapperPath,
+      ACP_STDIO_ARGS_JSON: "[]",
+      ACP_STDIO_DISPATCH_METHOD: "",
+      ACP_STDIO_ENABLE_V2: "1",
+      ACP_STDIO_ADAPTER_PORT: String(generationAdapterPort),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let generationAdapter = spawnGenerationAdapter();
+  generationAdapter.stderr.on("data", (chunk) => process.stderr.write(`[stdio generation adapter] ${chunk}`));
+  try {
+    const generationReadyDeadline = Date.now() + 5_000;
+    let generationReady = false;
+    while (Date.now() < generationReadyDeadline) {
+      try {
+        const health = await fetch(`http://127.0.0.1:${generationAdapterPort}/health`);
+        if (health.ok) { generationReady = true; break; }
+      } catch { /* adapter is still starting */ }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(generationReady, "generation-scoped adapter starts");
+    const runGenerationTurn = async (tag) => {
+      const dispatchKey = `stdio-generation-${tag}-dispatch`;
+      const response = await fetch(`http://127.0.0.1:${generationAdapterPort}/runs`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer " + "adapter-secret" },
+        body: JSON.stringify({
+          ...v2Body,
+          parent_run_id: `stdio-generation-${tag}-run`,
+          session_id: `stdio-generation-${tag}-session`,
+          attempt_number: 1,
+          dispatch_idempotency_key: dispatchKey,
+        }),
+      });
+      assert.equal(response.status, 202, `generation ${tag} dispatch is accepted`);
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline && !events.some((event) => event.dispatch_idempotency_key === dispatchKey && ["completed", "failed"].includes(event.type))) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const terminal = events.find((event) => event.dispatch_idempotency_key === dispatchKey && ["completed", "failed"].includes(event.type));
+      assert.ok(terminal?.type === "completed",
+        `generation ${tag} turn completes: ${JSON.stringify(terminal?.payload?.error ?? terminal?.error)?.slice(0, 400)}`);
+    };
+    await runGenerationTurn("v2");
+    const healthV2 = await (await fetch(`http://127.0.0.1:${generationAdapterPort}/health`)).json();
+    assert.deepEqual(healthV2.negotiatedVersions, [2], "v2 agent negotiates v2");
+    assert.equal(healthV2.sessionLoadSupported, true, "v2 agent supports session load");
+    // Replace the agent executable with a v1-only agent that cannot load
+    // sessions: same adapter process, new executable generation.
+    await writeWrapper("v1-no-load");
+    await runGenerationTurn("v1");
+    const healthV1 = await (await fetch(`http://127.0.0.1:${generationAdapterPort}/health`)).json();
+    assert.ok((healthV1.capabilityGeneration ?? 1) > (healthV2.capabilityGeneration ?? 1),
+      `executable replacement advances the capability generation; observed v2=${healthV2.capabilityGeneration} v1=${healthV1.capabilityGeneration}`);
+    assert.deepEqual(healthV1.negotiatedVersions, [1],
+      `downgraded executable negotiates v1 only, never a stale v2 claim; observed: ${JSON.stringify(healthV1.negotiatedVersions)}`);
+    assert.equal(healthV1.sessionLoadSupported, false,
+      "downgraded executable drops the session-load claim instead of retaining history");
+  } finally {
+    generationAdapter.kill("SIGTERM");
+    await Promise.race([new Promise((resolve) => generationAdapter.once("exit", resolve)), new Promise((resolve) => setTimeout(resolve, 10_000))]);
+  }
   console.log(`acp-stdio-duplex-integration: task reached child stdin; read-only sandbox ${readOnlySandboxAvailable ? "executed" : "failed closed"}`);
 } finally {
   adapter.kill("SIGTERM");
-  await new Promise((resolve) => adapter.once("exit", resolve));
+  await Promise.race([new Promise((resolve) => adapter.once("exit", resolve)), new Promise((resolve) => setTimeout(resolve, 10_000))]);
   await new Promise((resolve) => control.close(resolve));
   await rm(state, { recursive: true, force: true });
 }

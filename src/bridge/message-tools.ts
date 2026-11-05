@@ -123,6 +123,66 @@ export function registerMessageTools(server: McpServer, config: BridgeConfig): v
     },
   );
 
+  registerMutationAppTool(
+    server,
+    "post_reviewer_message",
+    {
+      title: "Post message to worker",
+      description: "Send a reviewer message to the worker on an active work session. Durable and ordered — the worker retrieves it via list_agent_messages or get_work_result and a live event waiter (await_work_session_events) sees reviewer.message.posted. This does not by itself resume a worker parked on await_agent_reply: to answer a clarification/blocker and resume that worker, use resolve_agent_message with reply text; to direct a new review round, use provide_review_feedback. Fails closed on terminal sessions or sessions with no dispatched run.",
+      inputSchema: {
+        sessionId: z.string().describe("Work session ID."),
+        title: z.string().optional().describe("Short headline."),
+        body: z.string().min(1).describe("Message text for the worker."),
+        clientMutationId: z.string().min(1).max(200).optional(),
+      },
+      outputSchema: { messageId: z.string(), status: z.string() },
+      _meta: {},
+      annotations: { readOnlyHint: false },
+    },
+    config,
+    async ({ sessionId, title, body }) => {
+      if (!isReviewer(config.principalRole)) {
+        return forbidden(config.principalRole, "post_reviewer_message");
+      }
+      const access = requireWorkSessionMutation(config, sessionId);
+      if (access) return access;
+      if (!config.agentMessages) {
+        return { content: [{ type: "text" as const, text: "Agent-message store unavailable." }], isError: true };
+      }
+      const session = config.workSessions.get(sessionId);
+      if (!session) return { content: [{ type: "text" as const, text: "Session not found." }], isError: true };
+      if (["approved", "rejected", "cancelled", "failed", "failed_protocol"].includes(session.status)) {
+        return { content: [{ type: "text" as const, text: `Session is ${session.status}; reviewer messages require an active session.` }], isError: true };
+      }
+      const run = config.agentRegistry.getRunByWorkSessionId(sessionId);
+      if (!run) {
+        return { content: [{ type: "text" as const, text: "No dispatched run for this session; message the worker after dispatch." }], isError: true };
+      }
+      const commit = () => {
+        const message = config.agentMessages!.post({
+          workSessionId: sessionId,
+          runId: run.runId,
+          kind: "note",
+          author: "reviewer",
+          title,
+          body,
+        });
+        const event = config.eventStore.appendEvent({
+          type: "reviewer.message.posted",
+          sessionId,
+          payload: { messageId: message.id, kind: message.kind, author: "reviewer", runId: run.runId },
+        }, { publish: false });
+        return { message, event };
+      };
+      const committed = config.db ? config.db.sqlite.transaction(commit)() : commit();
+      config.eventStore.publishEvents([committed.event]);
+      return {
+        content: [{ type: "text" as const, text: `Posted reviewer note ${committed.message.id} to worker on session ${sessionId}.` }],
+        structuredContent: { messageId: committed.message.id, status: committed.message.status },
+      };
+    },
+  );
+
   registerAppTool(
     server,
     "list_agent_messages",

@@ -6,12 +6,24 @@
  * render helpers receive views by reference.
  */
 import type {
+  ApprovalOutcomeRecord,
   PendingApprovalRecord,
   ReviewSubmissionView,
   WorkSessionViewState,
 } from "./session-view-types.js";
 
 export const workSessionViews = new Map<string, WorkSessionViewState>();
+
+/** Bounded recent-outcome history for resolved approvals (newest last). */
+export const MAX_RECENT_APPROVAL_OUTCOMES = 5;
+
+export function recordApprovalOutcome(view: WorkSessionViewState, entry: ApprovalOutcomeRecord): void {
+  const history = view.recentApprovalOutcomes ?? (view.recentApprovalOutcomes = []);
+  const at = history.findIndex((existing) => existing.approvalId === entry.approvalId);
+  if (at >= 0) history.splice(at, 1);
+  history.push(entry);
+  while (history.length > MAX_RECENT_APPROVAL_OUTCOMES) history.shift();
+}
 
 export function ensureWorkSessionView(workSessionId: string, workspaceSessionId: string, runId: string): WorkSessionViewState {
   let view = workSessionViews.get(workSessionId);
@@ -27,6 +39,7 @@ export function ensureWorkSessionView(workSessionId: string, workspaceSessionId:
       activity: [],
       submissions: new Map(),
       policyApprovals: new Map(),
+      recentApprovalOutcomes: [],
       policyGrants: new Map(),
       policyGrantsLoaded: false,
       openMessages: new Map(),
@@ -55,7 +68,33 @@ export function noteSubmission(view: WorkSessionViewState, submission: ReviewSub
   }
 }
 
+/** Outcomes that close an approval: a later pending listing for the same
+ * approvalId is stale data, never a reopenable decision. "unknown" is
+ * deliberately absent — it records no commitment. */
+const COMMITTED_APPROVAL_OUTCOMES: ReadonlySet<string> = new Set([
+  "approved_pending_retry",
+  "executed",
+  "authorization_consumed",
+  "denied",
+  "expired",
+  "cancelled",
+]);
+
 export function mergePendingApproval(view: WorkSessionViewState, approval: PendingApprovalRecord, fallbackWorkspaceId: string): void {
+  // A refresh must never overwrite a more recent committed decision with
+  // stale pending data: once the reviewer committed (or the server reported
+  // a terminal state), the card stays closed and the outcome stands.
+  const committed = (view.recentApprovalOutcomes ?? []).some(
+    (entry) => entry.approvalId === approval.approvalId && COMMITTED_APPROVAL_OUTCOMES.has(entry.outcome),
+  );
+  if (committed) return;
+  // A hydration refresh must not clobber a local decision still in flight: a
+  // record the user is submitting (or whose outcome is unknown after an
+  // interruption) keeps its UI state until the outcome is known.
+  const existing = view.policyApprovals.get(approval.approvalId);
+  const inFlight = existing?.uiState === "submitting" || existing?.uiState === "outcome_unknown"
+    ? { uiState: existing.uiState, error: existing.error, clientMutationId: existing.clientMutationId, clientMutationDecision: existing.clientMutationDecision }
+    : {};
   view.policyApprovals.set(approval.approvalId, {
     approvalId: approval.approvalId,
     workspaceId: approval.workspaceId ?? approval.workspaceSessionId ?? fallbackWorkspaceId,
@@ -76,6 +115,7 @@ export function mergePendingApproval(view: WorkSessionViewState, approval: Pendi
     requestedAt: approval.requestedAt,
     createdAt: approval.createdAt,
     expiresAt: approval.expiresAt,
+    ...inFlight,
   });
   view.pendingApprovalCount = view.policyApprovals.size;
 }

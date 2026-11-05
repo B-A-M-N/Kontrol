@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { CdpClient } from "./cdp-client.js";
 import { CdpCommandError } from "./cdp-client.js";
 import type { BoundReviewerTarget } from "./target-binding.js";
@@ -13,6 +14,15 @@ export type PromptSubmission = { status: "accepted"; submittedAt: string; conver
   | { status: "rejected"; reason: string }
   | { status: "uncertain"; reason: string };
 export type GenerationState = "not_started" | "generating" | "finished" | "blocked" | "unknown";
+export interface PartialResponseObservation {
+  state: GenerationState;
+  assistantMessageCount: number;
+  attemptPresent: boolean;
+  textSha256?: string;
+  textPrefix?: string;
+  capturedAt: string;
+}
+export const PARTIAL_TEXT_PREFIX_LIMIT = 4000;
 
 export class BrowserReadinessError extends Error {
   constructor(readonly readiness: BrowserReadiness["status"]) {
@@ -122,6 +132,40 @@ export class ChatGptPageDriver {
       return accepted ? { status: "accepted", submittedAt: new Date().toISOString(), conversationKey: after.conversationKey }
         : { status: "uncertain", reason: "prompt_acceptance_not_observed" };
     } catch { return { status: "uncertain", reason: "post_send_observation_unavailable" }; }
+  }
+
+  /**
+   * Capture recoverable visible assistant text for one attempt. The returned
+   * text is page-visible evidence bound to the attempt, never a verdict: it
+   * carries no reviewer authority and must be marked unverified_partial by
+   * consumers. Text from another attempt is never attributed to this one.
+   */
+  async observePartialResponse(baseline: TurnBaseline, attemptId: string): Promise<PartialResponseObservation> {
+    const capturedAt = new Date().toISOString();
+    const state = await this.observeGeneration(baseline, attemptId);
+    if (state !== "generating" && state !== "finished") {
+      return { state, assistantMessageCount: baseline.assistantMessageCount, attemptPresent: state !== "unknown", capturedAt };
+    }
+    const observed = await this.evaluate<{ attemptPresent: boolean; assistantCount: number; lastText: string }>(`(() => {
+      // partial-assistant-text capture: page-visible evidence for one attempt
+      const users=[...document.querySelectorAll('[data-message-author-role="user"]')],last=users[users.length-1];
+      const assistants=[...document.querySelectorAll('[data-message-author-role="assistant"]')];
+      const captured=assistants.length?(assistants[assistants.length-1].innerText||'').slice(0,${PARTIAL_TEXT_PREFIX_LIMIT * 2}):'';
+      return {attemptPresent:${JSON.stringify(attemptId)}?(last?.innerText||'').includes(${JSON.stringify(attemptId)}):true,
+        assistantCount:assistants.length,lastText:captured};
+    })()`);
+    if (!observed.attemptPresent) {
+      return { state: "unknown", assistantMessageCount: observed.assistantCount, attemptPresent: false, capturedAt };
+    }
+    const textPrefix = observed.lastText.slice(0, PARTIAL_TEXT_PREFIX_LIMIT);
+    return {
+      state,
+      assistantMessageCount: observed.assistantCount,
+      attemptPresent: true,
+      textSha256: createHash("sha256").update(textPrefix).digest("hex"),
+      textPrefix,
+      capturedAt,
+    };
   }
 
   async observeGeneration(baseline: TurnBaseline, attemptId?: string): Promise<GenerationState> {

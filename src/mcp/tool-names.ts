@@ -23,6 +23,7 @@ export const toolNames = {
   gitShow: "git_show",
   shell: "bash",
   pollProcess: "poll_process",
+  execCommand: "exec_command",
   writeStdin: "write_stdin",
   enqueuePeerJob: "enqueue_peer_job",
   cancelPeerJob: "cancel_peer_job",
@@ -71,10 +72,10 @@ function serverInstructions(config: ServerConfig): string {
     : "";
 
   if (config.toolMode === "codex") {
-    return `Use Kontrol as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, ${toolNames.ls}, ${toolNames.gitStatus}, ${toolNames.gitLog}, ${toolNames.gitDiff}, and ${toolNames.gitShow} for direct structured inspection; use apply_patch for modifications, exec_command for tests/builds/other commands, and ${toolNames.pollProcess} to observe running processes (${toolNames.writeStdin} remains available when input is required). When the user asks to open or inspect the workspace interface, call ${toolNames.showWorkspaceUi} with the existing workspaceId. Review, diagnosis, architecture, and code-edit requests go directly through the workspace first. Delegate only when the reviewer explicitly asks for bounded worker assistance: call discover_agents, dispatch only a currently dispatchable healthy role=agent peer, and if optional assistance is unavailable continue directly without trying an alternate ACP route. The WebUI reviewer remains the approval authority. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${showChangesInstruction}`;
+    return `Use Kontrol as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, ${toolNames.ls}, ${toolNames.gitStatus}, ${toolNames.gitLog}, ${toolNames.gitDiff}, and ${toolNames.gitShow} for direct structured inspection; use apply_patch for modifications, ${toolNames.execCommand} for tests/builds/other commands, and ${toolNames.pollProcess} to observe running processes (${toolNames.writeStdin} remains available when input is required). When the user asks to open or inspect the workspace interface, call ${toolNames.showWorkspaceUi} with the existing workspaceId. Review, diagnosis, architecture, and code-edit requests go directly through the workspace first. Delegate only when the reviewer explicitly asks for bounded worker assistance: call discover_agents, dispatch only a currently dispatchable healthy role=agent peer, and if optional assistance is unavailable continue directly without trying an alternate ACP route. The WebUI reviewer remains the approval authority. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${showChangesInstruction}`;
   }
 
-  const inspection = `Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, ${toolNames.ls}, ${toolNames.gitStatus}, ${toolNames.gitLog}, ${toolNames.gitDiff}, and ${toolNames.gitShow} for file inspection. Long-running ${toolNames.shell} calls return a process session; use ${toolNames.pollProcess} to retrieve output and completion. `;
+  const inspection = `Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, ${toolNames.ls}, ${toolNames.gitStatus}, ${toolNames.gitLog}, ${toolNames.gitDiff}, and ${toolNames.gitShow} for file inspection. Long-running ${toolNames.shell} calls return a process session; use ${toolNames.pollProcess} to retrieve output and completion. ${toolNames.execCommand} launches with explicit TTY, timeout, and idempotency choices, and ${toolNames.writeStdin} supplies input or resizes the PTY when authorized; pure polls stay read-only. `;
 
   const skills = config.skillsEnabled
     ? `When ${toolNames.openWorkspace} returns available skills and a task matches a skill, use ${toolNames.read} to read that skill's path before proceeding. Skill paths may be outside the workspace, but ${toolNames.read} only permits advertised SKILL.md files and files under already-loaded skill directories. `

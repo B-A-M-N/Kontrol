@@ -35,6 +35,25 @@ export type ReviewSubmissionView = {
   coverage?: { backend: "git" | "filesystem"; uncoveredPaths: string[]; reasons: string[] };
 };
 
+export type ApprovalOutcome =
+  | "approved_pending_retry"
+  // "executed" requires an execution receipt tied to the operation; approval
+  // consumption alone must use "authorization_consumed". No producer emits
+  // "executed" yet.
+  | "executed"
+  | "authorization_consumed"
+  | "denied"
+  | "expired"
+  | "cancelled"
+  | "unknown";
+
+export interface ApprovalOutcomeRecord {
+  approvalId: string;
+  title?: string;
+  outcome: ApprovalOutcome;
+  detail: string;
+}
+
 export interface PolicyApprovalView {
   approvalId: string;
   workspaceId?: string;
@@ -64,6 +83,18 @@ export interface PolicyApprovalView {
   }>;
   uiState?: "idle" | "submitting" | "resolved" | "error" | "outcome_unknown";
   error?: string;
+  /**
+   * Stable idempotency key for the in-flight approval decision. Bound to
+   * the exact {approvalId, decision} pair (see clientMutationDecision):
+   * generated once per decision attempt and retained until the outcome is
+   * known, so a retry of the identical decision resends the identical
+   * mutation instead of minting a second one. A changed decision always
+   * mints a distinct key — the server rejects a reused key with different
+   * request content as a conflict.
+   */
+  clientMutationId?: string;
+  /** The decision the stored clientMutationId was minted for. */
+  clientMutationDecision?: string;
 }
 
 export interface PendingApprovalRecord {
@@ -191,6 +222,15 @@ export interface WorkSessionViewState {
   activity: AgentActivityEvent[];
   submissions: Map<string, ReviewSubmissionView>;
   policyApprovals: Map<string, PolicyApprovalView>;
+  /**
+   * Recently resolved approvals, newest last, bounded in
+   * recordApprovalOutcome. Terminal cards are deleted from policyApprovals,
+   * so without this the reviewer could never distinguish "approved, retry
+   * the original call" from "operation completed". "executing" is
+   * deliberately absent: this surface cannot observe execution, only the
+   * decision, its consumption, and the server-reported terminal state.
+   */
+  recentApprovalOutcomes: ApprovalOutcomeRecord[];
   policyGrants: Map<string, PolicyGrantView>;
   policyGrantsLoaded: boolean;
   policyGrantsError?: string;

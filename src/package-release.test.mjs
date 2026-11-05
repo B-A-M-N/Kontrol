@@ -161,10 +161,16 @@ try {
 
   const servicePort = await unusedTcpPort();
   const serviceState = join(tmp, "installed-state");
+  // Fixture ownership for the tunnel health probe: the doctor must not read
+  // the ambient production tunnel on 127.0.0.1:8080. Point it at an
+  // unbound port so both tunnel checks report UNAVAILABLE instead of
+  // mistaking unrelated live state for the fixture's result.
+  const tunnelHealthPort = await unusedTcpPort();
   const serviceEnv = testHarnessEnvironment(process.env, { overrides: {
     HOST: "127.0.0.1",
     PORT: String(servicePort),
     KONTROL_AUTH_MODE: "tunnel",
+    KONTROL_TUNNEL_HEALTH_URL: `http://127.0.0.1:${tunnelHealthPort}`,
     KONTROL_ALLOWED_ROOTS: installPrefix,
     KONTROL_ALLOWED_HOSTS: "127.0.0.1,localhost",
     KONTROL_PUBLIC_BASE_URL: `http://127.0.0.1:${servicePort}`,
@@ -177,9 +183,16 @@ try {
     // mutation return approval_required without executing.
     KONTROL_TUNNEL_REVIEWER_SECRET: "package-release-reviewer-secret-long-enough",
   } });
+  // Fixture ownership: the doctor probe must not read the ambient
+  // ~/.kontrol/config.json. That file belongs to the operator, not the
+  // fixture; an unrelated legacy config would fail this gate on an
+  // otherwise healthy artifact. The legacy-config FAIL branch itself stays
+  // covered by config.test.ts against fixture homes.
+  const doctorHome = join(tmp, "doctor-home");
+  mkdirSync(doctorHome, { recursive: true });
   const doctorOutput = execFileSync("node", [installedCli, "doctor"], {
     cwd: installPrefix,
-    env: serviceEnv,
+    env: { ...serviceEnv, HOME: doctorHome },
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"], // capture stderr — review #10
   });
@@ -463,8 +476,21 @@ async function exerciseInstalledServiceLifecycle(installedPkg, tmpRoot) {
   writeFileSync(join(candidate, "cli.js"), "#!/usr/bin/env node\n");
   writeFileSync(join(candidate, "build-meta.json"), JSON.stringify(candidateMeta));
 
+  // Hermetic operator configuration: without an explicit fixture config dir
+  // this exercise would inherit the ambient ~/.kontrol/config.json, and any
+  // operator-configured tunnel would become a required rollback auxiliary
+  // that the stubbed systemctl can never activate.
+  const fixtureConfigDir = join(rootDir, "kontrol-config");
+  mkdirSync(fixtureConfigDir, { recursive: true });
+  writeFileSync(join(fixtureConfigDir, "config.json"), JSON.stringify({ serviceComponents: [] }));
+  // Explicit environment file: with no tunnel configured, install no longer
+  // materializes one as a side effect, so the fixture provides its own.
+  const fixtureEnvDir = join(tmpRoot, "service-config-home", "kontrol");
+  mkdirSync(fixtureEnvDir, { recursive: true });
+  writeFileSync(join(fixtureEnvDir, "environment"), "PORT=9\n", { mode: 0o600 });
   const env = {
     ...serviceEnvForInstall(tmpRoot, rootDir),
+    KONTROL_CONFIG_DIR: fixtureConfigDir,
     KONTROL_STATE_DIR: join(rootDir, "database state"),
     KONTROL_USER_SERVICE_NAME: "kontrol-package-fixture.service",
   };
@@ -473,6 +499,11 @@ async function exerciseInstalledServiceLifecycle(installedPkg, tmpRoot) {
   const dependencies = {
     currentArtifactPath: () => join(installedPkg, "dist"),
     requireSystemd: () => undefined,
+    // Fixture ownership for stop verification: the stubbed systemctl never
+    // starts real units, so nothing is ever active. Without this stub the
+    // check shells to the ambient systemd manager, where an unrelated live
+    // stack (notably the fixed-name kontrol.target) would fail the fixture.
+    probeUnitActive: () => false,
     systemctl: (servicePaths, args) => {
       calls.push(args.join(" "));
       if (args[0] !== "start") return;
@@ -513,11 +544,16 @@ async function exerciseInstalledServiceLifecycle(installedPkg, tmpRoot) {
   } finally {
     sqlite.close();
   }
-  assert.deepEqual(calls.filter((call) => call.startsWith("start") || call.startsWith("stop")).slice(-4), [
-    "stop kontrol-package-fixture.service",
-    "start kontrol-package-fixture.service",
-    "stop kontrol-package-fixture.service",
-    "start kontrol-package-fixture.service",
+  // Full-stack lifecycle contract: the candidate stops the aggregate target
+  // (never just the core unit), and rollback stops, reloads, and restarts
+  // through the target as well. The core-only stop/start sequence this
+  // asserted before is the behavior review finding #1 ordered removed.
+  assert.deepEqual(calls.slice(-5), [
+    "stop kontrol.target",
+    "enable --now kontrol.target",
+    "stop kontrol.target",
+    "daemon-reload",
+    "enable --now kontrol.target",
   ]);
 }
 
@@ -566,6 +602,10 @@ function serviceEnvForInstall(tmpRoot, installPrefix) {
     XDG_DATA_HOME: join(tmpRoot, "service-data-home"),
     KONTROL_SERVICE_DATA_DIR: join(tmpRoot, "service-data"),
     KONTROL_ALLOWED_ROOTS: installPrefix,
+    // Fixture reviewer credential: `service unit` generation is guarded by
+    // the tunnel reviewer-auth check under an ask-capable policy, so the
+    // fixture must present the dedicated secret (never a real credential).
+    KONTROL_TUNNEL_REVIEWER_SECRET: "package-release-fixture-reviewer-secret",
   } });
 }
 

@@ -1,9 +1,15 @@
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
 import { WorkspaceRegistry } from "./workspaces.js";
+
+// Pin an empty machine-config dir so this test asserts workspace behavior
+// only: a machine-local ~/.kontrol/config.json (e.g. tunnel auth mode)
+// would otherwise leak into loadConfig and trip unrelated validation.
+const emptyConfigDir = mkdtempSync(join(tmpdir(), "kontrol-empty-config-session-isolation-"));
 
 const root = await realpath(await mkdtemp(join(tmpdir(), "kontrol-workspace-session-isolation-")));
 try {
@@ -14,6 +20,7 @@ try {
   await writeFile(join(nested, "file.txt"), "hello\n");
 
   const config = loadConfig({
+    KONTROL_CONFIG_DIR: emptyConfigDir,
     KONTROL_ALLOWED_ROOTS: root,
     KONTROL_WORKTREE_ROOT: join(root, ".kontrol", "worktrees"),
     KONTROL_AGENT_DIR: join(root, ".pi", "agent"),

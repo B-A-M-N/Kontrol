@@ -20,6 +20,7 @@ import type { McpOperationDiagnostics } from "./mcp-operation-diagnostics.js";
 import type { McpQualificationEvidenceJournal } from "./mcp-qualification-evidence.js";
 import type { Request, Response } from "express";
 import { toolListCacheDiagnostics } from "../mcp-tool-list-cache.js";
+import { resolveReleaseBuildMeta } from "../build-identity.js";
 import { readMcpToolSurface } from "../mcp/tool-names.js";
 import { readIngressManagementProjection } from "../ingress/ingress-tools.js";
 
@@ -66,6 +67,12 @@ export interface DiagnosticsDeps {
   countActiveWorkSessions(): number;
   countPendingReviews(): number;
   countAliveAgents(): number;
+  /**
+   * Override for the module directory used to resolve release build
+   * metadata. Production always resolves from the diagnostics module's own
+   * location; tests stage a packaged-shaped tree and point here.
+   */
+  buildMetaModuleDir?: string;
   listPendingApprovals(): Array<{ kind: string; origin?: string; approvalId: string; reattachDeadline?: string }>;
   sqlite(): { prepare?: (sql: string) => { get?: () => unknown } } | undefined;
 }
@@ -342,12 +349,23 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
     };
 
     // P1 #51: Report embedded build metadata (immutable artifact identity)
-    // rather than the working tree state.
-    let buildMeta: Record<string, unknown> | undefined;
-    try {
-      const metaPath = join(dirname(fileURLToPath(import.meta.url)), "build-meta.json");
-      buildMeta = JSON.parse(readFileSync(metaPath, "utf8"));
-    } catch { /* ignore */ }
+    // rather than the working tree state. Packaged layout keeps
+    // build-meta.json at the release root ABOVE server/diagnostics.js, so
+    // resolve from the verified release location instead of adjacent to
+    // this module; a miss/parse failure/validation mismatch is an explicit
+    // diagnostic state, never a silent fallback.
+    const generationExpectedBuildId = (() => {
+      const active = (generationRecord as Record<string, unknown> | undefined)?.activeBuildId;
+      const requested = (generationRecord as Record<string, unknown> | undefined)?.requestedBuildId;
+      if (typeof active === "string" && active.length > 0) return active;
+      if (typeof requested === "string" && requested.length > 0) return requested;
+      return undefined;
+    })();
+    const releaseBuild = resolveReleaseBuildMeta({
+      moduleDir: deps.buildMetaModuleDir ?? dirname(fileURLToPath(import.meta.url)),
+      expectedBuildId: generationExpectedBuildId,
+    });
+    const buildMeta = releaseBuild.meta as Record<string, unknown> | undefined;
     const mcpToolSurface = readMcpToolSurface();
 
     return res.json({
@@ -357,6 +375,11 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
       // never from an ambient process.env read inside a route handler.
       build: buildMeta ?? config.expectedBuildId ?? "dev",
       buildMeta,
+      buildMetaStatus: {
+        status: releaseBuild.status,
+        ...(releaseBuild.expectedBuildId ? { expectedBuildId: releaseBuild.expectedBuildId } : {}),
+        ...(releaseBuild.actualBuildId ? { actualBuildId: releaseBuild.actualBuildId } : {}),
+      },
       mcpToolSurface,
       schema: schemaVersion,
       schemaExpected: LATEST_SCHEMA_VERSION,

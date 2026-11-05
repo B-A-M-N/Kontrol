@@ -71,6 +71,8 @@ try {
   const eventTypes: string[] = [];
   const eventPayloads: unknown[] = [];
   let browserRecoveryInput: Record<string, unknown> | undefined;
+  let terminalOutcomeInput: Record<string, unknown> | undefined;
+  let threadMessages: Array<Record<string, unknown>> = [];
   const browserAuthCalls: string[] = [];
   const testSubmission = {
     id: "sub-1", workSessionId: "wsess-handoff", submissionNumber: 1,
@@ -93,17 +95,27 @@ try {
     connectionConversationId: "conv-b",
     connectionMcpSessionId: "mcp-reviewer-1",
     reviewRoutes: routes,
+    db,
     reviewThreads: {
       getById: (id: string) => id === "thread-recovery" ? {
         id, status: "active", reviewerPrincipalId: "user-a",
         reviewerContextId: reviewerThreadContextId({ principalRole: "reviewer", principalId: "user-a", connectionConversationId: "conv-b", connectionMcpSessionId: "mcp-reviewer-1" } as any),
         routeEpoch: route.routeEpoch, workSessionId: "wsess-handoff",
       } : undefined,
+      listMessages: (id: string) => id === "thread-recovery" ? threadMessages : [],
     },
     reviewBrowserJobs: {
       resolveUncertainAttemptForRetry: (input: Record<string, unknown>) => {
         browserRecoveryInput = input;
         return { messageId: "message-recovered", messageRevision: 3, resolutionSha256: "b".repeat(64) };
+      },
+      recordTerminalOutcome: (input: Record<string, unknown>) => {
+        terminalOutcomeInput = input;
+        return {
+          attemptId: input.attemptId, classification: "reviewer_unrecoverable", reasonCode: "authentication_unrecoverable",
+          evidenceSha256: "c".repeat(64), partialSeq: 2, partialSha256: "d".repeat(64), partialComplete: false,
+          lastProgressAt: "2026-10-26T12:01:58.000Z",
+        };
       },
     },
     reviewBrowserController: {
@@ -181,6 +193,44 @@ try {
   }, "recovery tool binds the explicit resolution to the active reviewer principal and route epoch");
   assert.equal((resolvedBrowserAttempt.structuredContent as Record<string, unknown>).status, "queued");
   assert.equal(eventTypes.includes("review.browser_turn.operator_reconciled"), true);
+  const recordedOutcome = await reviewerClient.callTool({ name: "record_reviewer_browser_outcome", arguments: {
+    attemptId: "rturn-stranded", threadId: "thread-recovery", classification: "reviewer_unrecoverable",
+    reasonCode: "authentication_unrecoverable", confirmNoFeedbackCommitted: true,
+    inspectionEvidence: "I inspected the bound conversation; reviewer authentication is lost with no safe recovery.",
+  } });
+  assert.equal(recordedOutcome.isError, undefined);
+  assert.deepEqual(terminalOutcomeInput, {
+    attemptId: "rturn-stranded", reviewThreadId: "thread-recovery", routeEpoch: route.routeEpoch,
+    reviewerPrincipalId: "user-a", classification: "reviewer_unrecoverable",
+    reasonCode: "authentication_unrecoverable",
+    inspectionEvidence: "I inspected the bound conversation; reviewer authentication is lost with no safe recovery.",
+  }, "terminal outcome binds the exact attempt to the active reviewer principal and route epoch");
+  const recordedContent = recordedOutcome.structuredContent as Record<string, unknown>;
+  assert.equal(recordedContent.status, "failed");
+  assert.equal(recordedContent.classification, "reviewer_unrecoverable");
+  assert.equal(recordedContent.partialComplete, false);
+  assert.equal(eventTypes.includes("review.browser_turn.terminal_outcome"), true);
+  threadMessages = [{
+    id: "msg-terminal", handoffId: handoff.id, submissionId: "sub-terminal", reviewEpoch: route.routeEpoch + 1,
+    roundNumber: 2, kind: "resubmission", status: "failed", revision: 2, payloadSha256: "e".repeat(64),
+  }];
+  const existingThreadId = (db.sqlite.prepare("select id from review_threads where route_id = ? and route_epoch = ?").get(route.id, route.routeEpoch) as { id: string }).id;
+  db.sqlite.prepare("insert into review_thread_messages (id, thread_id, route_epoch, work_session_id, handoff_id, submission_id, review_epoch, round_number, kind, payload_json, payload_sha256, status, revision, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    .run("msg-terminal", existingThreadId, route.routeEpoch, "wsess-handoff", handoff.id, "sub-terminal", route.routeEpoch + 1, 2, "resubmission", "{}", "e".repeat(64), "failed", 2, new Date().toISOString(), new Date().toISOString());
+  db.sqlite.prepare("insert into review_browser_turns (id, review_message_id, review_thread_id, route_epoch, profile_id, conversation_fingerprint, attempt_number, state, prompt_sha256, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    .run("rturn-terminal", "msg-terminal", "thread-recovery", route.routeEpoch, "reviewer-profile", "f".repeat(64), 1, "failed", "a".repeat(64), new Date().toISOString());
+  db.sqlite.prepare("insert into review_browser_turn_resolutions (attempt_id, review_thread_id, route_epoch, reviewer_principal_id, resolution, reason_code, evidence_sha256, created_at) values (?, ?, ?, ?, ?, ?, ?, ?)")
+    .run("rturn-terminal", "thread-recovery", route.routeEpoch, "user-a", "reviewer_unrecoverable", "authentication_unrecoverable", "c".repeat(64), new Date().toISOString());
+  const threadListing = await reviewerClient.callTool({ name: "list_review_thread_messages", arguments: { threadId: "thread-recovery" } });
+  assert.equal(threadListing.isError, undefined);
+  const listedTerminal = (threadListing.structuredContent as { messages: Array<Record<string, unknown>> }).messages
+    .find((entry) => entry.handoffId === handoff.id);
+  assert.equal(listedTerminal?.deliveryState, "reviewer_unrecoverable",
+    "a terminal reviewer receipt is never projected as recoverable");
+  assert.match(listedTerminal?.nextAction as string, /authentication_unrecoverable/,
+    "the terminal state names the verified reason");
+  assert.match(listedTerminal?.nextAction as string, /await operator decision/i,
+    "a terminal outcome tells the reviewer-side reader to await the operator, not to retry delivery");
 
   const authStarted = await reviewerClient.callTool({ name: "begin_reviewer_browser_auth", arguments: { profileId: "reviewer-profile" } });
   assert.equal(authStarted.isError, undefined, "authenticated reviewers can start the dedicated ordinary-Chrome auth handoff");
@@ -241,6 +291,12 @@ try {
     inspectionEvidence: "I inspected the conversation carefully.",
   } });
   assert.equal(deniedBrowserRecovery.isError, true, "non-reviewers cannot release an uncertain browser-attempt fence");
+  const deniedTerminalOutcome = await client.callTool({ name: "record_reviewer_browser_outcome", arguments: {
+    attemptId: "rturn-forged", threadId: "thread-recovery", classification: "reviewer_unrecoverable",
+    reasonCode: "authentication_unrecoverable", confirmNoFeedbackCommitted: true,
+    inspectionEvidence: "A worker attempts to declare its own review terminal.",
+  } });
+  assert.equal(deniedTerminalOutcome.isError, true, "non-reviewers cannot record a terminal reviewer outcome");
   const deniedBrowserAuth = await client.callTool({ name: "begin_reviewer_browser_auth", arguments: { profileId: "reviewer-profile" } });
   assert.equal(deniedBrowserAuth.isError, true, "non-reviewers cannot launch ordinary Chrome for reviewer authentication");
   assert.deepEqual(browserAuthCalls, ["begin:reviewer-profile", "complete:reviewer-profile", "legacy-login:reviewer-profile"], "denied auth requests never reach the browser controller");

@@ -18,7 +18,7 @@ A supervised mission is not complete because the worker says it is done. It is c
 
 | Tool | Purpose |
 |------|---------|
-| `begin_supervised_work` | Create the mission contract, create a work session, dispatch the preferred ACP worker, and return the supervisor packet. |
+| `begin_supervised_work` | When the reviewer explicitly requests a mission: create the mission contract, create a work session, dispatch the selected healthy `role: "agent"` worker (Hermes, Muse Code, MuseFI, or another registered harness — select by capability, never silently reroute), and return the supervisor packet. Direct workspace work comes first; missions are opt-in bounded assistance. |
 | `inspect_supervised_work` | Read the current mission packet: session, mission, criteria, findings, work orders, evidence, approval predicate, and diff summaries. |
 | `continue_supervised_work` | Persist reviewer findings/evidence/criterion updates, create the next bounded work order, and request changes. |
 | `approve_supervised_work` | Approve only when the mission predicate allows it; otherwise returns concrete blocker reasons. |
@@ -61,7 +61,7 @@ After a worker submission, call `inspect_supervised_work` before deciding. Check
 - Incremental diff and cumulative mission diff
 - Approval predicate reasons
 
-If the work is not acceptable, use `continue_supervised_work`, not generic `provide_review_feedback`, so the correction round is structured and auditable.
+If the work is not acceptable, use `continue_supervised_work` for the structured, auditable correction round inside the mission (findings, evidence, next work order). The terminal verdict still commits through the review authority: `approve_supervised_work` when the mission predicate allows it, or `provide_review_feedback` on the review loop. A correction round is not an approval.
 
 ## Changes Requested
 
@@ -99,6 +99,12 @@ If approval is blocked, report the returned reasons and continue with a bounded 
 - Required criteria need current evidence tied to the latest submission and snapshot.
 - Manual reviewer inspection is acceptable evidence when no command can prove the criterion.
 - Waived findings require a reason.
+
+## Authority boundaries (do not cross these)
+
+- Mission tools are conditional on exposure: if `begin_supervised_work` and friends are not in the current tool catalog, missions are unavailable — do not emulate them with generic tools.
+- `begin/continue/approve_supervised_work` are reviewer-only; `inspect_supervised_work` is read-only for any session reader. A worker calling the reviewer tools gets `Forbidden`.
+- No tool auto-creates a ChatGPT conversation, and caller conversation IDs are correlation data, never authority.
 
 ## Relationship To Ralph/Nelson
 

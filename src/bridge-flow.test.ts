@@ -552,6 +552,37 @@ try {
     const clientReviews = await callClient("list_pending_reviews", {});
     assert.ok(clientReviews.isError, "ordinary client cannot enumerate pending reviews");
 
+    // Stateless reviewer (ChatGPT remote MCP): authenticated principal, no transport owner.
+    {
+      const statelessServer = fakeServer();
+      registerBridgeTools(statelessServer as any, {
+        ...config,
+        principalRole: "reviewer",
+        principalId: undefined,
+        connectionContext: { authenticatedRole: "reviewer", authenticatedPrincipalId: "tunnel-reviewer", listenerKind: "owner_public" },
+      });
+      const callStateless = (name: string, args: any) => statelessServer.handlers.get(name)!(args);
+      const ownPending = workSessions.create({ workspaceSessionId: WS, submittedBy: "webui", principalId: "tunnel-reviewer" }).id;
+      workSessions.updateStatus(ownPending, "awaiting_review");
+      const otherPending = workSessions.create({ workspaceSessionId: WS, submittedBy: "webui", principalId: "someone-else" }).id;
+      workSessions.updateStatus(otherPending, "awaiting_review");
+      const listed = await callStateless("list_pending_reviews", {});
+      assert.ok(!listed.isError, "stateless reviewer with authenticated principal can list pending reviews");
+      const ids = (listed.structuredContent?.sessions ?? []).map((s: any) => s.sessionId);
+      assert.ok(ids.includes(ownPending), "principal-scoped pending review is listed");
+      assert.ok(!ids.includes(otherPending), "other principal's pending review is not listed");
+
+      const anonServer = fakeServer();
+      registerBridgeTools(anonServer as any, {
+        ...config,
+        principalRole: "reviewer",
+        principalId: undefined,
+        connectionContext: { authenticatedRole: "reviewer", listenerKind: "owner_public" },
+      });
+      const anonListed = await anonServer.handlers.get("list_pending_reviews")!({});
+      assert.ok(anonListed.isError, "anonymous reviewer without principal or owner stays forbidden");
+    }
+
     const clientPolicyServer = fakeServer();
     registerPolicyTools(clientPolicyServer as any, { eventStore, policyEngine, approvalRequests, principalRole: "client" });
     const clientPolicy = (name: string, args: any) => clientPolicyServer.handlers.get(name)!(args);
@@ -1757,6 +1788,33 @@ try {
       processSessionId: "proc_reviewer_observe",
     });
     assert.ok(workerPtyObservation.isError, "PTY output observation is reviewer-only");
+    config.reviewBrowserJobs!.getActiveForThread = () => undefined;
+    (config.reviewBrowserJobs as any).getTerminalOutcome = (input: { reviewThreadId: string }) => input.reviewThreadId === deliveryThread.id ? {
+      attemptId: "browser-turn-terminal", classification: "reviewer_unrecoverable", reasonCode: "authentication_unrecoverable",
+      evidenceSha256: "c".repeat(64), reviewerPrincipalId: "snapshot-reviewer", routeEpoch: deliveryRoute.routeEpoch,
+      createdAt: "2026-10-26T12:02:00.000Z", attemptState: "failed", attemptErrorCode: "reviewer_unrecoverable",
+      lastProgressAt: "2026-10-26T12:01:58.000Z", partialSeq: 2, partialSha256: "d".repeat(64),
+      partialComplete: false, partialPrefix: "partial verdict draft", partialCapturedAt: "2026-10-26T12:01:58.000Z",
+    } : undefined;
+    const terminalSnapshot = await callReviewer("get_work_session_snapshot", { sessionId });
+    assert.ok(!terminalSnapshot.isError, "work-session snapshot rehydrates with a terminal outcome");
+    assert.equal(terminalSnapshot.structuredContent.reviewLoop.browserAttempt, undefined,
+      "a terminal attempt releases the active browser-turn projection");
+    const terminalOutcome = terminalSnapshot.structuredContent.reviewLoop.terminalOutcome;
+    assert.equal(terminalOutcome.classification, "reviewer_unrecoverable");
+    assert.equal(terminalOutcome.reasonCode, "authentication_unrecoverable");
+    assert.equal(terminalOutcome.partial.authority, "unverified_partial",
+      "preserved partial text is marked unverified, never a verdict");
+    assert.equal(terminalOutcome.partial.complete, false);
+    assert.equal(terminalOutcome.partial.prefix, "partial verdict draft");
+    assert.match(terminalOutcome.guidance, /await operator decision/i,
+      "a terminal outcome tells the worker to await the operator, not to resend");
+    config.reviewBrowserJobs!.getActiveForThread = (threadId: string) => threadId === deliveryThread.id ? ({
+      id: "browser-turn-snapshot", status: "awaiting_feedback", attemptNumber: 2,
+      promptSubmittedAt: "2026-10-26T12:01:00.000Z", generationStartedAt: "2026-10-26T12:01:01.000Z",
+      generationFinishedAt: "2026-10-26T12:01:02.000Z",
+    } as any) : undefined;
+    delete (config.reviewBrowserJobs as any).getTerminalOutcome;
     ptyObservationSessionId = undefined;
     const surface = await callReviewer("get_workspace_session_surface", { workspaceId: WS });
     assert.ok(!surface.isError, "workspace session surface reads through the shared snapshot path");

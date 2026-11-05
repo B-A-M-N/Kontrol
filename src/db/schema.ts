@@ -307,9 +307,9 @@ export const workspaceGoals = sqliteTable(
 
 export type WorkspaceSessionRow = typeof workspaceSessions.$inferSelect;
 export type NewWorkspaceSessionRow = typeof workspaceSessions.$inferInsert;
+export type WorkspaceGoalRow = typeof workspaceGoals.$inferSelect;
 export type LoadedAgentFileRow = typeof loadedAgentFiles.$inferSelect;
 export type NewLoadedAgentFileRow = typeof loadedAgentFiles.$inferInsert;
-export type WorkspaceGoalRow = typeof workspaceGoals.$inferSelect;
 
 export const workSessions = sqliteTable("work_sessions", {
   id: text("id").primaryKey(),
@@ -355,6 +355,8 @@ export const workSessionSubmissions = sqliteTable("work_session_submissions", {
    * could not represent, so reviewers see the blind spot and an ordinary
    * approval is refused until explicitly accepted. Null = fully covered. */
   coverageJson: text("coverage_json"),
+  /** Explicit three-state assessment; legacy missing data migrates to unknown. */
+  coverageStatus: text("coverage_status", { enum: ["complete", "incomplete", "unknown"] }).notNull().default("unknown"),
   /** Exact working-tree snapshot commit the diff was captured against. Bound to
    * the submission so approval can require the workspace to still equal this
    * tree (fixes stale-approval after a concurrent submission in the same
@@ -543,6 +545,7 @@ export const continuations = sqliteTable("continuations", {
   verdict: text("verdict").notNull(),
   requiredActionsJson: text("required_actions_json").notNull().default("[]"),
   allowedNextActionsJson: text("allowed_next_actions_json").notNull().default("[]"),
+  allowedNextActionsSource: text("allowed_next_actions_source").notNull().default("legacy_unspecified"),
   reviewedDiffHash: text("reviewed_diff_hash"),
   feedbackSummary: text("feedback_summary"),
   resumeInstructions: text("resume_instructions"),
@@ -610,6 +613,7 @@ export const approvalRequests = sqliteTable("approval_requests", {
   principalId: text("principal_id"),
   approvalKey: text("approval_key"),
   operationHash: text("operation_hash"),
+  commandDigest: text("command_digest"),
   mcpSessionId: text("mcp_session_id"),
   mcpRequestId: text("mcp_request_id"),
   waiterKey: text("waiter_key"),
@@ -981,6 +985,9 @@ export const reviewRoutes = sqliteTable("review_routes", {
   deliveryTransport: text("delivery_transport").notNull().default("mcp_app"),
   browserProfileId: text("browser_profile_id"),
   pinnedConversationId: text("pinned_conversation_id"),
+  skillId: text("skill_id"),
+  skillVersion: text("skill_version"),
+  skillConfigSha256: text("skill_config_sha256"),
   maxReviewRounds: integer("max_review_rounds").notNull().default(3),
   completedReviewRounds: integer("completed_review_rounds").notNull().default(0),
   admittedReviewRounds: integer("admitted_review_rounds").notNull().default(0),
@@ -1127,6 +1134,7 @@ export const reviewBrowserTurns = sqliteTable("review_browser_turns", {
   generationFinishedObservationId: text("generation_finished_observation_id"),
   feedbackCommittedAt: text("feedback_committed_at"),
   errorCode: text("error_code"),
+  lastProgressAt: text("last_progress_at"),
   createdAt: text("created_at").notNull(),
 }, (table) => [
   uniqueIndex("review_browser_turns_message_number_unique").on(table.reviewMessageId, table.attemptNumber),
@@ -1141,10 +1149,23 @@ export const reviewBrowserTurnResolutions = sqliteTable("review_browser_turn_res
   routeEpoch: integer("route_epoch").notNull(),
   reviewerPrincipalId: text("reviewer_principal_id").notNull(),
   resolution: text("resolution").notNull(),
+  reasonCode: text("reason_code"),
   evidenceSha256: text("evidence_sha256").notNull(),
   createdAt: text("created_at").notNull(),
 }, (table) => [
   index("review_browser_turn_resolutions_thread_idx").on(table.reviewThreadId, table.createdAt),
+]);
+
+export const reviewBrowserPartialObservations = sqliteTable("review_browser_partial_observations", {
+  attemptId: text("attempt_id").notNull().references(() => reviewBrowserTurns.id, { onDelete: "cascade" }),
+  seq: integer("seq").notNull(),
+  textSha256: text("text_sha256").notNull(),
+  textPrefix: text("text_prefix").notNull(),
+  capturedAt: text("captured_at").notNull(),
+  provenance: text("provenance").notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.attemptId, table.seq] }),
+  index("review_browser_partial_observations_attempt_idx").on(table.attemptId, table.seq),
 ]);
 
 export const reviewBrowserProfiles = sqliteTable("review_browser_profiles", {

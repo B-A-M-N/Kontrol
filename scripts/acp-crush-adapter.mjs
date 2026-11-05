@@ -246,7 +246,10 @@ async function handleRequest(req, res) {
   if (url === "/health" && method === "GET") {
     const ready = reconciliationComplete && !shuttingDown;
     const executableAvailable = Boolean(resolveExecutablePath(CRUSH_BIN));
-    const confinementAvailable = Boolean(resolveExecutablePath("bwrap") && resolveExecutablePath("prlimit"));
+    // Confinement is enforced by Bubblewrap alone (buildReadOnlySandboxCommand
+    // never executes prlimit); gating availability on prlimit refused real
+    // confinement on hosts without util-linux's prlimit installed.
+    const confinementAvailable = Boolean(resolveExecutablePath("bwrap"));
     return writeJson(res, ready ? 200 : 503, {
       ok: ready,
       ready,

@@ -379,20 +379,29 @@ export async function runVerificationCommand(
     const append = (chunk: Buffer) => { output = (output + chunk.toString("utf8")).slice(-MAX_OUTPUT_BYTES); };
     child.stdout?.on("data", append);
     child.stderr?.on("data", append);
+    // The escalation timer is owned by this run and always cleared on settle:
+    // a late SIGKILL must never fire against a recycled process-group id.
+    let escalateTimer: NodeJS.Timeout | undefined;
+    const clearEscalation = () => {
+      if (escalateTimer !== undefined) {
+        clearTimeout(escalateTimer);
+        escalateTimer = undefined;
+      }
+    };
     const timeout = setTimeout(() => {
       timedOut = true;
       if (process.platform !== "win32" && child.pid) {
         process.kill(-child.pid, "SIGTERM");
         // P1 #20: SIGKILL after grace period
         const pid = child.pid;
-        setTimeout(() => {
+        escalateTimer = setTimeout(() => {
           try { process.kill(-pid, "SIGKILL"); } catch { /* already exited */ }
-        }, 5_000).unref?.();
+        }, 5_000);
       } else {
         child.kill("SIGTERM");
-        setTimeout(() => {
+        escalateTimer = setTimeout(() => {
           try { child.kill("SIGKILL"); } catch { /* already exited */ }
-        }, 5_000).unref?.();
+        }, 5_000);
       }
     }, Math.max(1, remainingMs));
     child.on("error", (error) => {
@@ -400,6 +409,7 @@ export async function runVerificationCommand(
       settled = true;
       activeVerifiers.delete(child);
       clearTimeout(timeout);
+      clearEscalation();
       output = (output + `\n${error.message}`).slice(-MAX_OUTPUT_BYTES);
       resolve({ status: active.interrupted ? "inconclusive" : "failed", exitCode: null, signal: null, durationMs: Date.now() - startedAt, outputTail: active.interrupted ? `${output}\nVerification interrupted during shutdown.` : output, outputSha256: createHash("sha256").update(output).digest("hex"), failureSetSha256: createFailureSetFingerprint(command, output, null, null), source: "executed" });
     });
@@ -408,6 +418,7 @@ export async function runVerificationCommand(
       settled = true;
       activeVerifiers.delete(child);
       clearTimeout(timeout);
+      clearEscalation();
       if (timedOut) output = `${output}\nVerification timed out.`.slice(-MAX_OUTPUT_BYTES);
       if (active.interrupted) output = `${output}\nVerification interrupted during shutdown.`.slice(-MAX_OUTPUT_BYTES);
       resolve({ status: active.interrupted ? "inconclusive" : exitCode === 0 && !timedOut ? "passed" : "failed", exitCode, signal, durationMs: Date.now() - startedAt, outputTail: output, outputSha256: createHash("sha256").update(output, "utf8").digest("hex"), failureSetSha256: createFailureSetFingerprint(command, output, exitCode, signal), source: "executed" });

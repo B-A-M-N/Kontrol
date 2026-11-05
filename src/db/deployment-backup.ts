@@ -251,12 +251,21 @@ export function restoreDeploymentDatabaseBackup(options: {
   deploymentId: string;
   maxReadableSchemaVersion: number;
   expectedOriginalSchemaVersion?: number;
+  /**
+   * Live schema snapshotted before this deployment mutated anything. The
+   * restore is required only when the deployment itself raised the schema
+   * past this baseline: a database that was already newer than the rollback
+   * target before the deployment (migrated out-of-band) is left untouched,
+   * since there is nothing this deployment did to undo.
+   */
+  preMutationSchemaVersion?: number;
 }): RestoreDatabaseResult {
-  const { stateDir, deploymentId, maxReadableSchemaVersion, expectedOriginalSchemaVersion } = options;
+  const { stateDir, deploymentId, maxReadableSchemaVersion, expectedOriginalSchemaVersion, preMutationSchemaVersion } = options;
   const record = readDeploymentMigrationRecord(stateDir, deploymentId);
   const databasePath = record?.databasePath ?? join(stateDir, "kontrol.sqlite");
   const currentSchemaVersion = currentDatabaseSchema(databasePath);
-  const required = currentSchemaVersion > maxReadableSchemaVersion;
+  const baseline = Math.max(preMutationSchemaVersion ?? maxReadableSchemaVersion, maxReadableSchemaVersion);
+  const required = currentSchemaVersion > baseline;
   if (!required) {
     return {
       deploymentId,

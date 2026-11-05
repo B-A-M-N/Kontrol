@@ -18,9 +18,11 @@ import {
   workspaceRelativePath,
 } from "./checkpoint-coverage.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
+import { resolveTestGitIdentity } from "./test-git-identity.js";
 
-const testGitName = execFileSync("git", ["config", "user.name"], { cwd: process.cwd(), encoding: "utf8" }).trim();
-const testGitEmail = execFileSync("git", ["config", "user.email"], { cwd: process.cwd(), encoding: "utf8" }).trim();
+const testGitIdentity = resolveTestGitIdentity();
+const testGitName = testGitIdentity.name;
+const testGitEmail = testGitIdentity.email;
 
 // ── Pure classifier ──────────────────────────────────────
 
@@ -107,7 +109,7 @@ assert.match(gitCoverage.reasons[1], /git-ignored/);
   writeFileSync(join(root, ".gitignore"), "secret.txt\n");
   writeFileSync(join(root, "tracked.txt"), "hi\n");
   run(["add", "-A"]);
-  run(["commit", "-q", "-m", "init"]);
+  run(["-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "init"]);
   const checkpoints = createReviewCheckpointManager({ snapshotStoreRoot: join(state, "snapshots") });
   // Open the workspace so the git backend initializes.
   await checkpoints.reviewChanges({ workspaceId: "ws-coverage-git", root, since: "workspace_open", markReviewed: false });

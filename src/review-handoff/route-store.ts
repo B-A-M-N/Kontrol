@@ -27,6 +27,9 @@ export interface ReviewRoute {
   deliveryTransport: ReviewDeliveryTransport;
   browserProfileId?: string;
   pinnedConversationId?: string;
+  skillId?: string;
+  skillVersion?: string;
+  skillConfigSha256?: string;
   maxReviewRounds: number;
   completedReviewRounds: number;
   admittedReviewRounds: number;
@@ -71,6 +74,9 @@ export interface ConfigureReviewLoopInput {
   expectedRevision?: number;
   deliveryTransport?: ReviewDeliveryTransport;
   browserProfileId?: string;
+  skillId?: string;
+  skillVersion?: string;
+  skillConfigSha256?: string;
 }
 
 export interface ReviewRouteStore {
@@ -141,6 +147,9 @@ function rowToRoute(row: ReviewRouteRow): ReviewRoute {
     deliveryTransport: row.deliveryTransport as ReviewDeliveryTransport,
     browserProfileId: row.browserProfileId ?? undefined,
     pinnedConversationId: row.pinnedConversationId ?? undefined,
+    skillId: row.skillId ?? undefined,
+    skillVersion: row.skillVersion ?? undefined,
+    skillConfigSha256: row.skillConfigSha256 ?? undefined,
     maxReviewRounds: row.maxReviewRounds,
     completedReviewRounds: row.completedReviewRounds,
     admittedReviewRounds: row.admittedReviewRounds,
@@ -262,6 +271,25 @@ export function createReviewRouteStore(database: DatabaseHandle): ReviewRouteSto
   return {
     configure(input) {
       if (input.maxReviewRounds < 1 || input.maxReviewRounds > 10) throw new Error("maxReviewRounds must be between 1 and 10.");
+      // Skill provenance is optional, but when supplied it must be complete
+      // and well-formed: a reviewer-asserted budget carries no provenance,
+      // never a half-filled one. Deep validation of the skill configuration
+      // content against the local skill catalog is a follow-up; the format
+      // gate here keeps malformed bindings out of the durable record.
+      const skillId = input.skillId?.trim() ? input.skillId.trim() : undefined;
+      const skillVersion = input.skillVersion?.trim() ? input.skillVersion.trim() : undefined;
+      const skillConfigSha256 = input.skillConfigSha256?.trim() ? input.skillConfigSha256.trim() : undefined;
+      const provenanceCount = [skillId, skillVersion, skillConfigSha256].filter((part) => part !== undefined).length;
+      if (provenanceCount > 0 && provenanceCount < 3) {
+        throw new Error("Skill provenance is all-or-nothing: provide skillId, skillVersion, and skillConfigSha256 together, or none of them.");
+      }
+      if (skillId !== undefined && (skillId.length > 128 || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(skillId))) {
+        throw new Error("skillId must be a portable skill identifier.");
+      }
+      if (skillVersion !== undefined && skillVersion.length > 32) throw new Error("skillVersion must be 32 characters or fewer.");
+      if (skillConfigSha256 !== undefined && !/^[0-9a-f]{64}$/.test(skillConfigSha256)) {
+        throw new Error("skillConfigSha256 must be a 64-character lowercase hex digest.");
+      }
       const requestedTransport = input.deliveryTransport ?? "mcp_app";
       const requestedProfileId = requestedTransport === "native_cdp" ? input.browserProfileId : undefined;
       if (requestedTransport === "native_cdp" && !requestedProfileId) throw new Error("Native CDP review delivery requires an explicitly selected browser profile.");
@@ -280,6 +308,9 @@ export function createReviewRouteStore(database: DatabaseHandle): ReviewRouteSto
             deliveryTransport: requestedTransport,
             browserProfileId: requestedProfileId ?? null,
             pinnedConversationId: input.pinnedConversationId ?? null,
+            skillId: skillId ?? null,
+            skillVersion: skillVersion ?? null,
+            skillConfigSha256: skillConfigSha256 ?? null,
             maxReviewRounds: input.maxReviewRounds,
             completedReviewRounds: 0,
             admittedReviewRounds: 0,
@@ -307,7 +338,16 @@ export function createReviewRouteStore(database: DatabaseHandle): ReviewRouteSto
         const nextProfileId = nextTransport === "native_cdp" ? (input.browserProfileId ?? existing.browserProfileId) : undefined;
         if (nextTransport === "native_cdp" && !nextProfileId) throw new Error("Native CDP review delivery requires an explicitly selected browser profile.");
         const changedTransport = nextTransport !== existing.deliveryTransport || nextProfileId !== existing.browserProfileId;
-        const changesGeneration = changedMode || changedTransport
+        // The round budget is locked to the loop generation: changing it is an
+        // explicit audited reconfiguration that opens a fresh generation with
+        // a fresh reviewer thread. It is never mutated in place within an
+        // epoch, so a worker or a repeated configure call cannot silently
+        // stretch the active loop.
+        const changedBudget = input.maxReviewRounds !== existing.maxReviewRounds;
+        const changedProvenance = (skillId ?? null) !== (existing.skillId ?? null)
+          || (skillVersion ?? null) !== (existing.skillVersion ?? null)
+          || (skillConfigSha256 ?? null) !== (existing.skillConfigSha256 ?? null);
+        const changesGeneration = changedMode || changedTransport || changedBudget || changedProvenance
           || (input.enabled && existing.status === "disabled")
           || (!input.enabled && existing.status !== "disabled");
         if (changesGeneration) supersedeRouteEpoch(existing.id, existing.routeEpoch, now);
@@ -316,6 +356,9 @@ export function createReviewRouteStore(database: DatabaseHandle): ReviewRouteSto
           deliveryTransport: nextTransport,
           browserProfileId: nextProfileId ?? null,
           pinnedConversationId: input.pinnedConversationId ?? null,
+          skillId: skillId ?? null,
+          skillVersion: skillVersion ?? null,
+          skillConfigSha256: skillConfigSha256 ?? null,
           maxReviewRounds: input.maxReviewRounds,
           status: input.enabled ? "active" : "disabled",
           routeEpoch: changesGeneration ? existing.routeEpoch + 1 : existing.routeEpoch,
@@ -323,15 +366,10 @@ export function createReviewRouteStore(database: DatabaseHandle): ReviewRouteSto
           warningAcknowledgedAt: existing.warningAcknowledgedAt ?? null,
           updatedAt: now,
         }).where(eq(reviewRoutes.id, existing.id)).run();
-        if (input.maxReviewRounds !== existing.maxReviewRounds && !changesGeneration) {
-          database.db.update(reviewThreads).set({
-            maxRounds: input.maxReviewRounds,
-            revision: sql`${reviewThreads.revision} + 1`,
-          }).where(and(
-            eq(reviewThreads.routeId, existing.id), eq(reviewThreads.routeEpoch, existing.routeEpoch),
-            sql`${reviewThreads.status} != 'closed'`,
-          )).run();
-        }
+        // No in-place budget propagation: any budget change above forced a new
+        // generation, so open threads of this epoch always carry the budget
+        // they were admitted under. The next handoff opens a fresh thread
+        // with the new generation budget.
         if (!changesGeneration && input.enabled) syncThreadDeliveryStatus(existing.id, existing.routeEpoch, "active", now);
         return getRouteBySession(input.workSessionId)!;
       });

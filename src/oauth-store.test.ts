@@ -150,6 +150,13 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 107, name: "review-browser-durable-auth-ownership" },
       { version: 108, name: "review-browser-launch-diagnostics" },
       { version: 109, name: "workspace-goals" },
+      { version: 110, name: "fail-closed-review-coverage-state" },
+      { version: 111, name: "durable-review-mutation-provenance" },
+      { version: 112, name: "redacted-approval-command-previews" },
+      { version: 113, name: "continuation-action-permission-provenance" },
+      { version: 114, name: "review-route-skill-provenance" },
+      { version: 115, name: "review-browser-partial-observations" },
+      { version: 116, name: "review-browser-terminal-outcome" },
     ]);
   } finally {
     database.close();

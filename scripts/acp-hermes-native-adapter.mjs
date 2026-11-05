@@ -314,7 +314,9 @@ async function handle(req, res) {
         read_only_audit: {
           supported: true,
           grantPolicy: "kontrol_signed_attempt_bound",
-          confinementAvailable: Boolean(resolveExecutablePath("bwrap") && resolveExecutablePath("prlimit")),
+          // Confinement is enforced by Bubblewrap alone (see crush adapter):
+          // prlimit is never executed on this path, so it must not gate it.
+          confinementAvailable: Boolean(resolveExecutablePath("bwrap")),
           executableAvailable: Boolean(PYTHON_BIN && resolveExecutablePath(PYTHON_BIN) && resolveExecutablePath(HERMES_ACP_ENTRY.command) && existsSync(RUNNER)),
           toolchainAvailable: HERMES_READ_ONLY_TOOLCHAIN_STATUS.available,
           ...(HERMES_READ_ONLY_TOOLCHAIN_STATUS.reason ? { toolchainFailure: HERMES_READ_ONLY_TOOLCHAIN_STATUS.reason } : {}),
@@ -324,7 +326,8 @@ async function handle(req, res) {
         bounded_file_write: {
           supported: true,
           grantPolicy: "kontrol_signed_attempt_bound",
-          confinementAvailable: Boolean(resolveExecutablePath("bwrap") && resolveExecutablePath("prlimit")),
+          // Same Bubblewrap-only confinement as read_only_audit above.
+          confinementAvailable: Boolean(resolveExecutablePath("bwrap")),
           executableAvailable: Boolean(PYTHON_BIN && resolveExecutablePath(PYTHON_BIN) && resolveExecutablePath(HERMES_ACP_ENTRY.command) && existsSync(RUNNER)),
           toolchainAvailable: HERMES_READ_ONLY_TOOLCHAIN_STATUS.available,
           ...(HERMES_READ_ONLY_TOOLCHAIN_STATUS.reason ? { toolchainFailure: HERMES_READ_ONLY_TOOLCHAIN_STATUS.reason } : {}),
@@ -391,8 +394,16 @@ async function handle(req, res) {
       if (!receipt.requestFingerprint || receipt.requestFingerprint !== requestFingerprint) {
         return writeJson(res, 409, { error: { code: receipt.requestFingerprint ? "dispatch_idempotency_conflict" : "dispatch_fingerprint_unavailable", message: "The original dispatch key is already bound to different or unverifiable request content." } });
       }
+      // The replay must be built from authoritative persisted state only.
+      // Worker tokens are ephemeral by design (stripped before durable
+      // persistence), so a restarted adapter cannot return the original
+      // token without recreating one. When the run is still live in this
+      // process, its current token is authoritative live state; otherwise
+      // the receipt identity and certainty state are returned without a
+      // token and nothing new is launched.
+      const liveRun = [...active.values()].find((candidate) => candidate.dispatchIdempotencyKey === dispatchIdempotencyKey);
       return writeJson(res, 202, {
-        worker_token: run.workerToken,
+        ...(liveRun?.workerToken ? { worker_token: liveRun.workerToken } : {}),
       run_id: receipt.remoteRunId,
         remote_run_id: receipt.remoteRunId,
         accepted: !["dispatching", "unstarted"].includes(receipt.status),
@@ -527,6 +538,11 @@ async function handle(req, res) {
       exp: Date.now() + TOKEN_TTL_MS,
     }, AGENT_SECRET);
   }
+  // Ordinary delegation carries no signed execution grant: it is authorized
+  // by the worker/run identity plus the live workspace lease checked below,
+  // and it spawns outside the confined sandbox. Only the two restricted
+  // modes require their respective complete signed grants.
+  const requiresConfinedGrant = run.readOnlyAudit || run.boundedFileWrite;
   const execution = run.boundedFileWrite
     ? {
       mode: "bounded_file_write",
@@ -536,15 +552,17 @@ async function handle(req, res) {
         ? createHash("sha256").update(run.boundedFileWriteGrant.signature).digest("hex")
         : undefined,
     }
-    : {
-      mode: "read_only_audit",
-      grant: run.readOnlyExecutionGrant,
-      networkPolicy: run.readOnlyExecutionGrant?.networkPolicy,
-      grantFingerprint: run.readOnlyExecutionGrant
-        ? createHash("sha256").update(run.readOnlyExecutionGrant.signature).digest("hex")
-        : undefined,
-    };
-  if (!execution.grant || !execution.networkPolicy || !execution.grantFingerprint) {
+    : run.readOnlyAudit
+      ? {
+        mode: "read_only_audit",
+        grant: run.readOnlyExecutionGrant,
+        networkPolicy: run.readOnlyExecutionGrant?.networkPolicy,
+        grantFingerprint: run.readOnlyExecutionGrant
+          ? createHash("sha256").update(run.readOnlyExecutionGrant.signature).digest("hex")
+          : undefined,
+      }
+      : { mode: "delegated", grant: undefined, networkPolicy: undefined, grantFingerprint: undefined };
+  if (requiresConfinedGrant && (!execution.grant || !execution.networkPolicy || !execution.grantFingerprint)) {
     return writeJson(res, 403, {
       error: { code: "execution_grant_incomplete", message: "A complete signed execution grant is required for confined Hermes execution." },
     });
@@ -602,6 +620,9 @@ async function handle(req, res) {
       run.readOnlySandbox = buildReadOnlySandboxCommand({
         workspaceRoot,
         executable: pythonExecutable,
+        // A relocated interpreter is bind-mounted at hermesSandboxPython;
+        // the host path is not a valid sandbox target (it lives under /tmp
+        // scratch or the workspace), so aim at the mounted sandbox path.
         executableTarget: pythonUsesSystemRuntime ? undefined : hermesSandboxPython,
         args: ["/opt/kontrol/hermes-runtime/hermes-native-runner.py"],
         env: {
@@ -693,6 +714,7 @@ async function handle(req, res) {
       const runtimeProbe = buildReadOnlySandboxCommand({
         workspaceRoot,
         executable: pythonExecutable,
+        // Same relocated-interpreter target as the worker launch above.
         executableTarget: pythonUsesSystemRuntime ? undefined : hermesSandboxPython,
         args: ["-c", "import acp; from acp.core import connect_to_agent; from acp.schema import ClientCapabilities, FileSystemCapabilities, Implementation, TextContentBlock; import acp_adapter.entry; import acp_adapter.server"],
         env: {

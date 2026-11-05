@@ -15,7 +15,13 @@
 //   12. restart on the SAME state directory; stale identity reconciliation
 //   13. final DB integrity check
 //
-// Usage: node scripts/release-uat.mjs [--skip-install]
+// Usage: node scripts/release-uat.mjs [--skip-install] [--candidate <immutable-candidate-dir>]
+//
+// P1-D: `--candidate` (or KONTROL_UAT_CANDIDATE_DIR) exercises the EXACT
+// artifact intended for release instead of building a fresh one: the
+// candidate's build-meta.json identity is verified before packing, and the
+// same identity is recorded in the UAT receipt. Never rebuild the candidate
+// during final release qualification.
 import assert from "node:assert/strict";
 import { spawn, execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -26,6 +32,7 @@ import {
   existsSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -35,6 +42,21 @@ import { join, resolve } from "node:path";
 
 const root = resolve(import.meta.dirname ?? ".", "..");
 const skipInstall = process.argv.includes("--skip-install");
+function flagValue(name) {
+  const index = process.argv.indexOf(name);
+  return index >= 0 ? process.argv[index + 1] : undefined;
+}
+// P1-D: explicit immutable candidate under test. Empty/undefined = build one.
+const explicitCandidateDir = flagValue("--candidate") ?? process.env.KONTROL_UAT_CANDIDATE_DIR ?? undefined;
+if (process.argv.includes("--candidate") && !flagValue("--candidate")) {
+  throw new Error("release-uat: --candidate requires a directory argument");
+}
+// The UAT receipt binds the exercised artifact to its build identity.
+const uatReceipt = {
+  schema: "kontrol-release-uat-receipt/1",
+  candidate: null,
+  checksPassed: false,
+};
 const tmp = mkdtempSync(join(tmpdir(), "kontrol-release-uat-"));
 const installPrefix = join(tmp, "prefix");
 const stateDir = join(tmp, "state");
@@ -43,6 +65,27 @@ const workspaceDir = join(tmp, "workspace");
 let server = null;
 let serverStderr = "";
 let serverStdout = "";
+// P1-A: fixture-owned server PIDs. The leak check verifies exactly these
+// identities instead of a host-wide pgrep, so a concurrently running Kontrol
+// elsewhere on the machine can neither false-fail this UAT nor hide a
+// fixture child that survived.
+const ownedServerPids = [];
+
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+function assertNoFixtureSurvivors(label) {
+  const survivors = ownedServerPids.filter(pidAlive);
+  assert.equal(survivors.length, 0, `${label}: leaked fixture server processes: ${survivors.join(",")}`);
+  log("leak-check", `${label}: no fixture survivors`);
+}
 
 function log(step, message) {
   console.log(`[release-uat] ${step}: ${message}`);
@@ -58,12 +101,25 @@ function unusedTcpPort() {
   });
 }
 
+// P1-A: every outbound request carries its own deadline. A single hanging
+// fetch must never block the outer retry-deadline check.
+const PER_REQUEST_MS = Number(process.env.KONTROL_UAT_REQUEST_TIMEOUT_MS ?? 10_000);
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = PER_REQUEST_MS) {
+  const response = await fetch(url, {
+    ...options,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  return response;
+}
+
 async function waitForHttp(url, timeoutMs = 30_000, diagnostics = () => "") {
   const deadline = Date.now() + timeoutMs;
   let lastError;
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(url);
+      const remaining = deadline - Date.now();
+      const response = await fetchWithTimeout(url, {}, Math.min(PER_REQUEST_MS, Math.max(remaining, 1_000)));
       if (response.ok) return response;
       lastError = new Error(`HTTP ${response.status} from ${url}`);
     } catch (error) {
@@ -78,7 +134,7 @@ let rpcId = 0;
 let mcpSessionId;
 
 async function mcpRpc(method, params) {
-  const response = await fetch(globalThis.__uatMcpUrl, {
+  const response = await fetchWithTimeout(globalThis.__uatMcpUrl, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -111,42 +167,104 @@ try {
   assert.equal(existsSync(stateDir), false, "state directory must start empty");
   let installedCli;
   if (skipInstall && process.env.KONTROL_UAT_CLI) {
+    if (explicitCandidateDir) {
+      throw new Error("release-uat: --candidate cannot be combined with --skip-install (nothing would be installed)");
+    }
     installedCli = process.env.KONTROL_UAT_CLI;
     log("install", `skipped (--skip-install); using ${installedCli}`);
   } else {
-    log("pack", "building and packing immutable release candidate");
-    execFileSync(process.execPath, [
-      join(root, "scripts", "package-stage.mjs"),
-      "--pack-destination",
-      tmp,
-    ], {
-      cwd: root,
-      env: testHarnessEnvironment(process.env, {
-        overrides: {
-          KONTROL_BUILD_RESULT_PATH: join(tmp, "build-result.json"),
-          npm_config_cache: join(tmp, "npm-cache"),
-        },
-      }),
-      stdio: "pipe",
-    });
+    // P1-D: verify the exact candidate identity BEFORE packing/installing.
+    let packArgs;
+    if (explicitCandidateDir) {
+      const candidateMetaPath = join(explicitCandidateDir, "build-meta.json");
+      assert.ok(existsSync(candidateMetaPath), `explicit candidate has no build-meta.json: ${candidateMetaPath}`);
+      const candidateMeta = JSON.parse(readFileSync(candidateMetaPath, "utf8"));
+      assert.equal(typeof candidateMeta.buildId, "string", "candidate build-meta.json has no string buildId");
+      assert.equal(typeof candidateMeta.contentSha256, "string", "candidate build-meta.json has no string contentSha256");
+      uatReceipt.candidate = {
+        artifactPath: explicitCandidateDir,
+        buildId: candidateMeta.buildId,
+        version: candidateMeta.version ?? null,
+        contentSha256: candidateMeta.contentSha256,
+      };
+      log("candidate", `exact artifact buildId=${candidateMeta.buildId} contentSha256=${String(candidateMeta.contentSha256).slice(0, 16)}…`);
+      packArgs = ["--skip-build", "--candidate", explicitCandidateDir, "--pack-destination", tmp];
+    } else {
+      log("pack", "building and packing immutable release candidate");
+      packArgs = ["--pack-destination", tmp];
+    }
+    try {
+      execFileSync(process.execPath, [
+        join(root, "scripts", "package-stage.mjs"),
+        ...packArgs,
+      ], {
+        cwd: root,
+        env: testHarnessEnvironment(process.env, {
+          overrides: {
+            KONTROL_BUILD_RESULT_PATH: join(tmp, "build-result.json"),
+            npm_config_cache: join(tmp, "npm-cache"),
+          },
+        }),
+        stdio: "pipe",
+        // P1-A: packaging must be bounded; stdlib enforces the deadline.
+        timeout: Number(process.env.KONTROL_UAT_PACK_TIMEOUT_MS ?? 600_000),
+        killSignal: "SIGKILL",
+      });
+    } catch (error) {
+      error.message = `release-uat pack step failed (product failure, not network): ${error.message}`;
+      throw error;
+    }
     const tarballPath = readdirSync(tmp).find((name) => name.endsWith(".tgz"));
     assert.ok(tarballPath, "npm pack produced no tarball");
     log("install", `installing ${tarballPath}`);
-    execFileSync("npm", [
-      "install", "--prefix", installPrefix, "--no-audit", "--no-fund", "--package-lock=false",
-      join(tmp, tarballPath),
-    ], {
-      cwd: tmp,
-      // P1.10: UAT harness installs into an isolated temp prefix with the
-      // explicit tool allowlist, not a control-plane environment.
-      env: testHarnessEnvironment(process.env, { overrides: { npm_config_cache: join(tmp, "npm-cache") } }),
-      stdio: "pipe",
-    });
+    try {
+      execFileSync("npm", [
+        "install", "--prefix", installPrefix, "--no-audit", "--no-fund", "--package-lock=false",
+        join(tmp, tarballPath),
+      ], {
+        cwd: tmp,
+        // P1.10: UAT harness installs into an isolated temp prefix with the
+        // explicit tool allowlist, not a control-plane environment.
+        env: testHarnessEnvironment(process.env, { overrides: { npm_config_cache: join(tmp, "npm-cache") } }),
+        stdio: "pipe",
+        // P1-A: installation must be bounded. A timeout here is INFRA
+        // (registry/cache), not a product verdict — the stdlib ETIMEDOUT
+        // message preserves that distinction.
+        timeout: Number(process.env.KONTROL_UAT_INSTALL_TIMEOUT_MS ?? 600_000),
+        killSignal: "SIGKILL",
+      });
+    } catch (error) {
+      if (error.code === "ETIMEDOUT") {
+        error.message = `release-uat npm install timed out (infra/network, not a product verdict): ${error.message}`;
+      }
+      throw error;
+    }
     installedCli = join(installPrefix, "node_modules", "@b-a-m-n", "kontrol", "dist", "cli.js");
     assert.ok(existsSync(installedCli), "clean install missing dist/cli.js");
+    if (!uatReceipt.candidate) {
+      // Default path: the candidate was just built by package-stage; bind the
+      // receipt to its identity (build-result.json lives in tmp via
+      // KONTROL_BUILD_RESULT_PATH).
+      const builtResultPath = join(tmp, "build-result.json");
+      assert.ok(existsSync(builtResultPath), `fresh build produced no build-result.json at ${builtResultPath}`);
+      const builtResult = JSON.parse(readFileSync(builtResultPath, "utf8"));
+      const builtMetaPath = join(builtResult.artifactPath, "build-meta.json");
+      assert.ok(existsSync(builtMetaPath), `fresh candidate has no build-meta.json: ${builtMetaPath}`);
+      const builtMeta = JSON.parse(readFileSync(builtMetaPath, "utf8"));
+      uatReceipt.candidate = {
+        artifactPath: builtResult.artifactPath,
+        buildId: builtMeta.buildId ?? builtResult.buildId ?? null,
+        version: builtMeta.version ?? null,
+        contentSha256: builtMeta.contentSha256 ?? null,
+      };
+      log("candidate", `fresh artifact buildId=${uatReceipt.candidate.buildId} contentSha256=${String(uatReceipt.candidate.contentSha256).slice(0, 16)}…`);
+    }
   }
 
   // Deterministic workspace content.
+  // The install prefix must exist as a spawn cwd even when --skip-install
+  // bypasses `npm install` (which would otherwise create it).
+  fs.mkdirSync(installPrefix, { recursive: true });
   fs.mkdirSync(workspaceDir, { recursive: true });
   writeFileSync(join(workspaceDir, "hello.txt"), "release uat fixture\n");
 
@@ -168,11 +286,12 @@ try {
     KONTROL_LOG_FORMAT: "pretty",
   } });
   log("launch", `starting installed server on :${servicePort}`);
-  server = spawn("node", [installedCli, "serve"], {
+  server = spawn(process.execPath, [installedCli, "serve"], {
     cwd: installPrefix,
     env: serviceEnv,
     stdio: ["ignore", "pipe", "pipe"],
   });
+  if (server.pid) ownedServerPids.push(server.pid);
   server.stdout?.on("data", (chunk) => { serverStdout = `${serverStdout}${String(chunk)}`.slice(-32_000); });
   server.stderr?.on("data", (chunk) => { serverStderr += String(chunk); });
 
@@ -194,7 +313,7 @@ try {
     clientInfo: { name: "kontrol-release-uat", version: "1" },
   });
   assert.ok(mcpSessionId, "initialize did not provide an MCP session id");
-  await fetch(globalThis.__uatMcpUrl, {
+  await fetchWithTimeout(globalThis.__uatMcpUrl, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -272,7 +391,7 @@ try {
   // Registry surface sanity: registering a deterministic loopback agent
   // succeeds, and heartbeats keep it alive (exercises the auth + registration
   // path of the installed product without any real model).
-  const agentRegisterResponse = await fetch(`http://127.0.0.1:${servicePort}/acp/agents/register`, {
+  const agentRegisterResponse = await fetchWithTimeout(`http://127.0.0.1:${servicePort}/acp/agents/register`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -303,18 +422,17 @@ try {
   assert.equal(exitCode, 0, `installed server exited with ${exitCode} on SIGTERM`);
   log("shutdown", "clean exit code 0");
 
-  // ── 11: no leaked child processes from the install prefix ────────────────
-  const psOut = spawnSync("pgrep", ["-f", "kontrol/dist/cli.js"], { encoding: "utf8" });
-  assert.notEqual(psOut.status, 0, `leaked server processes: ${psOut.stdout}`);
-  log("leak-check", "no leaked processes");
+  // ── 11: no leaked child processes from this fixture ────────────────────
+  assertNoFixtureSurvivors("first server");
 
   // ── 12: restart on the same state dir; reconciliation must succeed ───────
   log("restart", "relaunching on the same state directory");
-  server = spawn("node", [installedCli, "serve"], {
+  server = spawn(process.execPath, [installedCli, "serve"], {
     cwd: installPrefix,
     env: serviceEnv,
     stdio: ["ignore", "pipe", "pipe"],
   });
+  if (server.pid) ownedServerPids.push(server.pid);
   const restartedStderr = [];
   server.stderr?.on("data", (chunk) => restartedStderr.push(String(chunk)));
   const port2 = servicePort; // reuse the same port after clean exit
@@ -323,20 +441,44 @@ try {
   log("restart", "reconciled and healthy");
 
   // ── 13: final DB integrity ───────────────────────────────────────────────
+  // P1-A: the final shutdown carries its own deadline with SIGKILL
+  // escalation, and the fixture-scoped leak check covers both servers.
   server.kill("SIGTERM");
-  await new Promise((resolvePromise) => server.once("exit", resolvePromise));
+  const finalExit = await new Promise((resolvePromise) => {
+    const timer = setTimeout(() => resolvePromise("timeout"), 15_000);
+    server.once("exit", (code) => { clearTimeout(timer); resolvePromise(code); });
+  });
+  if (finalExit === "timeout" && server.exitCode === null) {
+    server.kill("SIGKILL");
+    const killExit = await new Promise((resolvePromise) => {
+      const timer = setTimeout(() => resolvePromise("timeout"), 10_000);
+      server.once("exit", (code) => { clearTimeout(timer); resolvePromise(code); });
+    });
+    assert.notEqual(killExit, "timeout", `fixture server pid=${server.pid} survived SIGKILL (CLEANUP_FAILED)`);
+  }
+  assertNoFixtureSurvivors("restarted server");
   const dbPath = join(stateDir, "kontrol.sqlite");
   assert.ok(existsSync(dbPath), "state database missing after run");
-  const integrity = spawnSync("node", ["-e", `
+  const integrity = spawnSync(process.execPath, ["-e", `
     const Database = require(process.argv[1]);
     const db = new Database(process.argv[2], { readonly: true });
     console.log(db.pragma('integrity_check', { simple: true }));
     db.close();
-  `, createRequire(join(root, "package.json")).resolve("better-sqlite3"), dbPath], { encoding: "utf8" });
+  `, createRequire(join(root, "package.json")).resolve("better-sqlite3"), dbPath], {
+    encoding: "utf8",
+    // P1-A: local integrity probe, still bounded.
+    timeout: 60_000,
+    killSignal: "SIGKILL",
+  });
   assert.match(integrity.stdout, /ok/i, `DB integrity: ${integrity.stderr || integrity.stdout}`);
   log("db-integrity", "ok");
 
+  uatReceipt.checksPassed = true;
   console.log("\nrelease-uat: ALL CHECKS PASSED");
+  // P1-D: machine-readable receipt binds the exercised artifact to its
+  // build identity. stdout is the durable channel: the tmp dir is removed
+  // in `finally`, and the caller (beta gate) persists this line.
+  console.log(`release-uat-receipt: ${JSON.stringify(uatReceipt)}`);
 } finally {
   if (server && server.exitCode === null) {
     server.kill("SIGKILL");

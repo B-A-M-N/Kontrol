@@ -112,6 +112,32 @@ export function readPtyReviewSubmission(result: unknown): PtyReviewToolResult {
   return { ok: true, receipt };
 }
 
+export type PtyMessageReplyStatus = "reply_ready" | "timeout";
+
+export function readPtyMessagePost(result: unknown): PtyReviewToolResult {
+  const value = objectValue(result);
+  const receipt = objectValue(value?.structuredContent);
+  if (value?.isError === true || !receipt
+    || typeof receipt.messageId !== "string" || typeof receipt.status !== "string") {
+    return { ok: false, error: diagnostic(result, "post_agent_message returned an invalid response") };
+  }
+  return { ok: true, receipt };
+}
+
+export function readPtyMessageReply(result: unknown): PtyReviewToolResult & { status?: PtyMessageReplyStatus } {
+  const value = objectValue(result);
+  const receipt = objectValue(value?.structuredContent);
+  const status = receipt?.status;
+  if (value?.isError === true || !receipt
+    || !["reply_ready", "timeout", "error"].includes(String(status))) {
+    return { ok: false, error: diagnostic(result, "await_agent_reply returned an invalid response") };
+  }
+  if (status === "error") {
+    return { ok: false, error: typeof receipt.message === "string" ? receipt.message : "await_agent_reply failed" };
+  }
+  return { ok: true, status: status as PtyMessageReplyStatus, receipt };
+}
+
 export function readPtyReviewFeedback(result: unknown): PtyReviewToolResult & { status?: PtyReviewFeedbackStatus } {
   const value = objectValue(result);
   const receipt = objectValue(value?.structuredContent);

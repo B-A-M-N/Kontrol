@@ -18,11 +18,55 @@ export interface ReviewerAttempt {
   id: string; messageId: string; reviewThreadId: string; routeEpoch: number; profileId?: string;
   browserGeneration?: number; attemptNumber: number; status: string; leaseExpiresAt?: string;
   promptSubmittedAt?: string; generationStartedAt?: string; generationStartedObservationId?: string;
-  generationFinishedAt?: string; generationFinishedObservationId?: string;
+  generationFinishedAt?: string; generationFinishedObservationId?: string; lastProgressAt?: string;
   settledAt?: string; lastErrorCode?: string;
 }
 
+export interface PartialObservationInput {
+  attemptId: string;
+  leaseToken: string;
+  profileId: string;
+  browserGeneration: number;
+  textPrefix: string;
+  textSha256: string;
+  provenance?: string;
+}
+
+export interface TerminalOutcomeInput {
+  attemptId: string;
+  reviewThreadId: string;
+  routeEpoch: number;
+  reviewerPrincipalId: string;
+  classification: "reviewer_unrecoverable";
+  reasonCode: string;
+  inspectionEvidence: string;
+}
+
+export interface TerminalOutcome {
+  attemptId: string;
+  classification: "reviewer_unrecoverable";
+  reasonCode: string;
+  evidenceSha256: string;
+  partialSeq: number | null;
+  partialSha256: string | null;
+  partialComplete: false;
+  lastProgressAt?: string;
+}
+
+export interface TerminalOutcomeRecord extends TerminalOutcome {
+  reviewThreadId: string;
+  routeEpoch: number;
+  reviewerPrincipalId: string;
+  createdAt: string;
+  attemptState: string;
+  attemptErrorCode: string | null;
+  partialPrefix: string | null;
+  partialCapturedAt: string | null;
+}
+
 export interface ReviewerJobStore {
+  recordTerminalOutcome(input: TerminalOutcomeInput): TerminalOutcome;
+  getTerminalOutcome(input: { reviewThreadId: string }): TerminalOutcomeRecord | undefined;
   claim(input: { messageId: string; profileId: string; browserGeneration: number; leaseMs?: number }): ReviewerJobClaim | undefined;
   transition(input: {
     attemptId: string; leaseToken: string; profileId: string; browserGeneration: number;
@@ -37,11 +81,17 @@ export interface ReviewerJobStore {
   }): { messageId: string; messageRevision: number; resolutionSha256: string };
   settleForFeedback(input: { handoffId: string; routeEpoch: number }): void;
   settleForAgentMessage(input: { agentMessageId: string; routeEpoch: number }): void;
+  recordPartialObservation(input: PartialObservationInput): { seq: number; changed: boolean; sha256: string };
   getActiveForThread(reviewThreadId: string): ReviewerAttempt | undefined;
   close(): void;
 }
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
+
+/** Maximum persisted partial-response prefix per observation. Longer page
+ * text is truncated before hashing so the digest covers exactly the stored
+ * bytes; oversized input is rejected, never silently stored in full. */
+export const PARTIAL_OBSERVATION_PREFIX_LIMIT = 4000;
 
 function asAttempt(row: typeof reviewBrowserTurns.$inferSelect): ReviewerAttempt {
   return {
@@ -53,13 +103,118 @@ function asAttempt(row: typeof reviewBrowserTurns.$inferSelect): ReviewerAttempt
     generationStartedObservationId: row.generationStartedObservationId ?? undefined,
     generationFinishedAt: row.generationFinishedAt ?? undefined,
     generationFinishedObservationId: row.generationFinishedObservationId ?? undefined,
+    lastProgressAt: row.lastProgressAt ?? undefined,
     settledAt: row.feedbackCommittedAt ?? undefined,
     lastErrorCode: row.errorCode ?? undefined,
   };
 }
 
+const TERMINAL_ELIGIBLE_STATES = [
+  "prompt_accepted", "model_generating", "generation_finished", "awaiting_feedback",
+  "uncertain", "blocked_auth", "blocked_browser",
+] as const;
+
 export function createReviewerJobStore(database: DatabaseHandle): ReviewerJobStore {
   return {
+    recordTerminalOutcome(input) {
+      if (input.classification !== "reviewer_unrecoverable") {
+        throw new Error("Unknown terminal reviewer classification; only reviewer_unrecoverable is supported.");
+      }
+      const reasonCode = input.reasonCode.trim();
+      if (!/^[a-z0-9_]{1,120}$/.test(reasonCode)) {
+        throw new Error("Terminal outcome requires a bounded snake_case reason code.");
+      }
+      const inspectionEvidence = input.inspectionEvidence.trim();
+      if (!input.reviewerPrincipalId.trim() || inspectionEvidence.length < 12) {
+        throw new Error("Terminal outcome requires an authenticated reviewer and a concise inspection note.");
+      }
+      const now = new Date().toISOString();
+      const evidenceSha256 = sha256(inspectionEvidence);
+      return database.sqlite.transaction(() => {
+        const attempt = database.db.select().from(reviewBrowserTurns).where(eq(reviewBrowserTurns.id, input.attemptId)).get();
+        if (!attempt || attempt.reviewThreadId !== input.reviewThreadId || attempt.routeEpoch !== input.routeEpoch) {
+          throw new Error("The browser attempt is already terminal or was never dispatched; it cannot be declared terminal.");
+        }
+        if (attempt.leaseExpiresAt && Date.parse(attempt.leaseExpiresAt) > Date.parse(now)) {
+          throw new Error("The browser attempt still has a live dispatch lease; wait for its owner to finish before declaring it terminal.");
+        }
+        if (!(TERMINAL_ELIGIBLE_STATES as readonly string[]).includes(attempt.state)) {
+          throw new Error("The browser attempt is already terminal or was never dispatched; it cannot be declared terminal.");
+        }
+        const thread = database.db.select().from(reviewThreads).where(eq(reviewThreads.id, attempt.reviewThreadId)).get();
+        const route = thread && database.db.select().from(reviewRoutes).where(eq(reviewRoutes.id, thread.routeId)).get();
+        const message = database.db.select().from(reviewThreadMessages).where(eq(reviewThreadMessages.id, attempt.reviewMessageId)).get();
+        const handoff = message && database.db.select().from(reviewHandoffs).where(eq(reviewHandoffs.id, message.handoffId)).get();
+        const bindingRevisionMatches = thread && (attempt.bindingRevision === thread.conversationBindingRevision
+          || (attempt.bindingRevision == null && thread.conversationFingerprint === attempt.conversationFingerprint));
+        if (handoff?.status === "feedback_committed") {
+          throw new Error("Reviewer feedback is already committed for this handoff; a terminal outcome cannot override a verdict.");
+        }
+        if (!thread || thread.status !== "active" || thread.routeEpoch !== input.routeEpoch
+          || thread.reviewerPrincipalId !== input.reviewerPrincipalId
+          || !route || route.status !== "active" || route.routeEpoch !== input.routeEpoch
+          || route.deliveryTransport !== "native_cdp" || route.browserProfileId !== attempt.profileId
+          || thread.browserProfileId !== attempt.profileId || thread.conversationBindingStatus !== "bound"
+          || thread.conversationFingerprint !== attempt.conversationFingerprint
+          || !bindingRevisionMatches
+          || !message || message.threadId !== thread.id || message.routeEpoch !== input.routeEpoch
+          || !["presenting", "presented"].includes(message.status)) {
+          throw new Error("Only the bound reviewer principal can declare this unresolved attempt terminal on its exact conversation.");
+        }
+        const latestPartial = database.sqlite.prepare(`select seq, text_sha256 as textSha256
+          from review_browser_partial_observations where attempt_id = ? order by seq desc limit 1`)
+          .get(attempt.id) as { seq: number; textSha256: string } | undefined;
+        const updatedAttempt = database.db.update(reviewBrowserTurns).set({
+          state: "failed", errorCode: "reviewer_unrecoverable", leaseTokenSha256: null, leaseExpiresAt: null,
+        }).where(and(eq(reviewBrowserTurns.id, attempt.id),
+          sql`${reviewBrowserTurns.state} in (${sql.join(TERMINAL_ELIGIBLE_STATES.map((status) => sql`${status}`), sql`, `)})`,
+          sql`(${reviewBrowserTurns.leaseExpiresAt} is null or ${reviewBrowserTurns.leaseExpiresAt} <= ${now})`)).run();
+        if (updatedAttempt.changes !== 1) throw new Error("The browser attempt changed while the terminal outcome was being committed.");
+        const updatedMessage = database.db.update(reviewThreadMessages).set({
+          status: "failed", revision: sql`${reviewThreadMessages.revision} + 1`, updatedAt: now,
+        }).where(and(eq(reviewThreadMessages.id, message.id), eq(reviewThreadMessages.revision, message.revision), sql`${reviewThreadMessages.status} in ('presenting', 'presented')`)).run();
+        if (updatedMessage.changes !== 1) throw new Error("The reviewer message changed while the terminal outcome was being committed.");
+        database.db.insert(reviewBrowserTurnResolutions).values({
+          attemptId: attempt.id, reviewThreadId: thread.id, routeEpoch: input.routeEpoch,
+          reviewerPrincipalId: input.reviewerPrincipalId, resolution: "reviewer_unrecoverable",
+          reasonCode, evidenceSha256, createdAt: now,
+        }).run();
+        return {
+          attemptId: attempt.id, classification: "reviewer_unrecoverable" as const, reasonCode,
+          evidenceSha256, partialSeq: latestPartial?.seq ?? null,
+          partialSha256: latestPartial?.textSha256 ?? null, partialComplete: false as const,
+          lastProgressAt: attempt.lastProgressAt ?? undefined,
+        };
+      })();
+    },
+    getTerminalOutcome(input) {
+      const row = database.sqlite.prepare(`select r.attempt_id as attemptId, r.review_thread_id as reviewThreadId,
+          r.route_epoch as routeEpoch, r.reviewer_principal_id as reviewerPrincipalId, r.resolution,
+          r.reason_code as reasonCode, r.evidence_sha256 as evidenceSha256, r.created_at as createdAt,
+          t.state as attemptState, t.error_code as attemptErrorCode, t.last_progress_at as lastProgressAt
+        from review_browser_turn_resolutions r
+        join review_browser_turns t on t.id = r.attempt_id
+        where r.review_thread_id = ? and r.resolution = 'reviewer_unrecoverable'
+        order by r.created_at desc, r.attempt_id desc limit 1`)
+        .get(input.reviewThreadId) as {
+          attemptId: string; reviewThreadId: string; routeEpoch: number; reviewerPrincipalId: string;
+          resolution: string; reasonCode: string | null; evidenceSha256: string; createdAt: string;
+          attemptState: string; attemptErrorCode: string | null; lastProgressAt: string | null;
+        } | undefined;
+      if (!row || row.resolution !== "reviewer_unrecoverable") return undefined;
+      const partial = database.sqlite.prepare(`select seq, text_sha256 as textSha256, text_prefix as textPrefix, captured_at as capturedAt
+        from review_browser_partial_observations where attempt_id = ? order by seq desc limit 1`)
+        .get(row.attemptId) as { seq: number; textSha256: string; textPrefix: string; capturedAt: string } | undefined;
+      return {
+        attemptId: row.attemptId, classification: "reviewer_unrecoverable", reasonCode: row.reasonCode ?? "unspecified",
+        evidenceSha256: row.evidenceSha256, partialSeq: partial?.seq ?? null,
+        partialSha256: partial?.textSha256 ?? null, partialComplete: false,
+        lastProgressAt: row.lastProgressAt ?? undefined, reviewThreadId: row.reviewThreadId,
+        routeEpoch: row.routeEpoch, reviewerPrincipalId: row.reviewerPrincipalId, createdAt: row.createdAt,
+        attemptState: row.attemptState, attemptErrorCode: row.attemptErrorCode,
+        partialPrefix: partial?.textPrefix ?? null, partialCapturedAt: partial?.capturedAt ?? null,
+      };
+    },
     claim(input) {
       const leaseMs = Math.max(30_000, Math.min(input.leaseMs ?? 5 * 60_000, 30 * 60_000));
       const now = new Date();
@@ -185,6 +340,10 @@ export function createReviewerJobStore(database: DatabaseHandle): ReviewerJobSto
         if (input.nextStatus === "model_generating") {
           update.generationStartedAt = now;
           update.generationStartedObservationId = `${row.id}:chatgpt-dom:start`;
+          update.lastProgressAt = now;
+        }
+        if (input.nextStatus === "generation_finished" || input.nextStatus === "prompt_accepted") {
+          update.lastProgressAt = now;
         }
         if (input.nextStatus === "generation_finished") {
           update.generationFinishedAt = now;
@@ -203,6 +362,45 @@ export function createReviewerJobStore(database: DatabaseHandle): ReviewerJobSto
           && ["leased", "browser_ready", "dispatching"].includes(row.state)) database.db.update(reviewThreadMessages).set({ status: "queued", revision: sql`${reviewThreadMessages.revision} + 1`, updatedAt: now })
           .where(and(eq(reviewThreadMessages.id, row.reviewMessageId), eq(reviewThreadMessages.status, "presenting"))).run();
         return asAttempt(database.db.select().from(reviewBrowserTurns).where(eq(reviewBrowserTurns.id, row.id)).get()!);
+      })();
+    },
+    recordPartialObservation(input) {
+      if (input.textPrefix.length > PARTIAL_OBSERVATION_PREFIX_LIMIT) {
+        throw new Error(`Partial observation exceeds the ${PARTIAL_OBSERVATION_PREFIX_LIMIT}-character bound.`);
+      }
+      if (!/^[0-9a-f]{64}$/.test(input.textSha256)) {
+        throw new Error("Partial observation digest must be a 64-character lowercase hex digest.");
+      }
+      if (sha256(input.textPrefix) !== input.textSha256) {
+        throw new Error("Partial observation digest does not cover the persisted prefix.");
+      }
+      const provenance = input.provenance?.trim() ? input.provenance.trim().slice(0, 64) : "chatgpt-dom";
+      const now = new Date().toISOString();
+      return database.sqlite.transaction(() => {
+        const row = database.db.select().from(reviewBrowserTurns).where(eq(reviewBrowserTurns.id, input.attemptId)).get();
+        if (!row) throw new Error("Unknown reviewer attempt.");
+        if (row.profileId !== input.profileId || row.browserGeneration !== input.browserGeneration
+          || !row.leaseTokenSha256 || row.leaseTokenSha256 !== sha256(input.leaseToken)
+          || !row.leaseExpiresAt || row.leaseExpiresAt <= now) {
+          throw new Error("Partial observation was fenced: lease mismatch, generation mismatch, or expiry.");
+        }
+        if (!["prompt_accepted", "model_generating", "generation_finished", "awaiting_feedback"].includes(row.state)) {
+          throw new Error(`Partial observation is only recorded during an active generation (state ${row.state}).`);
+        }
+        const latest = database.sqlite.prepare(`select seq, text_sha256 as textSha256
+          from review_browser_partial_observations where attempt_id = ? order by seq desc limit 1`)
+          .get(input.attemptId) as { seq: number; textSha256: string } | undefined;
+        if (latest && latest.textSha256 === input.textSha256) {
+          return { seq: latest.seq, changed: false, sha256: input.textSha256 };
+        }
+        const seq = (latest?.seq ?? 0) + 1;
+        database.sqlite.prepare(`insert into review_browser_partial_observations
+          (attempt_id, seq, text_sha256, text_prefix, captured_at, provenance) values (?, ?, ?, ?, ?, ?)`)
+          .run(input.attemptId, seq, input.textSha256, input.textPrefix, now, provenance);
+        database.db.update(reviewBrowserTurns).set({ lastProgressAt: now }).where(and(
+          eq(reviewBrowserTurns.id, input.attemptId), eq(reviewBrowserTurns.leaseTokenSha256, row.leaseTokenSha256),
+        )).run();
+        return { seq, changed: true, sha256: input.textSha256 };
       })();
     },
     renewLease(input) {

@@ -282,12 +282,24 @@ assert.equal(interactive.running, true);
 assert.ok(interactive.sessionId);
 assert.equal(typeof interactive.sessionId, "string");
 
-const inputResult = await manager.write({
+let inputResult = await manager.write({
   workspaceId: "workspace-a",
   sessionId: interactive.sessionId,
   chars: "hello\n",
   yieldTimeMs: 2_000,
 });
+// Under a loaded chain the child may need longer than one yield budget to be
+// scheduled, read stdin, and exit. Poll briefly for the same terminal state
+// instead of asserting on the first snapshot; the asserted properties
+// (exited, correct output) are unchanged.
+const inputDeadline = Date.now() + 15_000;
+while (inputResult.running && Date.now() < inputDeadline) {
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  inputResult = await manager.write({
+    workspaceId: "workspace-a",
+    sessionId: interactive.sessionId,
+  });
+}
 assert.equal(inputResult.running, false);
 assert.match(inputResult.output, /input:hello/);
 
@@ -563,6 +575,49 @@ try {
   assert.equal(tiny.read(16, 100).cursorLapsed, false);
 }
 
+// ── OutputLog: strict retention bound and bounded reads ──
+{
+  // A single chunk larger than the whole buffer is kept as its bounded tail;
+  // the retention limit is a strict memory bound, never a hint.
+  const oversized = new OutputLog(10);
+  const end = oversized.append("abcdefghijklmnopqrstuvwxyz");
+  assert.equal(end, 26, "cursors stay monotonic across the evicted head");
+  assert.equal(oversized.oldestCursor, 16);
+  const tail = oversized.read(0, 100);
+  assert.equal(tail.cursorLapsed, true, "the evicted head must report cursorLapsed");
+  assert.equal(tail.output, "qrstuvwxyz");
+  assert.equal(tail.nextCursor, 26);
+  assert.equal(tail.oldestAvailableCursor, 16);
+  assert.equal(tail.truncated, true);
+
+  // High-volume appends stay bounded: retained text never exceeds the limit.
+  const busy = new OutputLog(64);
+  let cursor = 0;
+  for (let i = 0; i < 200; i++) cursor = busy.append(`line-${i}\n`);
+  const full = busy.read(0, 10_000);
+  assert.ok(full.output.length <= 64, `retained text never exceeds the buffer bound: ${full.output.length}`);
+  assert.equal(full.cursorLapsed, true);
+  assert.equal(full.nextCursor, cursor);
+
+  // Unicode: code-point slicing keeps a multi-byte character whole at the
+  // retention edge and across small bounded reads.
+  const uni = new OutputLog(4);
+  uni.append("ab🌲cde");
+  const uread = uni.read(0, 100);
+  assert.equal(uread.output, "🌲cde");
+  assert.equal(uread.nextCursor, 6);
+  assert.equal(uni.read(2, 1).output, "🌲", "a one-character bounded read returns the whole character");
+
+  // Independent observers read disjoint ranges; repeated reads are stable.
+  const shared = new OutputLog(1_000);
+  shared.append("hello world");
+  assert.equal(shared.read(0, 5).output, "hello");
+  assert.equal(shared.read(6, 100).output, "world");
+  assert.equal(shared.read(0, 5).output, "hello", "repeated reads at the same cursor are stable");
+  assert.equal(shared.read(0, 100).output, "hello world");
+  assert.equal(shared.read(0, 100).cursorLapsed, false);
+}
+
 // ── Lost poll_process response is recoverable via afterCursor ──
 {
   const cursorManager = new ProcessSessionManager({
@@ -807,7 +862,11 @@ try {
           ownerId: `work-session:${workSession.id}`,
           workSessionId: workSession.id,
           principalId: `worker-work-session:${workSession.id}`,
-          command: `${node} -e "process.stdout.write(String(process.env.KONTROL_AGENT_PTY_CREDENTIAL_FILE) + '|' + String(process.env.KONTROL_AGENT_PTY_TOKEN))"`,
+          // Keep the child alive past the start yield: an immediately-exiting
+          // command lets start() retire the session before observation, which
+          // makes this read timing-dependent. The 200ms sleep sits well above
+          // the 40ms yield and well inside the 500ms cleanup poll budget.
+          command: `${node} -e "process.stdout.write(String(process.env.KONTROL_AGENT_PTY_CREDENTIAL_FILE) + '|' + String(process.env.KONTROL_AGENT_PTY_TOKEN)); setTimeout(() => process.exit(0), 200)"`,
           cwd: process.cwd(),
           tty: true,
           yieldTimeMs: 40,

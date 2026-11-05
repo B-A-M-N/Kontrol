@@ -69,6 +69,15 @@ export function createReviewerBrowserController(input: {
   const activeForProfile = (profileId: string): number => input.database.db.select({ id: reviewBrowserTurns.id })
     .from(reviewBrowserTurns).where(and(eq(reviewBrowserTurns.profileId, profileId), inArray(reviewBrowserTurns.state, LIVE_DISPATCH_STATES))).all().length;
 
+  async function observeChromeProfileOwner(profileDirectory: string) {
+    let observation = await inspectChromeProfileOwner(profileDirectory);
+    for (let attempt = 0; observation.status === "unknown" && attempt < 4; attempt += 1) {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+      observation = await inspectChromeProfileOwner(profileDirectory);
+    }
+    return observation;
+  }
+
   async function startProfileOnce(profileId: string, mode?: ReviewerBrowserMode): Promise<ReviewerBrowserProfile> {
     const current = profiles.get(profileId);
     if (!current) throw new Error("Reviewer browser profile is not registered.");
@@ -287,7 +296,7 @@ export function createReviewerBrowserController(input: {
       // before its PID was persisted. Reconcile Chrome's own singleton lock
       // before starting a CDP-controlled generation.
       const profileDirectory = await profiles.profileDirectory(profileId);
-      const profileOwner = await inspectChromeProfileOwner(profileDirectory);
+      const profileOwner = await observeChromeProfileOwner(profileDirectory);
       if (profileOwner.status === "unknown") {
         profiles.transition({ profileId, expectedGeneration: profile.generation, status: "login_required", authState: "handoff_pending" });
         return { status: "auth_required", reason: "manual_browser_owner_unverified", targets: [] };

@@ -2,6 +2,7 @@ import type { DispatchOutbox, DispatchOutboxEvent, OutboxClaim } from "../dispat
 import type { ReviewerBrowserController } from "./browser-controller.js";
 import type { ReviewerJobStore, ReviewerJobClaim } from "../review-thread/reviewer-job-store.js";
 import { BrowserReadinessError } from "./chatgpt-page-driver.js";
+import type { ChatGptPageDriver, PartialResponseObservation, TurnBaseline } from "./chatgpt-page-driver.js";
 import { ReviewerTargetError } from "./target-binding.js";
 
 const EVENT = "reviewer.browser_turn.ready";
@@ -22,11 +23,72 @@ function claimOf(event: DispatchOutboxEvent): OutboxClaim {
   return { eventId: event.id, claimOwner: event.claimedBy ?? "", claimToken: event.claimToken ?? "" };
 }
 
+/**
+ * Supervise one generation phase with evidence instead of a blind wait. Each
+ * iteration renews the attempt lease (so a healthy long generation never loses
+ * ownership), captures recoverable partial text, and persists it as a
+ * monotonic, idempotent observation. A lost or fenced lease stops supervision
+ * without failing the logical wait: the reconciler owns the attempt now.
+ * Unknown observations are not terminal; only the phase deadline ends the
+ * loop, preserving the caller's uncertain-recovery path.
+ */
+async function superviseGeneration(options: {
+  driver: ChatGptPageDriver;
+  jobs: ReviewerJobStore;
+  profileId: string;
+  browserGeneration: number;
+  claim: ReviewerJobClaim;
+  baseline: TurnBaseline;
+  phase: "start" | "finish";
+  deadlineMs: number;
+  intervalMs: number;
+  isShutdown: () => boolean;
+}): Promise<"generating" | "finished" | "blocked" | "unknown" | "fenced"> {
+  const startedAt = Date.now();
+  for (;;) {
+    if (options.isShutdown()) return "fenced";
+    try {
+      options.jobs.renewLease({
+        attemptId: options.claim.attemptId, leaseToken: options.claim.leaseToken,
+        profileId: options.profileId, browserGeneration: options.browserGeneration,
+      });
+    } catch {
+      return "fenced";
+    }
+    let observed: PartialResponseObservation | undefined;
+    try {
+      observed = await options.driver.observePartialResponse(options.baseline, options.claim.attemptId);
+    } catch {
+      observed = undefined;
+    }
+    if (observed?.textPrefix !== undefined && observed.textSha256 !== undefined) {
+      try {
+        options.jobs.recordPartialObservation({
+          attemptId: options.claim.attemptId, leaseToken: options.claim.leaseToken,
+          profileId: options.profileId, browserGeneration: options.browserGeneration,
+          textPrefix: observed.textPrefix, textSha256: observed.textSha256, provenance: "chatgpt-dom",
+        });
+      } catch {
+        return "fenced";
+      }
+    }
+    const state = observed?.state ?? "unknown";
+    if (options.phase === "start" && (state === "generating" || state === "finished" || state === "blocked")) return state;
+    if (options.phase === "finish" && (state === "finished" || state === "blocked")) return state;
+    if (Date.now() - startedAt >= options.deadlineMs) return "unknown";
+    await new Promise((resolve) => setTimeout(resolve, options.intervalMs));
+  }
+}
+
 export function createReviewerTurnDispatcher(input: {
   outbox: DispatchOutbox;
   jobs: ReviewerJobStore;
   browser: ReviewerBrowserController;
   drainTimeoutMs?: number;
+  /** Interval between generation supervision polls (default 30s). */
+  observeIntervalMs?: number;
+  /** Per-phase ceiling for generation supervision (default 30min). */
+  generationDeadlineMs?: number;
 }): ReviewerTurnDispatcher {
   const workerId = `reviewer-browser-${process.pid}`;
   let stopped = true;
@@ -138,12 +200,19 @@ export function createReviewerTurnDispatcher(input: {
       if (result.status === "accepted") {
         input.jobs.transition({ attemptId: turnClaim.attemptId, leaseToken: turnClaim.leaseToken, profileId, browserGeneration: profile.generation, nextStatus: "prompt_accepted" });
         markCompleted(eventClaim, event.id, turnClaim.attemptId);
-        let generation = await restored.driver.waitForGeneration(baseline, turnClaim.attemptId, "start");
-        if (turnState!.shutdownPersisted) return;
+        const supervision = {
+          driver: restored.driver, jobs: input.jobs, profileId, browserGeneration: profile.generation,
+          claim: turnClaim, baseline,
+          deadlineMs: input.generationDeadlineMs ?? 30 * 60_000,
+          intervalMs: input.observeIntervalMs ?? 30_000,
+          isShutdown: () => turnState!.shutdownPersisted,
+        };
+        let generation = await superviseGeneration({ ...supervision, phase: "start" });
+        if (turnState!.shutdownPersisted || generation === "fenced") return;
         if (generation === "generating") {
           input.jobs.transition({ attemptId: turnClaim.attemptId, leaseToken: turnClaim.leaseToken, profileId, browserGeneration: profile.generation, nextStatus: "model_generating" });
-          generation = await restored.driver.waitForGeneration(baseline, turnClaim.attemptId, "finish");
-          if (turnState!.shutdownPersisted) return;
+          generation = await superviseGeneration({ ...supervision, phase: "finish" });
+          if (turnState!.shutdownPersisted || generation === "fenced") return;
         }
         if (generation === "finished") {
           input.jobs.transition({ attemptId: turnClaim.attemptId, leaseToken: turnClaim.leaseToken, profileId, browserGeneration: profile.generation, nextStatus: "generation_finished" });
