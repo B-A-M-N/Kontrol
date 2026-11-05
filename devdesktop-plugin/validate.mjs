@@ -11,6 +11,7 @@ const check = (label, ok, detail = "") => {
 };
 
 const EXPECTED_NAME = "dev-6a526f280aec81919bd3c5c6b9ad5a15";
+const EXPECTED_APP_ID = "asdk_app_6a526f280aec81919bd3c5c6b9ad5a15";
 const EXPECTED_SKILLS = [
   "kontrol-workspace-review",
   "nelson-wiggum-loop",
@@ -32,7 +33,7 @@ catch (e) { check("legacy .codex-plugin/plugin.json parses", false, String(e)); 
 if (portable && legacy) {
   check("manifest names preserved (no rename)", portable.name === EXPECTED_NAME && legacy.name === EXPECTED_NAME, `portable=${portable.name} legacy=${legacy.name}`);
   check("manifest versions agree", portable.version === legacy.version, `${portable.version} vs ${legacy.version}`);
-  check("version is semver bump to 1.0.1", /^\d+\.\d+\.\d+$/.test(portable.version) && portable.version === "1.0.1", portable.version);
+  check("version is semver bump to 1.0.2", /^\d+\.\d+\.\d+$/.test(portable.version) && portable.version === "1.0.2", portable.version);
   check("portable keeps app declaration", portable?.extensions?.["com.openai"]?.apps === "./.app.json", JSON.stringify(portable?.extensions));
   check("legacy keeps skills+apps pointers", legacy.skills === "./skills/" && legacy.apps === "./.app.json", `skills=${legacy.skills} apps=${legacy.apps}`);
   check("no second MCP server config", !portable.mcpServers && !portable.mcp && !legacy.mcpServers && !legacy.mcp, "none declared");
@@ -72,8 +73,10 @@ check("negative: no polling instruction", !/every N seconds|poll .* every \d/i.t
 
 // 5. No unrelated files, no nested plugin, no archives-within
 const topLevel = readdirSync(ROOT);
-check("top level is plugin layout + tooling + versioned archive only", topLevel.every((e) => ["plugin.json", ".codex-plugin", "skills", "REPORT.md", "validate.mjs"].includes(e) || /^devdesktop-plugin-update-\d+\.\d+\.\d+\.zip$/.test(e)), topLevel.join(","));
+check("top level is plugin layout + tooling + versioned archive only", topLevel.every((e) => ["plugin.json", ".codex-plugin", "skills", "REPORT.md", "validate.mjs", ".app.json"].includes(e) || /^devdesktop-plugin-update-\d+\.\d+\.\d+\.zip$/.test(e)), topLevel.join(","));
 check("no nested plugin.json under skills", !EXPECTED_SKILLS.some((s) => existsSync(join(ROOT, "skills", s, "plugin.json"))));
-check("no .app.json in overlay (unchanged, preserved on update)", !existsSync(join(ROOT, ".app.json")));
+let appJson = null;
+try { appJson = JSON.parse(readFileSync(join(ROOT, ".app.json"), "utf-8")); check(".app.json parses as UTF-8 JSON", true); } catch (e) { check(".app.json parses as UTF-8 JSON", false, String(e)); }
+check(".app.json binds plugin name to App ID", appJson?.apps?.[EXPECTED_NAME]?.id === EXPECTED_APP_ID, JSON.stringify(appJson));
 
 process.exit(failures ? 1 : 0);

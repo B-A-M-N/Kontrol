@@ -62,6 +62,8 @@ CLI Agent                          Kontrol Server                    WebUI (Huma
 |------|---------|
 | `list_pending_reviews` | Find sessions awaiting review |
 | `check_review_status` | Poll current status (fallback only) |
+| `get_work_result` | Principal-scoped read-only result projection; re-read after reconnect instead of redispatching |
+| `await_work_session_events` | Event-driven wait for session events (session-read scoped) |
 | `cancel_work_session` | Abandon a session |
 
 ## Agent Instructions

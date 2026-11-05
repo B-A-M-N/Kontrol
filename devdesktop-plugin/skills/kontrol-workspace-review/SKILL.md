@@ -43,7 +43,7 @@ Every finding needs: the observed behavior, the exact file and line (or command 
 
 ## Authority boundaries (do not cross these)
 
-- Inspection tools are read-only; edits go through `write`/`edit`/`apply_patch` with governing-instruction acknowledgement. Do not use shell redirection to bypass file-tool containment.
+- Inspection tools are read-only; edits go through `write`/`edit` with governing-instruction acknowledgement (`apply_patch` is mode-dependent — present in codex tool mode, absent in full/minimal modes; never promise it without checking the live catalog). Do not use shell redirection to bypass file-tool containment.
 - Approval-gated operations return a durable retryable `approval_required` result. The reviewer approves through `provide_policy_approval`; approval of one operation never authorizes a different operation, owner, or workspace.
 - Never expose credentials, tokens, or cookies in tool arguments, logs, or findings.
 

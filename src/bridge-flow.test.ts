@@ -552,6 +552,37 @@ try {
     const clientReviews = await callClient("list_pending_reviews", {});
     assert.ok(clientReviews.isError, "ordinary client cannot enumerate pending reviews");
 
+    // Stateless reviewer (ChatGPT remote MCP): authenticated principal, no transport owner.
+    {
+      const statelessServer = fakeServer();
+      registerBridgeTools(statelessServer as any, {
+        ...config,
+        principalRole: "reviewer",
+        principalId: undefined,
+        connectionContext: { authenticatedRole: "reviewer", authenticatedPrincipalId: "tunnel-reviewer", listenerKind: "owner_public" },
+      });
+      const callStateless = (name: string, args: any) => statelessServer.handlers.get(name)!(args);
+      const ownPending = workSessions.create({ workspaceSessionId: WS, submittedBy: "webui", principalId: "tunnel-reviewer" }).id;
+      workSessions.updateStatus(ownPending, "awaiting_review");
+      const otherPending = workSessions.create({ workspaceSessionId: WS, submittedBy: "webui", principalId: "someone-else" }).id;
+      workSessions.updateStatus(otherPending, "awaiting_review");
+      const listed = await callStateless("list_pending_reviews", {});
+      assert.ok(!listed.isError, "stateless reviewer with authenticated principal can list pending reviews");
+      const ids = (listed.structuredContent?.sessions ?? []).map((s: any) => s.sessionId);
+      assert.ok(ids.includes(ownPending), "principal-scoped pending review is listed");
+      assert.ok(!ids.includes(otherPending), "other principal's pending review is not listed");
+
+      const anonServer = fakeServer();
+      registerBridgeTools(anonServer as any, {
+        ...config,
+        principalRole: "reviewer",
+        principalId: undefined,
+        connectionContext: { authenticatedRole: "reviewer", listenerKind: "owner_public" },
+      });
+      const anonListed = await anonServer.handlers.get("list_pending_reviews")!({});
+      assert.ok(anonListed.isError, "anonymous reviewer without principal or owner stays forbidden");
+    }
+
     const clientPolicyServer = fakeServer();
     registerPolicyTools(clientPolicyServer as any, { eventStore, policyEngine, approvalRequests, principalRole: "client" });
     const clientPolicy = (name: string, args: any) => clientPolicyServer.handlers.get(name)!(args);

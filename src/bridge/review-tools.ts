@@ -12,7 +12,7 @@ import type { EventPredicate, EventStoreEvent } from "../event-log.js";
 import type { ReviewSubmissionDTO } from "../review-submission.js";
 import { authorizeWorkSessionAction } from "../work-session-action-guard.js";
 import { registerMutationAppTool } from "./app-tool.js";
-import { assertWorkerSessionBinding, defaultLiveWaiters, forbidden, isReviewer, isWorkerOrClient, liveOwnerContextId, reviewClaimContextId, reviewOwnerContextId, parsePatchFiles, requireWorkSessionMutation, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
+import { assertWorkerSessionBinding, defaultLiveWaiters, forbidden, isReviewer, isWorkerOrClient, liveOwnerContextId, livePrincipalId, reviewClaimContextId, reviewOwnerContextId, parsePatchFiles, requireWorkSessionMutation, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod/v4";
 
@@ -718,8 +718,13 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
         return forbidden(config.principalRole, "list_pending_reviews");
       }
       const owner = liveOwnerContextId(config);
-      if (config.connectionContext && !owner) return forbidden(config.principalRole, "list_pending_reviews");
-      const surface = config.workSessions.getWorkspaceSessionSurface(workspaceId, 20, "pending_review", undefined, owner);
+      // A stateless reviewer (e.g. ChatGPT remote MCP) carries an authenticated
+      // principal but no transport owner context. Listing is scoped to that
+      // principal below, which preserves principal-scoped access without
+      // granting an implicit global view. Anonymous reviewers stay closed.
+      const principal = livePrincipalId(config);
+      if (config.connectionContext && !owner && !principal) return forbidden(config.principalRole, "list_pending_reviews");
+      const surface = config.workSessions.getWorkspaceSessionSurface(workspaceId, 20, "pending_review", undefined, owner, principal);
       const text = surface.length === 0
         ? "No sessions awaiting review."
         : `${surface.length} session(s) awaiting review:\n${surface.map((s) => {

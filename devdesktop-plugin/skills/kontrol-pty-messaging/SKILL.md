@@ -18,6 +18,7 @@ The PTY relay is a worker-to-reviewer communication channel. It never grants the
 | Tool | Callable by | Purpose |
 |------|-------------|---------|
 | `post_agent_message` | worker only | Worker sends a message (clarification, blocker) toward the reviewer thread |
+| `post_reviewer_message` | reviewer only | Reviewer posts a durable message + event toward the worker; fails closed on terminal sessions. Does not resume a worker parked on `await_agent_reply` (needs `resolve_agent_message` or review feedback). |
 | `await_agent_reply` | worker or client | Worker blocks for the reviewer's reply; timeout means still-pending, not failure |
 | `get_pending_agent_replies` | worker or client | Recovery read after timeout or reconnect |
 | `ack_agent_reply` | worker or client | Acknowledge a reply, bound to its `deliveryAttemptId` |
