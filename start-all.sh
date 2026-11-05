@@ -1101,11 +1101,15 @@ fi
 # capability is computed by the same policy loader used by the server and
 # tunnel launcher; this checkout fallback executes the source CLI only when
 # its immutable dist projection is stale.
-# Generation-pinned: always compute policy from the exact immutable candidate
-# under launch; never select a stale dist/ projection because it can answer.
-if [[ -n "${KONTROL_RUNTIME_CLI_PATH:-}" && -f "${KONTROL_RUNTIME_CLI_PATH}" ]]; then
+# Generation-pinned: compute policy from the exact immutable candidate under
+# launch. Fall back to checkout source only when the candidate CLI cannot
+# answer effective-policy (e.g. minimal test fixtures); never pick stale dist/.
+# The source loader is the same policy implementation the candidate shipped.
+if [[ -n "${KONTROL_RUNTIME_CLI_PATH:-}" && -f "${KONTROL_RUNTIME_CLI_PATH}" ]] \
+  && node "${KONTROL_RUNTIME_CLI_PATH}" config effective-policy --json >/dev/null 2>&1; then
   POLICY_COMMAND=(node "$KONTROL_RUNTIME_CLI_PATH")
-elif [[ -n "${ACTIVE_ARTIFACT_PATH:-}" && -f "${ACTIVE_ARTIFACT_PATH}/cli.js" ]]; then
+elif [[ -n "${ACTIVE_ARTIFACT_PATH:-}" && -f "${ACTIVE_ARTIFACT_PATH}/cli.js" ]] \
+  && node "${ACTIVE_ARTIFACT_PATH}/cli.js" config effective-policy --json >/dev/null 2>&1; then
   POLICY_COMMAND=(node "${ACTIVE_ARTIFACT_PATH}/cli.js")
 else
   POLICY_COMMAND=(node --import tsx "$DESKTOP_PWD/src/cli.ts")
