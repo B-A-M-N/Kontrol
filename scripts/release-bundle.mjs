@@ -1,6 +1,6 @@
-// Qualification-bundle transport (public-beta audit P0): the 12-hour soak runs
-// on the deployment host, so a fresh CI runner can never possess the
-// soak-qualified artifacts from a git checkout — receipts and releases/ are
+// Qualification-bundle transport (public-beta audit P0): deployment uptime
+// and continuity evidence are produced separately from a fresh CI checkout,
+// so a runner cannot possess the qualified artifacts from git alone — receipts and releases/ are
 // deliberately gitignored. This script is the immutable handoff:
 //
 //   create  — bundle the qualified candidate + final receipt + per-file digests
@@ -13,7 +13,7 @@
 // The bundle is uploaded to a durable store (a GitHub Release keyed
 // `qualification-<buildId>`); the release workflow downloads it, verifies it,
 // and stages the package from the extracted candidate — never a rebuild
-// (the soak qualifies an exact artifact).
+// (the complete evidence set qualifies an exact artifact).
 //
 // Usage:
 //   node scripts/release-bundle.mjs create [--receipt p] [--out dir]

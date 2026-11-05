@@ -50,6 +50,7 @@ import {
   renderPolicyApproval,
 } from "./review-feedback.js";
 import { eventLabel, renderMissionPanel } from "./mission-panel.js";
+import { disposeAgentTerminalPanels, renderAgentTerminalPanels } from "./agent-terminal-panel.js";
 import {
   hydrateWorkSessionSnapshot,
   loadHistoricalPendingReviews,
@@ -144,9 +145,16 @@ export function setSessionSurfaceHost(next: SessionSurfaceHost): void {
 }
 
 export function renderWorkSessionView(view: WorkSessionViewState): void {
+  const previousDom = host.getCurrentWorkSessionDom();
   ensureSurface(`session:${view.workSessionId}`);
   const dom = host.getCurrentWorkSessionDom() ?? createWorkSessionDom(view.workSessionId);
   host.setCurrentWorkSessionDom(dom);
+  if (previousDom && previousDom !== dom) {
+    // Workspace transition: the abandoned surface's terminal panels can never
+    // be revisited through their own container. Dispose them now instead of
+    // waiting for a later render to notice the detached host.
+    disposeAgentTerminalPanels(previousDom.meta);
+  }
 
   dom.titleStatus.textContent = isApprovalCenterId(view.workSessionId)
     ? "Approval Center"
@@ -218,6 +226,10 @@ export function renderWorkSessionView(view: WorkSessionViewState): void {
     }));
   }
   dom.meta.append(details);
+  // Live read-only transcripts live in their own module and stay visible
+  // outside the collapsed details: the surface only hosts the container,
+  // while each panel owns its viewer cursor and fetch.
+  renderAgentTerminalPanels(dom.meta, view);
   const hydrationAt = host.getLastSuccessfulHydrationAt();
   if (hydrationAt) {
     dom.meta.append(element("span", {
@@ -256,10 +268,17 @@ export function renderWorkSessionView(view: WorkSessionViewState): void {
   renderOpenMessages(dom.messages, view);
   renderActivityIncrementally(dom, view);
   dom.approvals.replaceChildren();
-  if (view.policyApprovals.size > 0) {
+  const outcomes = view.recentApprovalOutcomes ?? [];
+  if (view.policyApprovals.size > 0 || outcomes.length > 0) {
     dom.approvals.append(element("div", { className: "agent-activity-header", text: "Policy approvals" }));
     const approvals = element("div", { className: "approval-list" });
     for (const approval of view.policyApprovals.values()) approvals.append(renderPolicyApproval(view, approval));
+    for (const outcome of outcomes) {
+      approvals.append(element("div", {
+        className: `approval-outcome outcome-${outcome.outcome}`,
+        text: outcome.detail,
+      }));
+    }
     dom.approvals.append(approvals);
   }
 

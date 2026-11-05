@@ -15,6 +15,20 @@ assert.match(adapter, /approvals\/\$\{approvalId\}\/decision/);
 assert.match(adapter, /ACP_STDIO_COMMAND/);
 assert.match(adapter, /ACP_STDIO_DISPATCH_METHOD/);
 assert.match(adapter, /run\.conn\.request\("initialize"/);
+assert.match(adapter, /function ensureCapabilityGeneration\(\)/,
+  "capability claims are re-validated against the current agent executable generation");
+assert.match(adapter, /agentExecutableFingerprint\(\)/,
+  "the capability generation binds to the resolved agent executable identity");
+assert.match(adapter, /nativeReplyResumeSupported = false/,
+  "a new executable generation invalidates derived capability claims");
+assert.match(adapter, /markLiveProvenVersion\(run\.acpProtocolVersion\)/,
+  "only a completed turn marks its negotiated version live-proven");
+assert.match(adapter, /capabilityStages/,
+  "health distinguishes configured, initialized, negotiated, and live-proven capability");
+assert.match(adapter, /\{ category, id: randomUUID\(\), at: /,
+  "externally readable failures carry a category and correlation id, never raw detail");
+assert.ok(!adapter.match(/lastFailure\s*=\s*\{[^}]*\bdetail\b/),
+  "no raw error detail reaches the externally readable failure record");
 assert.match(adapter, /nativeReplyResumeSupported = true/,
   "the adapter advertises native reply resume only after ACP session-resume support is negotiated");
 assert.match(adapter, /capability !== "native-reply-resume"/,

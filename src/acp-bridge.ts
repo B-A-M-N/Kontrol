@@ -6,7 +6,7 @@
  * over a shared typed context (see src/bridge/register.ts). This file only
  * re-exports the public surface, so existing importers are unaffected.
  */
-export { registerBridgeTools } from "./bridge/register.js";
+export { registerBridgeTools, registerBridgeToolsFront, registerBridgeToolsBack } from "./bridge/register.js";
 export {
   createContinuationDispatcher,
   runContinuationTick,

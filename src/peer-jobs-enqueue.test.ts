@@ -16,6 +16,7 @@ import { createServer } from "./server.js";
 import { loadConfig } from "./config.js";
 import type { ServerConfig } from "./config.js";
 import { hashPeerCredential } from "./peer/credentials.js";
+import { resolveTestGitIdentity } from "./test-git-identity.js";
 import { manifestSha256 } from "./peer/jobs/service.js";
 import { createPeerJobResultProcessor } from "./peer/jobs/result-processor.js";
 import { getPeerJobStore } from "./peer/jobs/store.js";
@@ -39,10 +40,8 @@ const configDir = mkdtempSync(join(tmpdir(), "kontrol-enqueue-config-"));
 writeFileSync(join(root, "hello.txt"), "hello from enqueue e2e\n");
 execFileSync("git", ["init", "-q"], { cwd: root });
 execFileSync("git", ["add", "--", "hello.txt"], { cwd: root });
-const authorIdent = execFileSync("git", ["var", "GIT_AUTHOR_IDENT"], { encoding: "utf8" }).trim();
-const authorMatch = /^(.*) <([^<>]+)> \d+ [+-]\d{4}$/.exec(authorIdent);
-assert.ok(authorMatch, "the test environment provides its configured Git identity");
-execFileSync("git", ["-c", `user.name=${authorMatch[1]}`, "-c", `user.email=${authorMatch[2]}`, "commit", "-m", "peer job baseline", "-q"], { cwd: root });
+const authorIdentity = resolveTestGitIdentity();
+execFileSync("git", ["-c", `user.name=${authorIdentity.name}`, "-c", `user.email=${authorIdentity.email}`, "commit", "-m", "peer job baseline", "-q"], { cwd: root });
 const baseRevision = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
 
 function writeRegistry(peers: unknown[]): string {

@@ -174,11 +174,29 @@ checkout:
 npm run gate:beta:code
 ```
 
-Then run the real soak against the exact candidate build reported by
-`beta-code-qualification.json`, followed by the final evidence join:
+Deploy the exact candidate build reported by `beta-code-qualification.json`.
+The scheduled GitHub Actions workflow `Deployment uptime qualification` checks
+the live systemd generation every 30 minutes and awards its uptime receipt once
+that exact running generation is at least 12 hours old. It checks the process
+identity and runtime lock against the immutable installed artifact, then probes
+both `/core-readyz` and `/readyz`. A restart resets the window. The workflow
+runs on a dedicated self-hosted Linux runner with the `kontrol-deployment`
+label, so uptime checks use the deployment host and consume no GitHub-hosted
+runner minutes. Set the repository variables `KONTROL_STATE_DIR` and
+`KONTROL_SERVICE_DATA_DIR` only when the deployment uses non-default paths.
+The runner must run as the Kontrol service owner so it can read the private
+runtime identity and query that user's systemd services.
+The first qualified run per generation signs and retains one receipt; the
+runner stores it under `ci-qualification/` in the state directory to avoid
+duplicate artifacts. A manual workflow run produces a fresh receipt when the
+final gate needs a current timestamp.
+
+Then run the continuity workload against that same candidate. It exercises
+the runtime behavior; it no longer holds CI or a local terminal open for the
+12-hour uptime window:
 
 ```bash
-npm run soak:beta -- --hours 12 --url "$KONTROL_PUBLIC_BASE_URL" --workspace-path "$PWD" --build-id CANDIDATE_BUILD_ID --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" --tunnel-url http://127.0.0.1:8080
+npm run soak:beta -- --hours 1 --url "$KONTROL_PUBLIC_BASE_URL" --workspace-path "$PWD" --build-id CANDIDATE_BUILD_ID --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" --tunnel-url http://127.0.0.1:8080
 npm run probe:tunnel -- --url "$KONTROL_PUBLIC_BASE_URL" --workspace "$PWD" --dual --cycles 1 \
   --watcher-timeout-ms 18000 --heartbeat-count 2 --minimum-drain-events 2 \
   --resource-load-reads 2 --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" \
@@ -237,22 +255,25 @@ cannot expose all ChatGPT server-side tool dispatch, and a Kontrol response
 finishing proves only local response-stream completion.
 
 Inspect `beta-code-qualification.json`, `beta-soak.json`,
-`beta-external-catalog.json`, `beta-qualification.json`, and
-`beta-fault-matrix.json` before deployment.
+`deployment-uptime-qualification.json`, `beta-external-catalog.json`, `beta-qualification.json`, and
+`beta-fault-matrix.json` before release.
 The final gate requires clean end-state evidence, matching candidate/source
-identity, a passing soak, and a fresh external host catalog receipt for that
-same deployment. Local accelerated checks do not substitute for the
-multi-hour real-stack soak required for a persistent installation.
+identity, a passing continuity workload, a current signed CI uptime receipt,
+and a fresh external host catalog receipt for that same deployment. The final
+release workflow rechecks the live deployment and verifies the receipt's
+GitHub artifact attestation.
 
-For the required real wall-clock soak, choose the duration explicitly (12
-hours is the minimum enforced by the canonical stable-beta gate) and inspect
-its metrics report when it finishes:
+For the behavior workload, choose the duration explicitly and inspect its
+metrics report when it finishes. The 12-hour minimum is enforced separately
+from this command by the CI deployment uptime receipt:
 
 ```bash
-npm run soak:beta -- --hours 12 --url "$KONTROL_PUBLIC_BASE_URL" --workspace-path "$PWD" --build-id CANDIDATE_BUILD_ID --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" --tunnel-url http://127.0.0.1:8080
+npm run soak:beta -- --hours 1 --url "$KONTROL_PUBLIC_BASE_URL" --workspace-path "$PWD" --build-id CANDIDATE_BUILD_ID --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" --tunnel-url http://127.0.0.1:8080
 ```
 
-Use `--workspace-path` (and `--read-path` when the workspace lacks
+Download the signed receipt from the successful `Deployment uptime
+qualification` workflow run as `deployment-uptime-qualification.json` before
+running `npm run gate:beta:final`. Use `--workspace-path` (and `--read-path` when the workspace lacks
 `AGENTS.md`) for an allowed read on every fresh MCP transport. Stop the runner
 only when the intended soak window is complete; an interrupted run is recorded
 as non-passing.
@@ -289,9 +310,10 @@ For the local harness, replace `KONTROL_PUBLIC_BASE_URL` with
 `http://127.0.0.1:8787`. The real-tunnel run remains necessary because the
 harness verifies intermediary idle handling, not tunnel or host behavior.
 
-The 12-hour stable-beta receipt remains the publication gate. These longer
-runs are additional operational evidence for the reported multi-day failure;
-they do not turn an interrupted or locally simulated run into qualification.
+The CI-generated 12-hour deployment uptime receipt remains the publication
+gate. These longer behavior runs are additional operational evidence for the
+reported multi-day failure; they do not turn an interrupted or locally
+simulated run into qualification.
 
 The local liveness endpoint is `GET /healthz`; startup infrastructure
 readiness is `GET /core-readyz`; strict operational readiness is `GET /readyz`.

@@ -93,7 +93,7 @@ import { openDatabase } from "./db/client.js";
   // P1.3 decomposition: the workspace tool registrations live in
   // src/mcp/tools/*.ts; scan every workspace-tool module for barrier crossings.
   const { readdirSync } = await import("node:fs");
-  const toolSources = ["./mcp/tools/workspace.ts", "./mcp/tools/process.ts"]
+  const toolSources = ["./mcp/tools/workspace.ts", "./mcp/tools/process.ts", "./mcp/tools/inspection.ts", "./mcp/tools/mutation.ts"]
     .map((rel) => readFileSync(new URL(rel, import.meta.url), "utf8"))
     .join("\n");
   const source = toolSources;

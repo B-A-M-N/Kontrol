@@ -13,6 +13,7 @@ const checkout = join(fixture, "checkout");
 const fixtureScripts = join(checkout, "scripts");
 const codeReceiptPath = join(fixture, "beta-code.json");
 const soakReportPath = join(fixture, "beta-soak.json");
+const deploymentUptimeReceiptPath = join(fixture, "deployment-uptime.json");
 const externalCatalogReceiptPath = join(fixture, "beta-external-catalog.json");
 const receiptPath = join(fixture, "beta-final.json");
 mkdirSync(fixtureScripts, { recursive: true });
@@ -291,6 +292,34 @@ const soak = {
   },
   assertions,
   targetUrl: "https://kontrol.example.trycloudflare.com",
+};
+const uptimeCheckedAt = Date.now() - 5 * 60 * 1000;
+const uptimeStartedAt = uptimeCheckedAt - (12 * 60 * 60 * 1000 + 21 * 60 * 1000);
+const deploymentUptime = {
+  kind: "kontrol-deployment-uptime-qualification",
+  schemaVersion: 1,
+  status: "qualified",
+  qualified: true,
+  policy: { minimumUptimeMs: 12 * 60 * 60 * 1000 },
+  startedAt: new Date(uptimeStartedAt).toISOString(),
+  checkedAt: new Date(uptimeCheckedAt).toISOString(),
+  uptimeMs: uptimeCheckedAt - uptimeStartedAt,
+  deployment: {
+    buildId,
+    contentSha256,
+    sourceSha: sha,
+    generationId: "generation-fixture",
+  },
+  checks: {
+    serviceActive: true,
+    runtimeIdentityMatchesLock: true,
+    installedReleaseMatchesRuntime: true,
+    serverProcessLive: true,
+    launcherProcessLive: true,
+    coreReady: true,
+    operationalReady: true,
+  },
+  workflow: { repository: "B-A-M-N/Kontrol", runId: "123456", runAttempt: "1" },
 };
 const externalCatalog = {
   kind: "kontrol-external-catalog-probe",
@@ -719,6 +748,7 @@ function runFinal(extraEnv = {}) {
       ...process.env,
       KONTROL_BETA_CODE_RECEIPT: codeReceiptPath,
       KONTROL_BETA_SOAK_REPORT: soakReportPath,
+      KONTROL_BETA_DEPLOYMENT_UPTIME_RECEIPT: deploymentUptimeReceiptPath,
       KONTROL_BETA_EXTERNAL_CATALOG_RECEIPT: externalCatalogReceiptPath,
       KONTROL_BETA_RECEIPT: receiptPath,
       ...extraEnv,
@@ -729,6 +759,7 @@ function runFinal(extraEnv = {}) {
 try {
   writeFileSync(codeReceiptPath, JSON.stringify(code));
   writeFileSync(soakReportPath, JSON.stringify(soak));
+  writeFileSync(deploymentUptimeReceiptPath, JSON.stringify(deploymentUptime));
   writeFileSync(externalCatalogReceiptPath, JSON.stringify(externalCatalog));
   const passed = runFinal();
   assert.notEqual(passed.status, 0,
@@ -792,17 +823,23 @@ try {
     requestedHours: 2,
     finishedAt: "2026-08-27T02:00:00.000Z",
   }));
-  const tooShort = runFinal();
-  assert.notEqual(tooShort.status, 0, "the canonical gate must reject a soak shorter than 12 hours");
-  const tooShortReceipt = JSON.parse(readFileSync(receiptPath, "utf8"));
-  assert.equal(tooShortReceipt.policy.minimumSoakHours, 12);
-  assert.equal(tooShortReceipt.checks.soakDuration, false);
+  const shorterBehaviorRun = runFinal();
+  assert.notEqual(shorterBehaviorRun.status, 0, "operator-reported external host evidence must still block qualification");
+  const shorterBehaviorReceipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+  assert.equal(shorterBehaviorReceipt.policy.minimumDeploymentUptimeHours, 12);
+  assert.equal(shorterBehaviorReceipt.checks.soakWindowValid, true,
+    "the functional continuity workload is no longer responsible for waiting 12 wall-clock hours");
+  assert.equal(shorterBehaviorReceipt.checks.deploymentUptimeQualified, true,
+    "the separate CI receipt carries the 12-hour deployment uptime requirement");
 
-  const attemptedPolicyOverride = runFinal({ KONTROL_BETA_MIN_SOAK_HOURS: "1" });
-  assert.notEqual(attemptedPolicyOverride.status, 0, "the environment must not lower the 12-hour stable-beta floor");
-  const attemptedOverrideReceipt = JSON.parse(readFileSync(receiptPath, "utf8"));
-  assert.equal(attemptedOverrideReceipt.policy.minimumSoakHours, 12);
-  assert.equal(attemptedOverrideReceipt.checks.soakDuration, false);
+  writeFileSync(deploymentUptimeReceiptPath, JSON.stringify({
+    ...deploymentUptime,
+    uptimeMs: 12 * 60 * 60 * 1000 - 1,
+  }));
+  const tooShortDeployment = runFinal();
+  assert.notEqual(tooShortDeployment.status, 0, "the final gate must reject a deployment below 12 hours");
+  assert.equal(JSON.parse(readFileSync(receiptPath, "utf8")).checks.deploymentUptimeQualified, false);
+  writeFileSync(deploymentUptimeReceiptPath, JSON.stringify(deploymentUptime));
 
   writeFileSync(soakReportPath, JSON.stringify({
     ...soak,

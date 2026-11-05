@@ -33,6 +33,9 @@ const SAFE_RETRY_TOOLS = new Set([
   "get_review_submission",
   "inspect_supervised_work",
   "await_workspace_events",
+  // Read-only cursor poll: retrying the same afterCursor returns the same
+  // retained bytes, so a dropped response is safely retried, never ambiguous.
+  "observe_agent_pty",
 ]);
 
 const RECONCILE_ONLY_TOOLS = new Set([
@@ -68,6 +71,25 @@ export interface ServerToolHost {
   reconnect(reason: unknown): Promise<void>;
 }
 
+/**
+ * Single result-normalization choke point: every successful transport
+ * delivery converges here so a server-rejected read (`isError: true`)
+ * becomes an McpToolError on every path — direct, replacement-App, and
+ * reconnected — instead of resolving as an apparent success whose missing
+ * structured content a consumer could misread as an empty result.
+ */
+export function requireSuccessfulResult(result: CallToolResult): CallToolResult {
+  if (!result.isError) return result;
+  const message = result.content
+    .filter((block): block is { type: "text"; text: string } => block.type === "text")
+    .map((block) => block.text)
+    .join("\n")
+    .trim();
+  const error = new Error(message || "The server rejected the tool call.");
+  error.name = "McpToolError";
+  throw error;
+}
+
 let host: ServerToolHost = { getApp: () => null, reconnect: async () => undefined };
 
 export function setServerToolHost(next: ServerToolHost): void {
@@ -89,7 +111,7 @@ export async function callServerToolChecked(request: ServerToolRequest, options:
     if (!isMcpReconnectFailure(failure)) throw transportError;
     if (host.getApp() !== app) {
       const replacement = host.getApp();
-      if (retryMode === "safe" && replacement) return replacement.callServerTool(request);
+      if (retryMode === "safe" && replacement) return requireSuccessfulResult(await replacement.callServerTool(request));
       throw new AmbiguousMutationError(String(request.name), transportError);
     }
     try {
@@ -108,15 +130,7 @@ export async function callServerToolChecked(request: ServerToolRequest, options:
     }
     result = await reconnectedApp.callServerTool(request);
   }
-  if (!result.isError) return result;
-  const message = result.content
-    .filter((block): block is { type: "text"; text: string } => block.type === "text")
-    .map((block) => block.text)
-    .join("\n")
-    .trim();
-  const error = new Error(message || "The server rejected the tool call.");
-  error.name = "McpToolError";
-  throw error;
+  return requireSuccessfulResult(result);
 }
 
 export function cardFromMeta(result: CallToolResult): Partial<ToolResultCard> | undefined {

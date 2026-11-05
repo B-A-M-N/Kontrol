@@ -28,6 +28,7 @@ const configDir = mkdtempSync(join(tmpdir(), "kontrol-sched-config-"));
 const envFile = join(configDir, "sched.env");
 const reviewerToken = "sched-e2e-reviewer-token-long-enough";
 const agentSecret = "sched-e2e-agent-secret-long-enough";
+const adapterSecret = "sched-e2e-adapter-secret-long-enough";
 const PORT = 7793;
 const AGENT_PORT = 7794;
 let agentRuns = 0;
@@ -46,6 +47,7 @@ writeFileSync(envFile, [
   "KONTROL_LOG_REQUESTS=0",
   `KONTROL_ACP_AGENT_SECRET=${agentSecret}`,
   `KONTROL_ACP_REVIEWER_SECRET=${reviewerToken}`,
+  `KONTROL_ACP_ADAPTER_SECRET=${adapterSecret}`,
   `PORT=${PORT}`,
 ].join("\n") + "\n");
 
@@ -53,6 +55,27 @@ const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function startAgent() {
   const agent = createHttpServer(async (req, res) => {
+    if (req.method === "GET" && req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        ok: true,
+        executionCapabilities: {
+          read_only_audit: {
+            // Synthetic contract for scheduler lifecycle coverage only. This
+            // fixture does not provide evidence of adapter confinement.
+            supported: true,
+            grantPolicy: "kontrol_signed_attempt_bound",
+            confinementAvailable: true,
+            executableAvailable: true,
+            cliInputContract: "crush_positional_instruction_plus_stdin_v1",
+            // The fixture server leaves KONTROL_READ_ONLY_NETWORK_POLICY at
+            // its default, so the stub must advertise "disabled".
+            networkPolicies: ["disabled"],
+          },
+        },
+      }));
+      return;
+    }
     if (req.method === "POST" && req.url === "/runs") {
       for await (const _ of req) { /* drain */ }
       agentRuns += 1;
@@ -116,7 +139,10 @@ async function registerAgent() {
       name: "sched-audit-agent",
       url: `http://127.0.0.1:${AGENT_PORT}`,
       role: "agent",
-      capabilities: ["code"],
+      // Must advertise the scheduler capability for the seeded fixture job's
+      // execution mode (`scheduled:<mode>`); the scheduler only dispatches
+      // to agents carrying it (see scheduled-job-unattended-e2e.mjs).
+      capabilities: ["code", "scheduled:read_only_audit"],
       ttlSeconds: 600,
     }),
   });
@@ -179,6 +205,7 @@ async function main() {
       KONTROL_POLICY_MODE: "allow",
       KONTROL_ACP_AGENT_SECRET: agentSecret,
       KONTROL_ACP_REVIEWER_SECRET: reviewerToken,
+      KONTROL_ACP_ADAPTER_SECRET: adapterSecret,
       KONTROL_ALLOWED_ROOTS_ACK: "1",
       PORT: String(PORT),
     });

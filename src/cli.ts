@@ -15,6 +15,7 @@ import { loadPolicyConfig, policyCanAsk } from "./policy.js";
 import { collectDurableSnapshotRoots } from "./runtime/snapshot-roots.js";
 import { createReviewRouteStore } from "./review-handoff/route-store.js";
 import { runServiceCommand } from "./service.js";
+import { isPermanentConfigFailure, SCHEMA_INCOMPATIBLE_EXIT_CODE } from "./lifecycle-coordinator.js";
 import { isRuntimeIdentityLive, readBuildIdentity, readRuntimeIdentity } from "./runtime-identity.js";
 import {
   ensureKontrolDefaultSkills,
@@ -40,9 +41,9 @@ import { applyIngressProfile, disableIngressProfile, listIngressOperationReceipt
 import { latestIngressHealthByProfile } from "./ingress/health-store.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { completePtyReviewMutationId, getOrCreatePtyReviewMutationId, readPtyReviewFeedback, readPtyReviewMutationId, readPtyReviewMutationIntent, readPtyReviewSubmission } from "./pty-review-cli.js";
+import { completePtyReviewMutationId, getOrCreatePtyReviewMutationId, readPtyMessagePost, readPtyMessageReply, readPtyReviewFeedback, readPtyReviewMutationId, readPtyReviewMutationIntent, readPtyReviewSubmission } from "./pty-review-cli.js";
 
-type Command = "serve" | "up" | "init" | "doctor" | "config" | "service" | "snapshots" | "review-loop" | "review" | "agent" | "ingress" | "help" | "version";
+type Command = "serve" | "up" | "init" | "doctor" | "config" | "service" | "snapshots" | "review-loop" | "review" | "message" | "agent" | "ingress" | "help" | "version";
 const require = createRequire(import.meta.url);
 const SUPPORTED_NODE_RANGE = ">=22.19 <23 || >=24 <25 || >=26 <27";
 
@@ -81,6 +82,9 @@ async function main(argv: string[]): Promise<void> {
     case "review":
       await runPtyReviewCommand(args);
       return;
+    case "message":
+      await runPtyMessageCommand(args);
+      return;
     case "agent":
       await runAgentCommand(args);
       return;
@@ -101,6 +105,7 @@ function normalizeCommand(command: string | undefined): Command {
   if (command === "up" || command === "init" || command === "doctor" || command === "config" || command === "service" || command === "snapshots") return command;
   if (command === "review-loop") return "review-loop";
   if (command === "review") return "review";
+  if (command === "message") return "message";
   if (command === "agent") return "agent";
   if (command === "ingress") return "ingress";
   if (command === "help" || command === "--help" || command === "-h") return "help";
@@ -108,22 +113,11 @@ function normalizeCommand(command: string | undefined): Command {
   throw new Error(`Unknown command: ${command}`);
 }
 
-/** Submit and await review through the existing worker MCP tools. The only
- * credential available to this command is a private, generation-bound file
- * created for an explicitly launched agent PTY. */
-async function runPtyReviewCommand(args: string[]): Promise<void> {
-  const sub = args[0];
-  if (!sub || sub === "help") {
-    output.write("Usage: kontrol review submit [--message <text>] [--client-mutation-id <stable-id>] [--no-wait]\n");
-    return;
-  }
-  if (sub !== "submit") throw new Error(`Unknown review subcommand: ${sub} (expected submit)`);
-  const mutationId = readPtyReviewMutationId(args);
-  if (!mutationId.ok) {
-    errorOutput.write(`${mutationId.error}\n`);
-    process.exitCode = 1;
-    return;
-  }
+type PtyWorkerCredential = { mcpUrl: string; token: string; workSessionId: string };
+
+/** Read the private, generation-bound credential created for an explicitly
+ * launched agent PTY. Shared by the review and message worker commands. */
+function readPtyWorkerCredential(): { credential: PtyWorkerCredential; credentialDir: string } {
   const credentialPath = process.env.KONTROL_AGENT_PTY_CREDENTIAL_FILE;
   if (!credentialPath) throw new Error("This command is available only inside a Kontrol-managed agent PTY.");
   const canonicalPath = realpathSync(credentialPath);
@@ -144,6 +138,65 @@ async function runPtyReviewCommand(args: string[]): Promise<void> {
     || typeof credential.workSessionId !== "string") {
     throw new Error("PTY review credential file is malformed.");
   }
+  return {
+    credential: { mcpUrl: credential.mcpUrl, token: credential.token, workSessionId: credential.workSessionId },
+    credentialDir: dirname(canonicalPath),
+  };
+}
+
+/** Renew the PTY credential and connect an MCP client over loopback HTTP. */
+async function connectPtyWorkerMcp(credential: PtyWorkerCredential, clientName: string): Promise<Client> {
+  const endpoint = new URL(credential.mcpUrl);
+  if (endpoint.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname)
+    || endpoint.pathname !== "/mcp" || endpoint.search || endpoint.hash) {
+    throw new Error("PTY review endpoint must be loopback HTTP.");
+  }
+  const renewal = await fetch(new URL("/pty-review/renew", endpoint), {
+    method: "POST",
+    headers: { "x-kontrol-worker-token": credential.token },
+    signal: AbortSignal.timeout(5_000),
+  });
+  const renewed = await renewal.json().catch(() => undefined) as { token?: unknown } | undefined;
+  if (!renewal.ok || typeof renewed?.token !== "string") {
+    throw new Error(`PTY review credential renewal failed (${renewal.status}).`);
+  }
+  const nextClient = new Client({ name: clientName, version: "1.0.0" });
+  const transport = new StreamableHTTPClientTransport(endpoint, {
+    requestInit: { headers: { "x-kontrol-worker-token": renewed.token as string } },
+    reconnectionOptions: {
+      maxRetries: 0,
+      initialReconnectionDelay: 100,
+      maxReconnectionDelay: 1_000,
+      reconnectionDelayGrowFactor: 1.5,
+    },
+  });
+  try {
+    await nextClient.connect(transport);
+    return nextClient;
+  } catch (error) {
+    await nextClient.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+/** Submit and await review through the existing worker MCP tools. The only
+ * credential available to this command is a private, generation-bound file
+ * created for an explicitly launched agent PTY. */
+async function runPtyReviewCommand(args: string[]): Promise<void> {
+  const sub = args[0];
+  if (!sub || sub === "help") {
+    output.write("Usage: kontrol review submit [--message <text>] [--client-mutation-id <stable-id>] [--no-wait]\n");
+    return;
+  }
+  if (sub !== "submit") throw new Error(`Unknown review subcommand: ${sub} (expected submit)`);
+  const mutationId = readPtyReviewMutationId(args);
+  if (!mutationId.ok) {
+    errorOutput.write(`${mutationId.error}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const { credential, credentialDir } = readPtyWorkerCredential();
+  const canonicalPath = join(credentialDir, "credential.json");
   const mutationIntentPath = join(dirname(canonicalPath), "submission-intent");
   const pendingMutationId = readPtyReviewMutationIntent(mutationIntentPath);
   if (mutationId.clientMutationId && pendingMutationId && mutationId.clientMutationId !== pendingMutationId) {
@@ -153,44 +206,13 @@ async function runPtyReviewCommand(args: string[]): Promise<void> {
     ?? pendingMutationId
     ?? getOrCreatePtyReviewMutationId(mutationIntentPath);
   const ownsAutomaticIntent = !mutationId.clientMutationId || pendingMutationId === clientMutationId;
-  const credentialToken = credential.token;
-  const endpoint = new URL(credential.mcpUrl);
-  if (endpoint.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname)
-    || endpoint.pathname !== "/mcp" || endpoint.search || endpoint.hash) {
-    throw new Error("PTY review endpoint must be loopback HTTP.");
-  }
   let client: Client | undefined;
-  const connectWithRenewedCredential = async () => {
-    const renewal = await fetch(new URL("/pty-review/renew", endpoint), {
-      method: "POST",
-      headers: { "x-kontrol-worker-token": credentialToken },
-      signal: AbortSignal.timeout(5_000),
-    });
-    const renewed = await renewal.json().catch(() => undefined) as { token?: unknown } | undefined;
-    if (!renewal.ok || typeof renewed?.token !== "string") {
-      throw new Error(`PTY review credential renewal failed (${renewal.status}).`);
-    }
-    const renewedToken = renewed.token as string;
-    const nextClient = new Client({ name: "kontrol-pty-review", version: "1.0.0" });
-    const transport = new StreamableHTTPClientTransport(endpoint, {
-      requestInit: { headers: { "x-kontrol-worker-token": renewedToken } },
-      reconnectionOptions: {
-        maxRetries: 0,
-        initialReconnectionDelay: 100,
-        maxReconnectionDelay: 1_000,
-        reconnectionDelayGrowFactor: 1.5,
-      },
-    });
-    try {
-      await nextClient.connect(transport);
-      client = nextClient;
-    } catch (error) {
-      await nextClient.close().catch(() => undefined);
-      throw error;
-    }
+  const reconnect = async () => {
+    await client?.close().catch(() => undefined);
+    client = await connectPtyWorkerMcp(credential, "kontrol-pty-review");
   };
   try {
-    await connectWithRenewedCredential();
+    await reconnect();
     const submitted = await client!.callTool({
       name: "submit_for_review",
       arguments: {
@@ -221,13 +243,100 @@ async function runPtyReviewCommand(args: string[]): Promise<void> {
       }
       output.write(`${JSON.stringify(received.receipt)}\n`);
       if (received.status !== "timeout") return;
-      await client!.close().catch(() => undefined);
-      client = undefined;
-      await connectWithRenewedCredential();
+      await reconnect();
     }
   } finally {
     await client?.close().catch(() => undefined);
   }
+}
+
+/** Send an agent message and await the reviewer reply through the existing
+ * worker MCP tools. Same credential, intent, and renewal discipline as the
+ * review command; messages are never approvals. */
+async function runPtyMessageCommand(args: string[]): Promise<void> {
+  const sub = args[0];
+  if (!sub || sub === "help") {
+    output.write("Usage: kontrol message send [--kind <kind>] [--title <text>] [--body <text>] [--expects-reply] [--client-mutation-id <stable-id>]\n");
+    output.write("       kontrol message await --message-id <id> [--timeout-ms <ms>] [--client-mutation-id <stable-id>]\n");
+    return;
+  }
+  const { credential, credentialDir } = readPtyWorkerCredential();
+  if (sub === "send") {
+    const kind = flagValue(args, "--kind") ?? "note";
+    const mutationId = readPtyReviewMutationId(args);
+    if (!mutationId.ok) {
+      errorOutput.write(`${mutationId.error}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    const mutationIntentPath = join(credentialDir, "message-intent");
+    const pendingMutationId = readPtyReviewMutationIntent(mutationIntentPath);
+    if (mutationId.clientMutationId && pendingMutationId && mutationId.clientMutationId !== pendingMutationId) {
+      throw new Error("A prior PTY message send has an unresolved response; retry it with its pending mutation ID before starting another send.");
+    }
+    const clientMutationId = mutationId.clientMutationId
+      ?? pendingMutationId
+      ?? getOrCreatePtyReviewMutationId(mutationIntentPath);
+    const ownsAutomaticIntent = !mutationId.clientMutationId || pendingMutationId === clientMutationId;
+    let client: Client | undefined;
+    try {
+      client = await connectPtyWorkerMcp(credential, "kontrol-pty-message");
+      const posted = await client.callTool({
+        name: "post_agent_message",
+        arguments: {
+          sessionId: credential.workSessionId,
+          kind,
+          ...(flagValue(args, "--title") ? { title: flagValue(args, "--title") } : {}),
+          ...(flagValue(args, "--body") ? { body: flagValue(args, "--body") } : {}),
+          ...(args.includes("--expects-reply") ? { expectsReply: true } : {}),
+          clientMutationId,
+        },
+      });
+      const message = readPtyMessagePost(posted);
+      if (!message.ok) {
+        errorOutput.write(`${message.error}\n`);
+        process.exitCode = 1;
+        return;
+      }
+      if (ownsAutomaticIntent) completePtyReviewMutationId(mutationIntentPath, clientMutationId);
+      output.write(`${JSON.stringify({ ...message.receipt, clientMutationId })}\n`);
+    } finally {
+      await client?.close().catch(() => undefined);
+    }
+    return;
+  }
+  if (sub === "await") {
+    const messageId = flagValue(args, "--message-id");
+    if (!messageId) throw new Error("kontrol message await requires --message-id <id>");
+    const timeoutMs = Math.min(Math.max(Number(flagValue(args, "--timeout-ms") ?? 300_000), 1_000), 900_000);
+    let client: Client | undefined;
+    const reconnect = async () => {
+      await client?.close().catch(() => undefined);
+      client = await connectPtyWorkerMcp(credential, "kontrol-pty-message");
+    };
+    try {
+      await reconnect();
+      for (;;) {
+        const reply = await client!.callTool({
+          name: "await_agent_reply",
+          arguments: { sessionId: credential.workSessionId, messageId, timeoutMs },
+        });
+        const received = readPtyMessageReply(reply);
+        if (!received.ok) {
+          errorOutput.write(`${received.error}\n`);
+          process.exitCode = 1;
+          return;
+        }
+        output.write(`${JSON.stringify(received.receipt)}\n`);
+        if (received.status !== "timeout") return;
+        await reconnect();
+      }
+    } finally {
+      await client?.close().catch(() => undefined);
+    }
+    return;
+  }
+  throw new Error(`Unknown message subcommand: ${sub} (expected send|await)`);
 }
 
 function runSnapshotsCommand(args: string[]): Promise<void> {
@@ -1104,9 +1213,14 @@ async function runDoctor(options: { strict?: boolean } = {}): Promise<void> {
     const expectedMcp = config.authMode === "tunnel" ? mcp.status === 200 : mcp.status === 401;
     doctorResult("Local MCP initialize", expectedMcp ? "PASS" : mcp.status === 0 ? "UNAVAILABLE" : "FAIL", mcp.text);
     if (config.authMode === "tunnel") {
-      const tunnelHealth = await probe("http://127.0.0.1:8080/healthz");
+      // The health base URL is overridable so qualification fixtures can
+      // point the probe at an isolated endpoint instead of whatever happens
+      // to listen on the production default (a fixture must never report
+      // the health of an unrelated live tunnel as its own result).
+      const tunnelHealthBase = (process.env.KONTROL_TUNNEL_HEALTH_URL ?? "http://127.0.0.1:8080").replace(/\/+$/, "");
+      const tunnelHealth = await probe(`${tunnelHealthBase}/healthz`);
       doctorResult("Tunnel process", tunnelHealth.status === 200 ? "PASS" : tunnelHealth.status === 0 ? "UNAVAILABLE" : "FAIL", tunnelHealth.text);
-      const tunnelReady = await probe("http://127.0.0.1:8080/readyz");
+      const tunnelReady = await probe(`${tunnelHealthBase}/readyz`);
       doctorResult("Tunnel MCP initialize", tunnelReady.status === 200 ? "PASS" : tunnelReady.status === 0 ? "UNAVAILABLE" : "FAIL", tunnelReady.text);
       doctorResult("Tunnel MCP auth", "PASS", "delegated; no local bearer header");
     } else {
@@ -1287,10 +1401,12 @@ function printHelp(): void {
       "  kontrol config get      Print persisted config",
       "  kontrol config set publicBaseUrl <url|null>",
       "  kontrol config effective-policy --json",
-      "  kontrol service install|start|stop|restart|upgrade|status|logs|uninstall",
+      "  kontrol service install|start|stop|restart|upgrade|status|logs|uninstall|wait-core-ready|recover-tunnel",
       "  kontrol snapshots stats|gc",
       "  kontrol review-loop status|on|off|pause|resume --session <workSessionId>",
       "  kontrol review submit [--message <text>] [--client-mutation-id <stable-id>] [--no-wait]   Submit from an agent PTY and await feedback",
+      "  kontrol message send [--kind <kind>] [--title <text>] [--body <text>] [--expects-reply]   Post a worker message from an agent PTY",
+      "  kontrol message await --message-id <id> [--timeout-ms <ms>]   Await the reviewer reply from an agent PTY",
       "  kontrol agent list|add|remove      Register any loopback HTTP ACP agent",
       "  kontrol ingress inspect|plan|apply|disable|reconcile|doctor   Tailscale route control and qualification",
       "  kontrol -v, --version   Print the installed version",
@@ -1449,6 +1565,13 @@ function checkBashShell(): string {
 }
 
 main(process.argv.slice(2)).catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(message);
+  // Permanent configuration failures (e.g. the installed executable cannot
+  // read the live database schema) must exit distinct from transient
+  // failures so systemd RestartPreventExitStatus stops retrying them
+  // instead of burning the start budget.
+  process.exitCode = isPermanentConfigFailure({ stderr: message })
+    ? SCHEMA_INCOMPATIBLE_EXIT_CODE
+    : 1;
 });

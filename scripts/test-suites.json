@@ -1,0 +1,559 @@
+{
+  "version": 1,
+  "note": "Authoritative execution manifest for the integration suite. Timeouts are initial wall-clock ceilings, not demonstrated performance requirements; calibrate from clean CI observations. Each entry runs in an isolated child via scripts/lib/qualification-process.mjs, which reports PASSED/FAILED/TIMED_OUT/INTERRUPTED/INFRA_ERROR/CLEANUP_FAILED per entry.",
+  "entries": [
+    {
+      "id": "start-all",
+      "suite": "integration",
+      "command": [
+        "node",
+        "src/start-all.test.mjs"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "release-artifact",
+      "suite": "integration",
+      "command": [
+        "node",
+        "src/release-artifact.test.mjs"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "start-all.behavior",
+      "suite": "integration",
+      "command": [
+        "node",
+        "src/start-all.behavior.test.mjs"
+      ],
+      "timeoutMs": 1200000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "kontrol-supervisor",
+      "suite": "integration",
+      "command": [
+        "node",
+        "scripts/kontrol-supervisor.test.mjs"
+      ],
+      "timeoutMs": 1200000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "process-sessions",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/process-sessions.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "server-integrity",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/server-integrity.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "startup-recovery",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/server/startup-recovery.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "peer-failures",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/peer-failures.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "peer-listener",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/peer-listener.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "peer-jobs-enqueue",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/peer-jobs-enqueue.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "qualification.integration",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/ingress/qualification.integration.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "mcp-owner-bridge.integration",
+      "suite": "integration",
+      "command": [
+        "node",
+        "scripts/lib/mcp-owner-bridge.integration.test.mjs"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "shutdown",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/server/shutdown.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "diagnostics",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/server/diagnostics.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "mcp-process-continuity",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/mcp-process-continuity.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "mcp-minimal-process",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/mcp-minimal-process.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "mcp-process-control-modes",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/mcp-process-control-modes.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "mcp-transport-parity",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/server/mcp-transport-parity.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "work-session-lifecycle",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/work-session-lifecycle.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "approval-requests",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/approval-requests.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "server-admission",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/server-admission.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "acp-gateway",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/acp-gateway.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "acp-identity",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/acp-identity.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "acp-lifecycle",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/acp-lifecycle.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "continuation",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/continuation.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "dispatch-outbox",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/dispatch-outbox.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "bridge-flow",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/bridge-flow.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "reply-flow",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/bridge/reply-flow.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "reply-dispatcher",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/bridge/reply-dispatcher.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "schedule-tools",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/bridge/schedule-tools.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "scheduled-verification",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/scheduling/scheduled-verification.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "scheduled-jobs",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/scheduling/scheduled-jobs.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "scheduled-readonly-adapters-e2e",
+      "suite": "integration",
+      "command": [
+        "node",
+        "--import",
+        "tsx",
+        "scripts/scheduled-readonly-adapters-e2e.mjs"
+      ],
+      "timeoutMs": 1200000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "route-store",
+      "suite": "integration",
+      "command": [
+        "tsx",
+        "src/review-handoff/route-store.test.ts"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "lifecycle-soak",
+      "suite": "integration",
+      "command": [
+        "node",
+        "src/lifecycle-soak.test.mjs"
+      ],
+      "timeoutMs": 1200000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "card-types",
+      "suite": "ui",
+      "command": [
+        "node",
+        "node_modules/tsx/dist/cli.mjs",
+        "src/ui/card-types.test.ts"
+      ],
+      "timeoutMs": 300000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "patch-display",
+      "suite": "ui",
+      "command": [
+        "node",
+        "node_modules/tsx/dist/cli.mjs",
+        "src/ui/patch-display.test.ts"
+      ],
+      "timeoutMs": 300000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "approval-attention.dom",
+      "suite": "ui",
+      "command": [
+        "node",
+        "node_modules/tsx/dist/cli.mjs",
+        "src/ui/approval-attention.dom.test.ts"
+      ],
+      "timeoutMs": 300000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "session-views",
+      "suite": "ui",
+      "command": [
+        "node",
+        "node_modules/tsx/dist/cli.mjs",
+        "src/ui/session-views.test.ts"
+      ],
+      "timeoutMs": 300000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "submit-approval-id",
+      "suite": "ui",
+      "command": [
+        "node",
+        "node_modules/tsx/dist/cli.mjs",
+        "src/ui/submit-approval-id.test.ts"
+      ],
+      "timeoutMs": 300000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "submit-approval-click.dom",
+      "suite": "ui",
+      "command": [
+        "node",
+        "node_modules/tsx/dist/cli.mjs",
+        "src/ui/submit-approval-click.dom.test.ts"
+      ],
+      "timeoutMs": 300000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "agent-terminal-panel.dom",
+      "suite": "ui",
+      "command": [
+        "node",
+        "node_modules/tsx/dist/cli.mjs",
+        "src/ui/agent-terminal-panel.dom.test.ts"
+      ],
+      "timeoutMs": 300000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "policy-grant-revoke.dom",
+      "suite": "ui",
+      "command": [
+        "node",
+        "node_modules/tsx/dist/cli.mjs",
+        "src/ui/policy-grant-revoke.dom.test.tsx"
+      ],
+      "timeoutMs": 300000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "ingress-management.dom",
+      "suite": "ui",
+      "command": [
+        "node",
+        "node_modules/tsx/dist/cli.mjs",
+        "src/ui/ingress-management.dom.test.ts"
+      ],
+      "timeoutMs": 300000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "workspace-app.dom",
+      "suite": "ui",
+      "command": [
+        "node",
+        "node_modules/tsx/dist/cli.mjs",
+        "src/ui/workspace-app.dom.test.tsx"
+      ],
+      "timeoutMs": 300000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "connection-lifecycle.bootstrap",
+      "suite": "ui",
+      "command": [
+        "node",
+        "node_modules/tsx/dist/cli.mjs",
+        "src/ui/connection-lifecycle.bootstrap.test.ts"
+      ],
+      "timeoutMs": 300000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "workspace-app-size",
+      "suite": "ui",
+      "command": [
+        "node",
+        "src/ui/workspace-app-size.test.mjs"
+      ],
+      "timeoutMs": 300000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "workspace-app-contract",
+      "suite": "ui",
+      "command": [
+        "node",
+        "node_modules/tsx/dist/cli.mjs",
+        "src/ui/workspace-app-contract.test.ts"
+      ],
+      "timeoutMs": 300000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    },
+    {
+      "id": "workspace-app-browser",
+      "suite": "ui",
+      "command": [
+        "node",
+        "scripts/workspace-app-browser.test.mjs"
+      ],
+      "timeoutMs": 600000,
+      "resourceProfile": "isolated-subprocess",
+      "retryPolicy": "none"
+    }
+  ]
+}

@@ -4,14 +4,17 @@
 // leaves an inspectable receipt. The gate may be run with --allow-dirty for
 // engineering feedback, but a dirty checkout can never produce a qualified
 // stable-beta receipt.
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
-import { validateBetaFaultMatrix, validateBetaSoakAssertions } from "./beta-soak-contract.mjs";
+import { MINIMUM_DEPLOYMENT_UPTIME_MS, validateBetaDeploymentUptimeReceipt, validateBetaFaultMatrix } from "./beta-soak-contract.mjs";
 import { validateBetaExternalCatalogReceipt } from "./beta-external-catalog-contract.mjs";
 import { testHarnessEnvironment } from "./lib/tool-environment.mjs";
+import { runQualificationProcess } from "./lib/qualification-process.mjs";
+import { evaluateCandidateIdentity, evaluateGateVerdict, evaluateSoakEvidence } from "./lib/qualification-evaluator.mjs";
+import { acquireControllerLease, reconcilePhases, releaseControllerLease } from "./lib/qualification-controller.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const codeOnly = process.argv.includes("--code-only");
@@ -22,14 +25,9 @@ const receiptPath = resolve(
 );
 const faultReportPath = resolve(process.env.KONTROL_BETA_FAULT_REPORT ?? join(root, "beta-fault-matrix.json"));
 const soakReportPath = resolve(process.env.KONTROL_BETA_SOAK_REPORT ?? join(root, "beta-soak.json"));
+const deploymentUptimeReceiptPath = resolve(process.env.KONTROL_BETA_DEPLOYMENT_UPTIME_RECEIPT ?? join(root, "deployment-uptime-qualification.json"));
 const externalCatalogReceiptPath = resolve(process.env.KONTROL_BETA_EXTERNAL_CATALOG_RECEIPT ?? join(root, "beta-external-catalog.json"));
-const STABLE_BETA_MIN_SOAK_HOURS = 12;
-const configuredMinimumSoakHours = Number(process.env.KONTROL_BETA_MIN_SOAK_HOURS ?? STABLE_BETA_MIN_SOAK_HOURS);
-// The environment may require a longer soak, but it must never weaken the
-// stable-beta release policy.
-const minimumSoakHours = Number.isFinite(configuredMinimumSoakHours)
-  ? Math.max(STABLE_BETA_MIN_SOAK_HOURS, configuredMinimumSoakHours)
-  : STABLE_BETA_MIN_SOAK_HOURS;
+const minimumDeploymentUptimeHours = MINIMUM_DEPLOYMENT_UPTIME_MS / 3_600_000;
 const startedAt = new Date().toISOString();
 const receipt = {
   kind: "kontrol-beta-qualification",
@@ -39,7 +37,8 @@ const receipt = {
   policy: {
     cleanCheckoutRequired: true,
     allowDirtyRequested: allowDirty,
-    minimumSoakHours,
+    minimumDeploymentUptimeHours,
+    matchingDeploymentUptimeReceiptRequired: !codeOnly,
   },
   startedAt,
   phases: [],
@@ -72,37 +71,153 @@ function gitSha() {
   }
 }
 
-function runPhase(id, command, args, environment = {}) {
+// Every gate phase runs under the shared qualification executor with an
+// absolute deadline: a hung phase can no longer leave the receipt stuck at
+// "running". Deadlines are generous wall-clock ceilings, not targets.
+const PHASE_DEADLINE_MS = 30 * 60_000;
+const phaseDeadlinesMs = {
+  "runtime-suite": 100 * 60_000,
+  "installed-product-uat": 90 * 60_000,
+  "fault-matrix": 180 * 60_000,
+  "immutable-candidate-build": 20 * 60_000,
+};
+const gateRunId = process.env.KONTROL_BETA_RUN_ID ?? `beta-gate-${Date.now().toString(36)}`;
+receipt.runId = gateRunId;
+
+// Stage 4: one writer per receipt. A live controller blocks a duplicate
+// gate; a dead controller's unsettled "running" phases are reconciled to
+// "interrupted" before this run appends its own evidence. A receipt can
+// never again retain a permanent "running" status across gate restarts.
+// The controller lease lives outside the checkout in the machine-local temp
+// area: it is gate runtime state, and a lease file inside the repo would be
+// counted by every git-status cleanliness probe and by the candidate's own
+// gitDirty tally, making the gate fail its own source-identity check by
+// construction. The probes additionally exclude the lease by exact name so a
+// receipt path overridden back into the tree still cannot pollute them.
+const leaseDir = join(tmpdir(), "kontrol-beta-gate-leases");
+mkdirSync(leaseDir, { recursive: true });
+const leasePath = join(leaseDir, `${basename(receiptPath)}.controller-lease.json`);
+{
+  const lease = acquireControllerLease({
+    leasePath, runId: gateRunId, receiptPath,
+    readFileSync, writeFileSync, mkdirSync,
+  });
+  if (!lease.acquired) {
+    console.error(`[beta-gate] BLOCKED: ${lease.reason}`);
+    process.exit(2);
+  }
+  if (lease.reconciled) {
+    try {
+      const prior = JSON.parse(readFileSync(receiptPath, "utf8"));
+      const { phases, interruptedCount } = reconcilePhases(
+        prior.phases,
+        `prior controller run ${lease.reconciled.priorRunId} did not settle this phase`,
+      );
+      receipt.phases.push(...phases);
+      receipt.reconciledPriorRun = {
+        priorRunId: lease.reconciled.priorRunId,
+        priorPid: lease.reconciled.priorPid,
+        carriedPhases: phases.length,
+        interruptedPhases: interruptedCount,
+      };
+      console.log(`[beta-gate] reconciled prior run ${lease.reconciled.priorRunId}: ${interruptedCount} running phase(s) marked interrupted`);
+    } catch {
+      // No usable prior receipt; this run starts the history.
+    }
+  }
+}
+
+// The gate's own controller lease lives next to the receipt by design (it
+// serializes concurrent gate runs). It is gate runtime state, never source,
+// so cleanliness probes exclude exactly the lease file this gate owns; any
+// other untracked or modified path still fails the check. Both the starting
+// and ending probes must apply it, or the gate fails itself by construction.
+const excludeGateOwnedLease = (entries) => entries.filter(
+  (entry) => entry.slice(3) !== relative(root, leasePath),
+);
+
+// A controller shutdown (SIGTERM/SIGINT) never strands a phase as "running":
+// in-flight work settles under the executor's own absolute deadline, new
+// dispatches are refused, and the receipt records "interrupted".
+let controllerStopping = null;
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  process.once(signal, () => {
+    if (controllerStopping) return;
+    controllerStopping = signal;
+    for (const phase of receipt.phases) {
+      if (phase.status === "running") {
+        phase.status = "interrupted";
+        phase.finishedAt = new Date().toISOString();
+        phase.reason = `controller received ${signal} mid-phase`;
+      }
+    }
+    try {
+      persist();
+    } catch {
+      // Best-effort on the way out; the lease still fences successors.
+    }
+    console.error(`[beta-gate] ${signal} received; refusing new phases, in-flight work settles under its own deadline`);
+  });
+}
+
+async function runPhase(id, command, args, environment = {}) {
   const phase = {
     id,
     command: [command, ...args].join(" "),
-    status: "running",
+    status: controllerStopping ? "interrupted" : "running",
     startedAt: new Date().toISOString(),
+    deadlineMs: phaseDeadlinesMs[id] ?? PHASE_DEADLINE_MS,
+    deadlineAt: new Date(Date.now() + (phaseDeadlinesMs[id] ?? PHASE_DEADLINE_MS)).toISOString(),
   };
+  if (controllerStopping) {
+    phase.finishedAt = new Date().toISOString();
+    phase.reason = `controller shutdown (${controllerStopping}) requested before dispatch; phase never started`;
+    receipt.phases.push(phase);
+    persist();
+    console.log(`[beta-gate] INTERRUPTED ${id} (never dispatched)`);
+    return false;
+  }
   receipt.phases.push(phase);
   persist();
-  console.log(`\n[beta-gate] START ${id}: ${phase.command}`);
-  const started = Date.now();
-  const result = spawnSync(command, args, {
+  console.log(`\n[beta-gate] START ${id}: ${phase.command} (deadline ${phase.deadlineMs}ms)`);
+  const receipt_ = await runQualificationProcess({
+    runId: gateRunId,
+    phaseId: id,
+    command,
+    args,
     cwd: root,
     // P1.10: explicit allowlist; launcher authority never reaches gate
     // children. Phases pass their own test-hook keys via `environment`.
     env: testHarnessEnvironment(process.env, { overrides: { KONTROL_BETA_GATE: "1", ...environment } }),
-    stdio: "inherit",
+    deadlineMs: phase.deadlineMs,
   });
-  phase.status = result.status === 0 && result.signal === null ? "passed" : "failed";
-  phase.exitCode = result.status;
-  phase.signal = result.signal;
-  phase.durationMs = Date.now() - started;
+  phase.status = receipt_.status.toLowerCase();
+  phase.exitCode = receipt_.exitCode;
+  phase.signal = receipt_.signal;
+  phase.timedOut = receipt_.timedOut;
+  phase.escalated = receipt_.escalated;
+  phase.cleanupVerified = receipt_.cleanupVerified;
+  phase.cleanupFailures = receipt_.cleanupFailures;
+  phase.durationMs = receipt_.durationMs;
   phase.finishedAt = new Date().toISOString();
+  if (controllerStopping) {
+    // The executor settled the child under its own deadline, but the
+    // controller was asked to stop mid-phase: the phase is interrupted,
+    // never passed, so its evidence cannot qualify anything.
+    phase.status = "interrupted";
+    phase.reason = `controller received ${controllerStopping} mid-phase; executor outcome was ${receipt_.status.toLowerCase()}`;
+  }
   persist();
+  if (phase.status !== "passed" && receipt_.outputTail) {
+    process.stderr.write(receipt_.outputTail + (receipt_.outputTail.endsWith("\n") ? "" : "\n"));
+  }
   console.log(`[beta-gate] ${phase.status.toUpperCase()} ${id} (${phase.durationMs}ms)`);
-  return phase.status === "passed";
+  return !controllerStopping && phase.status === "passed";
 }
 
-function runEvidencePhase(id, command, args, evidence) {
+async function runEvidencePhase(id, command, args, evidence) {
   const phaseIndex = receipt.phases.length;
-  const passed = runPhase(id, command, args);
+  const passed = await runPhase(id, command, args);
   const phase = receipt.phases[phaseIndex];
   phase.testName = evidence.testName;
   phase.evidenceScope = evidence.scope;
@@ -112,7 +227,11 @@ function runEvidencePhase(id, command, args, evidence) {
   return passed;
 }
 
-const dirtyPaths = gitStatus();
+// The gate's own controller lease lives next to the receipt by design (it
+// serializes concurrent gate runs). It is gate runtime state, never source,
+// so the cleanliness probe excludes exactly the lease file this gate owns;
+// any other untracked or modified path still fails the check.
+const dirtyPaths = excludeGateOwnedLease(gitStatus());
 const cleanPass = dirtyPaths.length === 0;
 receipt.source = {
   started: {
@@ -136,7 +255,7 @@ console.log(`[beta-gate] ${cleanPhase.status.toUpperCase()} clean-checkout${dirt
 // Keep scheduled control-plane lifecycle evidence separate from proof of
 // bundled-adapter confinement: the unattended fixture's ACP endpoint writes
 // its artifact directly and cannot qualify the adapter security boundary.
-runEvidencePhase(
+await runEvidencePhase(
   "scheduled-control-plane-lifecycle",
   process.execPath,
   ["--import", "tsx", "scripts/scheduled-job-unattended-e2e.mjs"],
@@ -147,7 +266,7 @@ runEvidencePhase(
     excludes: ["bundled_adapter_confinement", "read_only_sandbox_security"],
   },
 );
-runEvidencePhase(
+await runEvidencePhase(
   "scheduled-bundled-adapter-confinement",
   process.execPath,
   ["--import", "tsx", "scripts/scheduled-readonly-adapters-e2e.mjs"],
@@ -157,7 +276,7 @@ runEvidencePhase(
     assertions: ["bundled_crush_adapter", "bundled_hermes_adapter", "real_bubblewrap_invoked", "workspace_mutations_denied", "symlink_escape_denied", "helper_process_confined", "read_only_execution_receipt_persisted"],
   },
 );
-runEvidencePhase(
+await runEvidencePhase(
   "bundled-adapter-grant-and-receipt",
   process.execPath,
   ["src/acp-readonly-adapters.integration.test.mjs"],
@@ -167,7 +286,7 @@ runEvidencePhase(
     assertions: ["forged_grant_rejected_before_launch", "signed_network_policy_enforced", "mutation_denied", "durable_receipt_acknowledged", "receipt_lookup_preserves_execution_identity"],
   },
 );
-runEvidencePhase(
+await runEvidencePhase(
   "bundled-adapter-crash-recovery",
   process.execPath,
   ["scripts/lib/adapter-launch-recovery.test.mjs"],
@@ -180,14 +299,15 @@ runEvidencePhase(
 
 // Later phases remain independent so the receipt identifies whether a failure
 // is runtime, packaging, candidate boot, or recovery behavior.
-runPhase("runtime-suite", "npm", ["run", "test:runtime"]);
-runPhase("package-install", "npm", ["run", "test:package"]);
-runPhase("installed-product-uat", "npm", ["run", "uat:release"]);
+await runPhase("runtime-suite", "npm", ["run", "test:runtime"]);
+await runPhase("package-install", "npm", ["run", "test:package"]);
+// P1-D: installed-product-uat runs after the immutable candidate build and
+// exercises that exact artifact via --candidate. See below.
 
 const buildRoot = mkdtempSync(join(tmpdir(), "kontrol-beta-gate-"));
 const buildResultPath = join(buildRoot, "build-result.json");
 try {
-  const built = runPhase("immutable-candidate-build", "npm", ["run", "build"], {
+  const built = await runPhase("immutable-candidate-build", "npm", ["run", "build"], {
     KONTROL_BUILD_RESULT_PATH: buildResultPath,
   });
   if (built && existsSync(buildResultPath)) {
@@ -196,20 +316,26 @@ try {
     const metadata = existsSync(metadataPath) ? JSON.parse(readFileSync(metadataPath, "utf8")) : undefined;
     receipt.candidate = { ...candidate, metadata };
     persist();
-    const validated = runPhase("candidate-module-closure", process.execPath, ["scripts/validate-release.mjs", candidate.artifactPath]);
-    if (validated) runPhase("candidate-isolated-boot", process.execPath, ["scripts/probe-release.mjs", "--boot", candidate.artifactPath]);
+    const validated = await runPhase("candidate-module-closure", process.execPath, ["scripts/validate-release.mjs", candidate.artifactPath]);
+    if (validated) await runPhase("candidate-isolated-boot", process.execPath, ["scripts/probe-release.mjs", "--boot", candidate.artifactPath]);
+    // P1-D: UAT exercises the exact immutable candidate above — never a
+    // rebuild. It runs whenever the candidate exists (diagnostic
+    // continuation); qualification eligibility is decided by the receipt.
+    await runPhase("installed-product-uat", process.execPath, ["scripts/release-uat.mjs", "--candidate", candidate.artifactPath]);
   } else {
     const phase = { id: "candidate-module-closure", status: "skipped", reason: "immutable candidate build did not produce a result" };
     receipt.phases.push(phase);
     const bootPhase = { id: "candidate-isolated-boot", status: "skipped", reason: "immutable candidate build did not produce a result" };
     receipt.phases.push(bootPhase);
+    const uatPhase = { id: "installed-product-uat", status: "blocked", reason: "no immutable candidate to exercise; refusal to test a rebuilt artifact" };
+    receipt.phases.push(uatPhase);
     persist();
   }
 } finally {
   rmSync(buildRoot, { recursive: true, force: true });
 }
 
-runPhase("fault-matrix", process.execPath, ["scripts/beta-fault-matrix.mjs"], {
+await runPhase("fault-matrix", process.execPath, ["scripts/beta-fault-matrix.mjs"], {
   KONTROL_BETA_FAULT_REPORT: faultReportPath,
   KONTROL_BETA_BUILD_ID: receipt.candidate?.buildId,
 });
@@ -230,7 +356,7 @@ receipt.phases.push({
 });
 persist();
 
-const endingDirtyPaths = gitStatus();
+const endingDirtyPaths = excludeGateOwnedLease(gitStatus());
 const endingGitSha = gitSha();
 receipt.source.finished = {
   dirtyPaths: endingDirtyPaths,
@@ -239,68 +365,17 @@ receipt.source.finished = {
 receipt.source.identityStable = receipt.source.started.gitSha === endingGitSha;
 receipt.source.cleanAtEnd = endingDirtyPaths.length === 0;
 receipt.source.dirtySetStable = JSON.stringify(receipt.source.started.dirtyPaths) === JSON.stringify(endingDirtyPaths);
-const candidateMetadata = receipt.candidate?.metadata;
-const candidateIdentityPass = Boolean(
-  receipt.candidate?.buildId
-  && candidateMetadata?.buildId === receipt.candidate.buildId
-  && candidateMetadata?.gitSha === receipt.source.started.gitSha
-  && Number(candidateMetadata?.gitDirty) === receipt.source.started.dirtyPaths.length
-  && endingGitSha === receipt.source.started.gitSha
-  && JSON.stringify(receipt.source.started.dirtyPaths) === JSON.stringify(endingDirtyPaths),
-);
-const candidateIdentityPhase = {
-  id: "candidate-source-identity",
-  command: "build-meta.json + git status --porcelain + git rev-parse HEAD",
-  status: candidateIdentityPass ? "passed" : "failed",
-  candidateBuildId: receipt.candidate?.buildId,
-  candidateGitSha: candidateMetadata?.gitSha,
-  candidateGitDirty: candidateMetadata?.gitDirty,
-  sourceStartedGitSha: receipt.source.started.gitSha,
-  sourceFinishedGitSha: endingGitSha,
-  sourceStartedDirtyPaths: receipt.source.started.dirtyPaths,
-  sourceFinishedDirtyPaths: endingDirtyPaths,
-  finishedAt: new Date().toISOString(),
-};
+// P1-E: identity and soak verdicts are computed by the side-effect-free
+// evaluator, not by the orchestrating controller. The controller assembles
+// evidence; only the evaluator judges it.
+const { pass: candidateIdentityPass, ...candidateIdentityPhase } = evaluateCandidateIdentity({
+  candidate: receipt.candidate,
+  sourceStarted: receipt.source.started,
+  endingGitSha,
+  endingDirtyPaths,
+});
 receipt.phases.push(candidateIdentityPhase);
 receipt.candidateIdentity = candidateIdentityPhase;
-
-function validateSoakEvidence(soak) {
-  if (!soak || soak.status !== "passed") return { passed: false, reason: "missing or non-passing soak report" };
-  if (soak.monitoring?.diagnosticsRequired === false || soak.monitoring?.tunnelRequired === false) {
-    return { passed: false, reason: "soak skipped required diagnostics or tunnel monitoring" };
-  }
-  const candidateBuildId = receipt.candidate?.buildId;
-  const started = soak.snapshots?.started;
-  const finished = soak.snapshots?.finished;
-  const startedAtMs = Date.parse(soak.startedAt ?? "");
-  const finishedAtMs = Date.parse(soak.finishedAt ?? "");
-  const durationMatches = Number(soak.requestedHours) >= minimumSoakHours
-    && Number.isFinite(startedAtMs)
-    && Number.isFinite(finishedAtMs)
-    && finishedAtMs - startedAtMs >= minimumSoakHours * 60 * 60_000;
-  const buildMatches = Boolean(
-    candidateBuildId
-    && soak.expectedBuildId === candidateBuildId
-    && started?.buildId === candidateBuildId
-    && finished?.buildId === candidateBuildId,
-  );
-  const sourceMatches = Boolean(
-    started?.gitSha === receipt.source.started.gitSha
-    && finished?.gitSha === receipt.source.started.gitSha
-    && (finished?.gitDirty === undefined || Number(finished.gitDirty) === 0),
-  );
-  const assertionCheck = validateBetaSoakAssertions(soak.assertions);
-  return {
-    passed: durationMatches && buildMatches && sourceMatches && assertionCheck.valid,
-    durationMatches,
-    buildMatches,
-    sourceMatches,
-    assertions: assertionCheck.valid,
-    missingAssertions: assertionCheck.missing,
-    invalidAssertions: assertionCheck.invalid,
-    reason: durationMatches && buildMatches && sourceMatches && assertionCheck.valid ? undefined : "soak duration, identity, or required assertions did not match the candidate",
-  };
-}
 
 if (!codeOnly) {
   let soak;
@@ -310,7 +385,10 @@ if (!codeOnly) {
     soak = undefined;
     receipt.soak = { path: soakReportPath, error: error instanceof Error ? error.message : String(error) };
   }
-  const soakCheck = validateSoakEvidence(soak);
+  const soakCheck = evaluateSoakEvidence(soak, {
+    candidateBuildId: receipt.candidate?.buildId,
+    sourceStartedGitSha: receipt.source.started.gitSha,
+  });
   receipt.soak = {
     path: soakReportPath,
     status: soak?.status,
@@ -323,10 +401,40 @@ if (!codeOnly) {
     ...soakCheck,
   };
   receipt.phases.push({
-    id: "wall-clock-soak-evidence",
+    id: "continuity-soak-evidence",
     command: `read ${soakReportPath}`,
     status: soakCheck.passed ? "passed" : "failed",
     ...soakCheck,
+    finishedAt: new Date().toISOString(),
+  });
+
+  let deploymentUptime;
+  try {
+    deploymentUptime = JSON.parse(readFileSync(deploymentUptimeReceiptPath, "utf8"));
+  } catch (error) {
+    receipt.deploymentUptime = { path: deploymentUptimeReceiptPath, error: error instanceof Error ? error.message : String(error) };
+  }
+  const deploymentUptimeCheck = validateBetaDeploymentUptimeReceipt(deploymentUptime, {
+    candidateBuildId: receipt.candidate?.buildId,
+    sourceSha: receipt.source.started.gitSha,
+    contentSha256: receipt.candidate?.metadata?.contentSha256,
+    minimumCheckedAt: soak?.finishedAt,
+  });
+  receipt.deploymentUptime = {
+    path: deploymentUptimeReceiptPath,
+    status: deploymentUptime?.status,
+    qualified: deploymentUptime?.qualified === true,
+    buildId: deploymentUptime?.deployment?.buildId,
+    sourceSha: deploymentUptime?.deployment?.sourceSha,
+    generationId: deploymentUptime?.deployment?.generationId,
+    uptimeMs: deploymentUptime?.uptimeMs,
+    ...deploymentUptimeCheck,
+  };
+  receipt.phases.push({
+    id: "deployment-uptime-evidence",
+    command: `read ${deploymentUptimeReceiptPath}`,
+    status: deploymentUptimeCheck.valid ? "passed" : "failed",
+    ...deploymentUptimeCheck,
     finishedAt: new Date().toISOString(),
   });
 
@@ -364,20 +472,22 @@ if (!codeOnly) {
 }
 
 receipt.finishedAt = new Date().toISOString();
-const hardFailures = receipt.phases.filter((phase) => phase.status === "failed" || phase.status === "skipped");
-const codeFailures = hardFailures.filter((phase) => phase.id !== "wall-clock-soak-evidence" && phase.id !== "external-host-catalog-evidence");
-receipt.codeQualified = cleanPass
-  && codeFailures.length === 0
-  && candidateIdentityPass
-  && receipt.source.identityStable
-  && receipt.source.dirtySetStable
-  && receipt.source.cleanAtEnd;
-const soakQualified = codeOnly
-  ? true
-  : receipt.phases.find((phase) => phase.id === "wall-clock-soak-evidence")?.status === "passed"
-    && receipt.phases.find((phase) => phase.id === "external-host-catalog-evidence")?.status === "passed";
-receipt.qualified = receipt.codeQualified && soakQualified;
-receipt.status = receipt.qualified ? "qualified" : (codeOnly ? "code_failed" : "failed");
+// P1-E: the verdict is computed by the side-effect-free evaluator from the
+// assembled evidence. Any non-passing executor outcome (failed, timed_out,
+// interrupted, infra_error, cleanup_failed, skipped) blocks qualification;
+// only an explicit "warning" (dirty checkout with --allow-dirty) is tolerated.
+const verdict = evaluateGateVerdict({
+  phases: receipt.phases,
+  codeOnly,
+  cleanPass,
+  candidateIdentityPass,
+  identityStable: receipt.source.identityStable,
+  dirtySetStable: receipt.source.dirtySetStable,
+  cleanAtEnd: receipt.source.cleanAtEnd,
+});
+receipt.codeQualified = verdict.codeQualified;
+receipt.qualified = verdict.qualified;
+receipt.status = verdict.status;
 if (!codeOnly) {
   receipt.checks = {
     ...(receipt.checks ?? {}),
@@ -385,14 +495,16 @@ if (!codeOnly) {
   };
 }
 receipt.policy.cleanCheckout = cleanPass && receipt.source.cleanAtEnd;
-receipt.policy.soakRequired = !codeOnly;
+receipt.policy.continuitySoakRequired = !codeOnly;
+receipt.policy.deploymentUptimeRequired = !codeOnly;
 receipt.policy.externalCatalogRequired = !codeOnly;
 persist();
 const resultLabel = receipt.qualified
   ? "QUALIFIED"
   : receipt.codeQualified
-    ? (codeOnly ? "CODE QUALIFIED; DEPLOYMENT EVIDENCE REQUIRED" : "CODE QUALIFIED; SOAK OR EXTERNAL CATALOG EVIDENCE REQUIRED")
+    ? (codeOnly ? "CODE QUALIFIED; DEPLOYMENT EVIDENCE REQUIRED" : "CODE QUALIFIED; UPTIME, CONTINUITY, OR EXTERNAL CATALOG EVIDENCE REQUIRED")
     : "NOT QUALIFIED";
 console.log(`\n[beta-gate] ${resultLabel}`);
 console.log(`[beta-gate] receipt=${receiptPath}`);
+releaseControllerLease({ leasePath, runId: gateRunId, readFileSync, rmSync });
 if (!receipt.qualified) process.exitCode = 1;

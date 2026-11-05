@@ -27,6 +27,10 @@ scripts/test-*.mjs
 !scripts/test-manifest.mjs
 
 # Generated runtime/test state — must never be shipped or captured in review snapshots
+# Ephemeral audit/verification work areas (.tmp-review-*, .tmp-verify-*,
+# .tmp-count-*, .tmp-artifact*, .tmp-scratch): read-only inventory only, never
+# delete blindly — some may hold another agent's active verification evidence.
+.tmp-*/
 .kontrol-uat/
 .kontrol-state/
 .kontrol-build-*
@@ -37,3 +41,4 @@ beta-code-qualification.json
 beta-fault-matrix.json
 beta-soak.json
 beta-external-catalog.json
+deployment-uptime-qualification.json

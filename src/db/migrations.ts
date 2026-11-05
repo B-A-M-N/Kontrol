@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { shellTelemetrySync } from "../redaction.js";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { getTableName, isTable } from "drizzle-orm";
@@ -120,7 +121,24 @@ const migrations: Migration[] = [
   { version: 106, name: "startup-recovery-selective-indexes", up: migrateStartupRecoverySelectiveIndexes },
   { version: 107, name: "review-browser-durable-auth-ownership", up: migrateReviewBrowserDurableAuthOwnership },
   { version: 108, name: "review-browser-launch-diagnostics", up: migrateReviewBrowserLaunchDiagnostics },
+  // Versions 109-113 follow the production lineage exactly (names and
+  // bodies): the live database already records them, so any rename or
+  // reorder here would fork the ledger. See reconcile note in 114-116.
   { version: 109, name: "workspace-goals", up: migrateWorkspaceGoals },
+  { version: 110, name: "fail-closed-review-coverage-state", up: migrateReviewCoverageState },
+  { version: 111, name: "durable-review-mutation-provenance", up: migrateDurableReviewMutationProvenance },
+  { version: 112, name: "redacted-approval-command-previews", up: migrateApprovalCommandRedaction },
+  { version: 113, name: "continuation-action-permission-provenance", up: migrateContinuationActionPermissionProvenance },
+  // The review skill-provenance, partial-observation, and terminal-outcome
+  // schema changes were developed against this line as 109-111 before the
+  // production lineage was reconciled. On any database that already records
+  // the production 109-111 above, re-issuing them under 109-111 would be
+  // ambiguous, so they are re-based here as 114-116 with identical bodies:
+  // additive, idempotent, and safe to apply on top of production schema 113
+  // or a fresh database.
+  { version: 114, name: "review-route-skill-provenance", up: migrateReviewRouteSkillProvenance },
+  { version: 115, name: "review-browser-partial-observations", up: migrateReviewBrowserPartialObservations },
+  { version: 116, name: "review-browser-terminal-outcome", up: migrateReviewBrowserTerminalOutcome },
 ];
 
 function migrateWorkspaceGoals(sqlite: Database.Database): void {
@@ -278,6 +296,87 @@ function migrateReviewBrowserLaunchDiagnostics(sqlite: Database.Database): void 
   addColumnIfMissing(sqlite, "review_browser_profiles", "browser_product", "text");
   addColumnIfMissing(sqlite, "review_browser_profiles", "remote_debugging_enabled", "integer");
   addColumnIfMissing(sqlite, "review_browser_profiles", "browser_launch_diagnostic", "text");
+}
+
+function migrateContinuationActionPermissionProvenance(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "continuations", "allowed_next_actions_source", "text not null default 'legacy_unspecified'");
+}
+
+
+function migrateReviewCoverageState(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "work_session_submissions", "coverage_status", "text not null default 'unknown'");
+  // Older rows only stored non-empty known omissions. A missing or malformed
+  // record cannot prove that a pending submission was fully covered.
+  const rows = sqlite.prepare(`
+    select id, coverage_json as coverageJson
+      from work_session_submissions
+     where coverage_json is not null
+       and coverage_status = 'unknown'
+  `).all() as Array<{ id: string; coverageJson: string }>;
+  const update = sqlite.prepare("update work_session_submissions set coverage_status = 'incomplete' where id = ?");
+  for (const row of rows) {
+    try {
+      const parsed = JSON.parse(row.coverageJson) as { uncoveredPaths?: unknown };
+      if (Array.isArray(parsed?.uncoveredPaths) && parsed.uncoveredPaths.length > 0) update.run(row.id);
+    } catch {
+      // Malformed legacy evidence remains unknown and cannot authorize approval.
+    }
+  }
+}
+
+function migrateDurableReviewMutationProvenance(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists review_mutation_provenance (
+      id text primary key not null,
+      workspace_id text not null,
+      work_session_id text not null default '',
+      operation_id text not null,
+      path text,
+      state text not null check (state in ('pending', 'applied', 'unknown')),
+      created_at text not null,
+      resolved_at text
+    );
+    create index if not exists review_mutation_provenance_scope_idx
+      on review_mutation_provenance(workspace_id, work_session_id, state, created_at);
+  `);
+}
+
+function migrateApprovalCommandRedaction(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "approval_requests", "command_digest", "text");
+  const rows = sqlite.prepare("select id, command from approval_requests where kind = 'tool' and command_digest is null")
+    .all() as Array<{ id: string; command: string }>;
+  const update = sqlite.prepare("update approval_requests set command_digest = ?, command = ? where id = ?");
+  for (const row of rows) {
+    const telemetry = shellTelemetrySync(row.command ?? "");
+    update.run(telemetry.commandHash, row.command ? telemetry.commandPreview : null, row.id);
+  }
+}
+
+function migrateReviewRouteSkillProvenance(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "review_routes", "skill_id", "text");
+  addColumnIfMissing(sqlite, "review_routes", "skill_version", "text");
+  addColumnIfMissing(sqlite, "review_routes", "skill_config_sha256", "text");
+}
+
+function migrateReviewBrowserPartialObservations(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "review_browser_turns", "last_progress_at", "text");
+  sqlite.exec(`
+    create table if not exists review_browser_partial_observations (
+      attempt_id text not null references review_browser_turns(id) on delete cascade,
+      seq integer not null,
+      text_sha256 text not null,
+      text_prefix text not null,
+      captured_at text not null,
+      provenance text not null,
+      primary key (attempt_id, seq)
+    );
+    create index if not exists review_browser_partial_observations_attempt_idx
+      on review_browser_partial_observations(attempt_id, seq);
+  `);
+}
+
+function migrateReviewBrowserTerminalOutcome(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "review_browser_turn_resolutions", "reason_code", "text");
 }
 
 function migrateAuthenticatedOutcomeObservationReceipts(sqlite: Database.Database): void {
@@ -2470,7 +2569,7 @@ function migrateExternalCatalogObservationsAndAssociations(sqlite: Database.Data
 
 function addColumnIfMissing(
   sqlite: Database.Database,
-  table: "workspace_sessions" | "work_sessions" | "work_session_submissions" | "work_session_feedback" | "agent_registry" | "continuations" | "acp_runs" | "agent_webhook_queue" | "dispatch_outbox" | "approval_requests" | "mission_evidence" | "event_log" | "supervisor_runs" | "mission_acceptance_criteria" | "mission_review_findings" | "mission_contracts" | "mission_completion_reports" | "scheduled_jobs" | "scheduled_job_attempts" | "review_routes" | "review_handoffs" | "review_threads" | "review_browser_turns" | "review_browser_profiles" | "mission_outcome_observations" | "agent_message_replies",
+  table: "workspace_sessions" | "work_sessions" | "work_session_submissions" | "work_session_feedback" | "agent_registry" | "continuations" | "acp_runs" | "agent_webhook_queue" | "dispatch_outbox" | "approval_requests" | "mission_evidence" | "event_log" | "supervisor_runs" | "mission_acceptance_criteria" | "mission_review_findings" | "mission_contracts" | "mission_completion_reports" | "scheduled_jobs" | "scheduled_job_attempts" | "review_routes" | "review_handoffs" | "review_threads" | "review_browser_turns" | "review_browser_turn_resolutions" | "review_browser_profiles" | "mission_outcome_observations" | "agent_message_replies",
   column: string,
   definition: string,
 ): void {

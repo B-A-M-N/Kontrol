@@ -74,27 +74,31 @@ For the complete stable-beta release gate, run:
 npm run gate:beta
 ```
 
-The canonical gate requires a matching wall-clock soak receipt. For a staged
-release review, run the code gate, soak the exact candidate, then join the
-receipts:
+The canonical gate requires an attested CI receipt showing the exact deployed
+generation has been continuously up and ready for 12 hours. For a staged
+release review, run the code gate, deploy that candidate, run the continuity
+workload, then join the receipts after CI awards uptime:
 
 ```bash
 npm run gate:beta:code
-npm run soak:beta -- --hours 12 --build-id CANDIDATE_BUILD_ID --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" --tunnel-url http://127.0.0.1:8080
+npm run soak:beta -- --hours 1 --build-id CANDIDATE_BUILD_ID --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" --tunnel-url http://127.0.0.1:8080
 npm run gate:beta:final
 ```
 
 `gate:beta:code` writes `beta-code-qualification.json`; the final gate writes
 `beta-qualification.json` only when the code receipt, candidate identity,
-clean checkout, and soak snapshots all match. `gate:beta` runs the full code
-gate and also requires the soak receipt in one invocation. `--allow-dirty` is
-only for collecting local feedback; a dirty checkout can never qualify.
+clean checkout, continuity workload, CI uptime receipt, and soak snapshots all
+match. Download the signed `deployment-uptime-qualification.json` artifact from
+the successful **Deployment uptime qualification** workflow before running
+the final gate. `gate:beta` runs the full code gate and checks both deployment
+uptime and continuity evidence. `--allow-dirty` is only for collecting local
+feedback; a dirty checkout can never qualify.
 
-Run that explicit wall-clock soak with a duration appropriate to the release
-(12 hours is the minimum enforced by the canonical stable-beta gate):
+Run the explicit continuity workload with a duration appropriate to the
+release. Its duration is independent of the CI uptime window:
 
 ```bash
-npm run soak:beta -- --hours 12 --url http://127.0.0.1:7676 --build-id CANDIDATE_BUILD_ID --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" --tunnel-url http://127.0.0.1:8080
+npm run soak:beta -- --hours 1 --url http://127.0.0.1:7676 --build-id CANDIDATE_BUILD_ID --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" --tunnel-url http://127.0.0.1:8080
 ```
 
 Add `--workspace-path` and, when needed, `--read-path` to include an allowed
@@ -110,8 +114,8 @@ For a one-command local qualification launch, use:
 ```
 
 This runs `gate:beta:code` first, then activates that exact immutable
-candidate and starts the 12-hour soak in the separate `kontrol-beta-soak`
-tmux session after the stack is ready. The soak runs in the background, so
+candidate and starts the configured continuity workload in the separate
+`kontrol-beta-soak` tmux session after the stack is ready. The soak runs in the background, so
 the MCP server remains available while you use it. Check `beta-soak.json`,
 read the log from `KONTROL_BETA_SOAK_LOG` (default: the Kontrol state
 directory's `beta-soak.log`), or attach with
@@ -128,7 +132,9 @@ HTTPS and reports tunnel readiness. These profiles use different auth trust
 boundaries, so one running generation qualifies one profile at a time. The
 launcher rejects local-only HTTP or a URL/profile mismatch before running the
 code gate or changing the active generation. Each profile still needs fresh
-external host-catalog evidence for its exact endpoint and candidate.
+external host-catalog evidence for its exact endpoint and candidate. The
+scheduled CI workflow separately observes deployment uptime; the local soak
+monitor does not award the 12-hour status.
 
 `KONTROL_BETA_SOAK_TRANSPORT` can explicitly select `public_https` or
 `secure_mcp_tunnel`; it must match `KONTROL_AUTH_MODE`. `KONTROL_BETA_SOAK_URL`
@@ -136,7 +142,7 @@ overrides the matching profile's target. The duration, workspace, report, and
 log can be set with `KONTROL_BETA_SOAK_HOURS`,
 `KONTROL_BETA_WORKSPACE_PATH`, `KONTROL_BETA_SOAK_REPORT`, and
 `KONTROL_BETA_SOAK_LOG`; `KONTROL_BETA_SSE_PROBE_CADENCE` changes how often
-the streaming probe runs. The stable-beta minimum remains 12 hours.
+the streaming probe runs. The deployment uptime minimum remains 12 hours.
 
 Use the same launcher for each profile, with its matching settings in `.env`.
 For a hosted endpoint:

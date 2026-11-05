@@ -16,8 +16,9 @@ import {
   getStructuredContent,
 } from "./server-tool-call.js";
 import { approvalCenterId } from "./approval-center.js";
-import { ensureWorkSessionView, mergePendingApproval, workSessionViews } from "./session-views.js";
+import { ensureWorkSessionView, mergePendingApproval, recordApprovalOutcome, workSessionViews } from "./session-views.js";
 import type {
+  ApprovalOutcome,
   MissionPacketView,
   PolicyApprovalView,
   PolicyGrantView,
@@ -601,14 +602,71 @@ async function revokePolicyGrant(view: WorkSessionViewState, grant: PolicyGrantV
   host.render();
 }
 
+/**
+ * Outcome text for a decision this client just committed. A direct-MCP
+ * approval authorizes exactly one retry of the original tool call — it is
+ * not proof the operation ran. A work-session approval wakes the waiter.
+ */
+export function describeDecisionOutcome(
+  decided: PolicyApprovalView,
+  decision: string,
+): { approvalId: string; title?: string; outcome: ApprovalOutcome; detail: string } {
+  const approvalId = decided.approvalId;
+  const title = decided.title ?? decided.tool;
+  const effect = decided.options?.find((option) => option.id === decision)?.effect;
+  if (effect === "deny" || effect === "changes_requested") {
+    return { approvalId, title, outcome: "denied", detail: `Denied — the operation will not run (${title ?? approvalId}).` };
+  }
+  if (decided.origin === "work_session") {
+    return { approvalId, title, outcome: "approved_pending_retry", detail: `Approved — the waiting work-session operation resumes (${title}).` };
+  }
+  return { approvalId, title, outcome: "approved_pending_retry", detail: `Approved — retry the original tool call to run it (${title}). This is not proof the operation completed.` };
+}
+
+/** Map an authoritative terminal status to a displayable resolved outcome. */
+export function describeTerminalOutcome(status: {
+  approvalId: string;
+  status: string;
+  consumed?: boolean;
+  title?: string;
+}): { approvalId: string; title?: string; outcome: ApprovalOutcome; detail: string } | undefined {
+  const label = status.title ?? status.approvalId;
+  switch (status.status) {
+    case "approved":
+      return status.consumed
+        ? { approvalId: status.approvalId, title: status.title, outcome: "authorization_consumed", detail: `Authorization consumed — the one-shot approval was used (${label}). Execution result not verified; only an execution receipt tied to the operation proves it ran.` }
+        : { approvalId: status.approvalId, title: status.title, outcome: "approved_pending_retry", detail: `Approved — retry the original tool call to run it (${label}). This is not proof the operation completed.` };
+    case "denied":
+      return { approvalId: status.approvalId, title: status.title, outcome: "denied", detail: `Denied — the operation will not run (${label}).` };
+    case "expired":
+      return { approvalId: status.approvalId, title: status.title, outcome: "expired", detail: `Expired — the approval is no longer actionable (${label}).` };
+    case "cancelled":
+      return { approvalId: status.approvalId, title: status.title, outcome: "cancelled", detail: `Cancelled — the approval was withdrawn (${label}).` };
+    default:
+      return undefined;
+  }
+}
+
 export async function submitPolicyApproval(
   view: WorkSessionViewState,
   approvalId: string,
   decision: string,
 ): Promise<void> {
   if (!host.getApp()) return;
+  // Duplicate clicks while a decision is in flight must not mint a second
+  // attempt: the in-flight request keeps its idempotency key.
+  if (view.policyApprovals.get(approvalId)?.uiState === "submitting") return;
   const approval = view.policyApprovals.get(approvalId);
+  // One idempotency key per {approvalId, decision} pair: reuse the stored
+  // key only when retrying the identical decision whose outcome is still
+  // unknown. A changed decision mints a distinct key — the server rejects
+  // a reused key with different request content as a conflict.
+  const clientMutationId = approval?.clientMutationId !== undefined && approval.clientMutationDecision === decision
+    ? approval.clientMutationId
+    : host.newClientMutationId();
   if (approval) {
+    approval.clientMutationId = clientMutationId;
+    approval.clientMutationDecision = decision;
     approval.uiState = "submitting";
     approval.error = undefined;
   }
@@ -616,10 +674,13 @@ export async function submitPolicyApproval(
   try {
     await callServerToolChecked({
       name: "provide_policy_approval",
-      arguments: { approvalId, decision, clientMutationId: host.newClientMutationId() },
+      arguments: { approvalId, decision, clientMutationId },
     });
-    const latest = view.policyApprovals.get(approvalId);
-    if (latest) latest.uiState = "resolved";
+    const decided = view.policyApprovals.get(approvalId);
+    if (decided) {
+      decided.uiState = "resolved";
+      recordApprovalOutcome(view, describeDecisionOutcome(decided, decision));
+    }
     view.policyApprovals.delete(approvalId);
   } catch (err) {
     const latest = view.policyApprovals.get(approvalId);
@@ -628,6 +689,13 @@ export async function submitPolicyApproval(
       latest.error = err instanceof AmbiguousMutationError
         ? "Approval outcome is unknown after a connection interruption. Refresh authoritative approval state before trying again."
         : "Failed to submit approval: " + (err instanceof Error ? err.message : String(err));
+      // A rejected decision has a known outcome, so the next submit is a new
+      // attempt with a fresh key. An unknown outcome keeps its key for a
+      // safe identical retry.
+      if (!(err instanceof AmbiguousMutationError)) {
+        latest.clientMutationId = undefined;
+        latest.clientMutationDecision = undefined;
+      }
     }
   }
   host.render();
@@ -643,14 +711,54 @@ export async function reconcilePolicyApproval(view: WorkSessionViewState, approv
     const pending = getStructuredContent<{ approvals?: PendingApprovalRecord[] }>(result)?.approvals ?? [];
     const current = pending.find((entry) => entry.approvalId === approvalId);
     if (!current) {
-      view.policyApprovals.delete(approvalId);
-      view.pendingApprovalCount = view.policyApprovals.size;
+      // The card left the pending list: ask the authoritative status
+      // endpoint what actually happened instead of inferring it. A known
+      // terminal state is recorded and the card is closed; anything else
+      // keeps the card as outcome_unknown so an unresolved action is never
+      // silently discarded.
+      let terminal: ReturnType<typeof describeTerminalOutcome> | undefined;
+      let lookupFailed = false;
+      try {
+        const statusResult = await callServerToolChecked({
+          name: "get_approval_status",
+          arguments: { approvalId },
+        });
+        const status = getStructuredContent<{ approval?: {
+          approvalId: string; found: boolean; status: string; consumed?: boolean;
+        } }>(statusResult)?.approval;
+        terminal = status?.found
+          ? describeTerminalOutcome({ ...status, title: view.policyApprovals.get(approvalId)?.title })
+          : undefined;
+      } catch {
+        lookupFailed = true;
+      }
+      if (terminal) {
+        recordApprovalOutcome(view, terminal);
+        view.policyApprovals.delete(approvalId);
+        view.pendingApprovalCount = view.policyApprovals.size;
+      } else {
+        const kept = view.policyApprovals.get(approvalId);
+        if (kept) {
+          kept.uiState = "outcome_unknown";
+          kept.error = lookupFailed
+            ? "Approval status lookup failed. The decision outcome is unknown; refresh again before retrying."
+            : "The approval left the pending list with no conclusive status. The decision outcome is unknown; refresh again before retrying.";
+        }
+      }
     } else {
       mergePendingApproval(view, current, view.workspaceSessionId);
       const refreshed = view.policyApprovals.get(approvalId);
-      if (refreshed) {
+      // An authoritative pending listing is a controlled transition out of
+      // uncertainty: it proves the decision has not committed, so the card
+      // returns to idle AND the uncertain attempt's key is released. The
+      // next submit mints a fresh key bound to the then-chosen decision —
+      // a retained key must never authorize a different decision.
+      // Never clobbers a decision submit still in flight.
+      if (refreshed && refreshed.uiState !== "submitting") {
         refreshed.uiState = "idle";
         refreshed.error = undefined;
+        refreshed.clientMutationId = undefined;
+        refreshed.clientMutationDecision = undefined;
       }
     }
   } catch (error) {

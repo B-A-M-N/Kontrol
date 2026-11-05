@@ -1022,6 +1022,49 @@ while (changed) {
   }
 }
 
+// Declarative execution manifest (Stage 3): scripts/test-suites.json lists
+// suites the static trace above cannot see (their paths arrive as manifest
+// data, not string literals). An entry counts as executed only when:
+//   1. the manifest schema is valid and every entry names an existing file,
+//   2. a chain-reachable runner consumes the manifest AND dispatches through
+//      the shared qualification executor (whose spawn path is independently
+//      regression-tested), so a manifest no runner honors proves nothing.
+const SUITE_MANIFEST = join(root, "scripts", "test-suites.json");
+if (existsSync(SUITE_MANIFEST)) {
+  let manifest;
+  try {
+    manifest = JSON.parse(readFileSync(SUITE_MANIFEST, "utf8"));
+  } catch (error) {
+    console.error("test-manifest: cannot parse scripts/test-suites.json: " + (error?.message ?? error));
+    process.exit(1);
+  }
+  const failManifest = (reason) => {
+    console.error("test-manifest: invalid scripts/test-suites.json: " + reason);
+    process.exit(1);
+  };
+  if (manifest?.version !== 1 || !Array.isArray(manifest.entries)) failManifest("expected { version: 1, entries: [...] }");
+  const manifestRunners = [...runnerBodies].filter(([, body]) =>
+    body.includes("test-suites.json") && body.includes("runQualificationProcess"));
+  if (manifestRunners.length === 0) failManifest("no chain-reachable runner consumes it through runQualificationProcess");
+  const manifestIds = new Set();
+  for (const [index, entry] of manifest.entries.entries()) {
+    const where = `entries[${index}]`;
+    if (typeof entry?.id !== "string" || !entry.id) failManifest(`${where}: id is required`);
+    if (manifestIds.has(entry.id)) failManifest(`${where}: duplicate id "${entry.id}"`);
+    manifestIds.add(entry.id);
+    if (!Array.isArray(entry.command) || entry.command.length === 0) failManifest(`${where} ("${entry.id}"): command must be a non-empty array`);
+    if (!Number.isFinite(entry.timeoutMs) || entry.timeoutMs <= 0) failManifest(`${where} ("${entry.id}"): timeoutMs must be a positive millisecond count`);
+    // The executed program is the last command token (interpreter flags and
+    // `--import` shims precede it). It must exist; only *.test.* programs
+    // count toward test-file coverage (e2e fixtures are existence-checked).
+    const program = [...entry.command].reverse().find((token) => typeof token === "string" && !token.startsWith("-"));
+    if (!program || !existsSync(join(root, program))) failManifest(`${where} ("${entry.id}"): executed program does not exist: ${program}`);
+    for (const token of entry.command) {
+      if (typeof token === "string" && TEST_PATH_PATTERN.test(token) && existsSync(join(root, token))) executed.add(token);
+    }
+  }
+}
+
 if (unresolvedFlags.length > 0) {
   console.error("test-manifest: " + unresolvedFlags.length
     + " interpreter flag(s) the checker cannot classify:");

@@ -103,3 +103,57 @@ const passive = createShutdownController({
 } as any);
 await passive.drain();
 assert.ok(passiveEvents.indexOf("transport-close") < passiveEvents.indexOf("database-close"), "passive watchers are woken before stores close");
+
+const injectedEvents: string[] = [];
+let hungPhaseSettled = false;
+const hungPhaseAction = new Promise<void>(() => {
+  // Never settles: models a critical shutdown operation that outlives its
+  // phase timeout. A bare never-resolving promise holds no event-loop
+  // handles, so it cannot keep this test process alive by itself.
+});
+hungPhaseAction.then(
+  () => { hungPhaseSettled = true; },
+  () => { hungPhaseSettled = true; },
+);
+const injected = createShutdownController({
+  config: {} as any,
+  db: { close: () => { injectedEvents.push("database-close"); } } as any,
+  transports: new Map(), mcpServers: new Map(), mcpSessions: new Map(),
+  sessionLifecycle: { recordMcpSessionEnd() {}, reaper: timer, memorySampler: timer } as any,
+  mcpAdmission: { close() {} } as any,
+  mcpWaiterAdmission: { close() {} } as any,
+  mcpResourceAdmission: { close() {} } as any,
+  startupReconciliation: { stop: () => { injectedEvents.push("startup-stop"); } },
+  maintenance: { stop: () => { injectedEvents.push("maintenance-stop"); } },
+  reviewCheckpoints: { drain: () => hungPhaseAction },
+  reviewerTurnDispatcher: { stopAndDrain: async () => undefined },
+  reviewBrowserController: { close: async () => undefined },
+  dispatcher: undefined, supervisorRuntime: undefined, replyDispatcher: undefined, scheduledJobRuntime: undefined,
+  supervisorRuns: { close: () => undefined }, mcpSessionChurnTimer: timer, shuttingDown: { value: false },
+  oauthProvider: null, workspaceStore: {}, workSessions: {}, agentRegistry: { close: () => undefined },
+  eventStore: { close: () => undefined }, continuationManager: { close: () => undefined }, dispatchOutbox: { close: () => undefined },
+  processSessions: { shutdown: async () => undefined }, shutdownMissionVerifiers: async () => undefined,
+  integrity: { stop: async () => undefined },
+} as any);
+const injectedError = await injected.close().then(
+  () => null,
+  (error: unknown) => error,
+);
+assert.ok(injectedError, "a hung critical phase must not report clean termination");
+assert.match(String((injectedError as Error)?.message ?? injectedError), /failed phase/, "the rejection identifies the shutdown failure");
+assert.match(
+  String((injectedError as Error)?.message ?? injectedError),
+  /critical phase "review-checkpoints" unfinished/,
+  "the rejection names the unfinished critical phase",
+);
+assert.match(
+  String((injectedError as Error)?.message ?? injectedError),
+  /fenced store close\(s\):.*database/,
+  "the rejection lists the fenced database close",
+);
+assert.ok(injectedEvents.includes("startup-stop"), "best-effort phases before the failure still run");
+assert.ok(injectedEvents.includes("maintenance-stop"), "best-effort phases after the failure still run when they close no durable store");
+assert.equal(injectedEvents.includes("database-close"), false, "the database is NOT closed underneath the unfinished checkpoint drain");
+assert.equal(hungPhaseSettled, false, "the timed-out action is still unresolved: the timeout records failure, it does not stop the work");
+
+console.log("server/shutdown.test.ts: hung-phase failure injection assertions passed");

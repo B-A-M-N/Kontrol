@@ -4,11 +4,11 @@
 // processes. That keeps one test's timers, HTTP server, or durable state from
 // making the next scenario appear healthy by accident, and makes the report
 // useful as release evidence rather than a single aggregate exit code.
-import { spawnSync } from "node:child_process";
 import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { testHarnessEnvironment } from "./lib/tool-environment.mjs";
+import { runQualificationProcess } from "./lib/qualification-process.mjs";
 import { REQUIRED_BETA_FAULT_CASES } from "./beta-soak-contract.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -48,28 +48,52 @@ const report = {
 };
 writeReport(report);
 
+// Deadlines are generous wall-clock ceilings, not performance targets.
+const caseDeadlineMs = Number(process.env.KONTROL_FAULT_CASE_TIMEOUT_MS ?? 15 * 60_000);
+const runId = process.env.KONTROL_BETA_RUN_ID ?? `fault-matrix-${Date.now().toString(36)}`;
+
 for (const testCase of cases) {
-  const startedAt = Date.now();
   console.log(`[beta-fault-matrix] START ${testCase.id}`);
-  const result = spawnSync(testCase.command, testCase.args, {
+  // Persist running before dispatch so an interrupted run never retains a
+  // silent gap; terminal evidence replaces this entry after cleanup.
+  const runningEntry = {
+    ...testCase,
+    passed: false,
+    status: "running",
+    startedAt: new Date().toISOString(),
+  };
+  report.cases.push(runningEntry);
+  writeReport(report);
+  const receipt = await runQualificationProcess({
+    runId,
+    phaseId: testCase.id,
+    command: testCase.command,
+    args: testCase.args,
     cwd: root,
     // P1.10: explicit allowlist; the matrix's isolated tests get the
     // toolchain, not the launcher environment.
     env: testHarnessEnvironment(process.env, { overrides: { KONTROL_BETA_FAULT_MATRIX: "1" } }),
-    stdio: "inherit",
-    encoding: "utf8",
+    deadlineMs: caseDeadlineMs,
   });
-  const passed = result.status === 0 && result.signal === null;
-  report.cases.push({
+  const passed = receipt.status === "PASSED";
+  if (!passed && receipt.outputTail) {
+    process.stderr.write(receipt.outputTail + (receipt.outputTail.endsWith("\n") ? "" : "\n"));
+  }
+  report.cases[report.cases.indexOf(runningEntry)] = {
     ...testCase,
     passed,
-    exitCode: result.status,
-    signal: result.signal,
-    durationMs: Date.now() - startedAt,
+    status: receipt.status.toLowerCase(),
+    exitCode: receipt.exitCode,
+    signal: receipt.signal,
+    timedOut: receipt.timedOut,
+    escalated: receipt.escalated,
+    cleanupVerified: receipt.cleanupVerified,
+    cleanupFailures: receipt.cleanupFailures,
+    durationMs: receipt.durationMs,
     finishedAt: new Date().toISOString(),
-  });
+  };
   writeReport(report);
-  console.log(`[beta-fault-matrix] ${passed ? "PASS" : "FAIL"} ${testCase.id}`);
+  console.log(`[beta-fault-matrix] ${passed ? "PASS" : receipt.status} ${testCase.id} in ${receipt.durationMs}ms`);
 }
 
 report.finishedAt = new Date().toISOString();

@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, w
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { completePtyReviewMutationId, getOrCreatePtyReviewMutationId, readPtyReviewFeedback, readPtyReviewMutationId, readPtyReviewMutationIntent, readPtyReviewSubmission } from "./pty-review-cli.js";
+import { completePtyReviewMutationId, getOrCreatePtyReviewMutationId, readPtyMessagePost, readPtyMessageReply, readPtyReviewFeedback, readPtyReviewMutationId, readPtyReviewMutationIntent, readPtyReviewSubmission } from "./pty-review-cli.js";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 
@@ -63,6 +63,25 @@ try {
 } finally {
   rmSync(intentDirectory, { recursive: true, force: true });
 }
+const validPost = readPtyMessagePost({ structuredContent: { messageId: "msg-1", status: "posted", kind: "clarification_request" } });
+assert.equal(validPost.ok, true, "a valid PTY message post returns its durable message identity");
+assert.equal(readPtyMessagePost({ isError: true, content: [{ type: "text", text: "cross-session message delivery" }] }).ok, false,
+  "MCP message errors, including cross-session denial, fail closed");
+assert.equal(readPtyMessagePost({ structuredContent: { status: "posted" } }).ok, false,
+  "a malformed message response is not printed as a successful result");
+const replyReady = readPtyMessageReply({ structuredContent: { status: "reply_ready", replyId: "r-1", replyRevision: 3, body: "proceed" } });
+assert.equal(replyReady.ok, true);
+assert.equal(replyReady.status, "reply_ready", "a ready reply carries its immutable reply identity");
+assert.equal(readPtyMessageReply({ structuredContent: { status: "timeout" } }).status, "timeout",
+  "reply timeout stays distinguishable so the CLI can keep waiting");
+assert.equal(readPtyMessageReply({ structuredContent: { status: "error", message: "Session cancelled" } }).ok, false,
+  "cancellation is a failing reply result rather than a successful stdout receipt");
+assert.match(cliSource, /kontrol message send/,
+  "the PTY message CLI advertises a send subcommand");
+assert.match(cliSource, /post_agent_message/,
+  "the PTY message send path calls the worker message tool");
+assert.match(cliSource, /await_agent_reply/,
+  "the PTY message await path calls the worker reply tool");
 const feedbackTimeout = readPtyReviewFeedback({ structuredContent: { status: "timeout", sessionId: "work-1" } });
 assert.equal(feedbackTimeout.ok, true);
 assert.equal(feedbackTimeout.status, "timeout", "feedback timeout stays distinguishable so the CLI can continue waiting");

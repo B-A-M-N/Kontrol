@@ -10,7 +10,7 @@ import {
   readMcpServerVersion,
   readMcpServerVersionFromBuildMeta,
 } from "./mcp/tool-logging.js";
-import { assertRequiredInspectionTools, REQUIRED_INSPECTION_TOOLS } from "./mcp/tool-names.js";
+import { assertRequiredInspectionTools, REQUIRED_INSPECTION_TOOLS, toolNames } from "./mcp/tool-names.js";
 import { fingerprintToolCatalog, TOOL_CATALOG_ACK_CAPABILITY, TOOL_CATALOG_ACK_METHOD } from "./mcp/tool-catalog-handshake.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { loadConfig } from "./config.js";
@@ -18,6 +18,36 @@ import { ProcessSessionManager } from "./process-sessions.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 import { openDatabase } from "./db/client.js";
 import { createWorkSessionManager } from "./work-sessions.js";
+import { resolveTestGitIdentity } from "./test-git-identity.js";
+import { registerBridgeToolsFront } from "./bridge/register.js";
+
+// ChatGPT ordering probe (ACP-enabled path): the ACP-disabled matrix below
+// never registers bridge tools, so its <55 check skips them. Probe the front
+// slice directly (registration order = tools/list order) and prove the
+// critical workflow tools fit, with headroom for open_workspace as the
+// first workspace tool after the front slice.
+{
+  const registered: string[] = [];
+  const fakeServer = {
+    registerTool: (name: string, _cfg: unknown, _handler: unknown) => { registered.push(name); },
+  };
+  registerBridgeToolsFront(fakeServer as never, {} as never);
+  const CRITICAL = [
+    "get_work_session", "submit_to_coding_agent", "call_acp_agent",
+    "discover_agents", "get_work_result", "await_work_session_events",
+    "post_reviewer_message", "post_agent_message", "resolve_agent_message",
+    "ack_agent_reply", "provide_review_feedback", "submit_for_review",
+    "check_review_status", "list_pending_reviews",
+  ];
+  for (const critical of CRITICAL) {
+    const at = registered.indexOf(critical);
+    assert.ok(at >= 0, `front bridge slice must register ${critical}`);
+    assert.ok(at < 55, `front bridge tool ${critical} must be within the first 55 (found at ${at + 1})`);
+  }
+  assert.ok(registered.length + 1 <= 55,
+    `front slice (${registered.length}) + open_workspace must fit in 55, got ${registered.length + 1}`);
+  console.log(`mcp-tool-surface-contract.test.ts: front bridge slice ${registered.length} tools, critical workflow within 55 — passed`);
+}
 
 // Packaged candidates with the same npm version but different executable-tree
 // identities must advertise different MCP server versions.
@@ -51,16 +81,16 @@ mkdirSync(workspaceRoot, { recursive: true });
 
 const modeExpectations: Record<string, { present: string[]; absent: string[] }> = {
   minimal: {
-    present: ["write", "edit", "bash", "poll_process"],
-    absent: ["apply_patch", "exec_command", "write_stdin"],
+    present: [toolNames.write, toolNames.edit, toolNames.shell, toolNames.pollProcess, toolNames.execCommand, toolNames.writeStdin],
+    absent: ["apply_patch"],
   },
   full: {
-    present: ["write", "edit", "bash", "poll_process"],
-    absent: ["apply_patch", "exec_command", "write_stdin"],
+    present: [toolNames.write, toolNames.edit, toolNames.shell, toolNames.pollProcess, toolNames.execCommand, toolNames.writeStdin],
+    absent: ["apply_patch"],
   },
   codex: {
-    present: ["apply_patch", "exec_command", "write_stdin", "poll_process"],
-    absent: ["write", "edit", "bash"],
+    present: ["apply_patch", toolNames.execCommand, toolNames.writeStdin, toolNames.pollProcess],
+    absent: [toolNames.write, toolNames.edit, toolNames.shell],
   },
 };
 
@@ -108,6 +138,23 @@ try {
         `${mode} must advertise the tool-catalog acknowledgement extension`);
       const listed = await client.listTools();
       const fingerprint = fingerprintToolCatalog({ tools: listed.tools });
+      // Capped hosts (ChatGPT registers ~55 tools) keep the first entries in
+      // tools/list order; the dispatch/result/messaging workflow must fit.
+      // Reorder registrations (bridge/register.ts, workspace-server.ts) if
+      // this fails — do not weaken the cap constant.
+      const CRITICAL_CHATGPT_WORKFLOW_TOOLS = [
+        "open_workspace", "get_work_session", "submit_to_coding_agent", "call_acp_agent",
+        "discover_agents", "get_work_result", "await_work_session_events",
+        "post_reviewer_message", "post_agent_message", "resolve_agent_message",
+        "ack_agent_reply", "provide_review_feedback", "submit_for_review",
+        "check_review_status", "list_pending_reviews",
+      ];
+      const orderedNames = listed.tools.map((tool: { name: string }) => tool.name);
+      for (const critical of CRITICAL_CHATGPT_WORKFLOW_TOOLS) {
+        const at = orderedNames.indexOf(critical);
+        if (at < 0) continue; // mode-excluded (e.g. minimal toolMode); order only constrains served tools
+        assert.ok(at < 55, `${mode} critical workflow tool ${critical} must be within the first 55 tools (found at ${at + 1})`);
+      }
       assert.ok(fingerprint, `${mode} tools/list catalog must be fingerprintable`);
       await client.notification({
         method: TOOL_CATALOG_ACK_METHOD,
@@ -143,7 +190,7 @@ try {
       assert.equal(observedHandshake?.status, "rejected", `${mode} a stale connected host version must be rejected`);
       assert.equal(observedHandshake?.reason, "server_version_mismatch");
       const names = new Set(listed.tools.map((tool) => tool.name));
-      for (const name of ["read", "grep", "glob", "ls", "git_status", "git_log", "git_diff", "git_show"]) {
+      for (const name of REQUIRED_INSPECTION_TOOLS) {
         assert.ok(names.has(name), `${mode} must expose required inspection tool ${name}`);
       }
       assert.ok(names.has("list_managed_worktrees"), `${mode} exposes managed worktree disposition listing`);
@@ -159,7 +206,7 @@ try {
         arguments: { path: workspaceRoot, mode: "checkout" },
       });
       const openedSurface = (opened.structuredContent as { toolSurface?: { version?: string; requiredInspectionTools?: string[] }; instruction?: string } | undefined);
-      assert.deepEqual(openedSurface?.toolSurface?.requiredInspectionTools, ["read", "grep", "glob", "ls", "git_status", "git_log", "git_diff", "git_show"],
+      assert.deepEqual(openedSurface?.toolSurface?.requiredInspectionTools, [...REQUIRED_INSPECTION_TOOLS],
         `${mode} open_workspace must return the required inspection surface`);
       assert.equal(typeof openedSurface?.toolSurface?.version, "string",
         `${mode} open_workspace must return the MCP surface version`);
@@ -281,6 +328,15 @@ const makeLeaseClient = async (context?: {
     server.registerTool("await_review_feedback", { title: "Await review feedback", inputSchema: {} }, async () => ({
       content: [{ type: "text" as const, text: "awaited" }],
     }));
+    server.registerTool("post_agent_message", { title: "Post agent message", inputSchema: {} }, async () => ({
+      content: [{ type: "text" as const, text: "posted" }],
+    }));
+    server.registerTool("await_agent_reply", { title: "Await agent reply", inputSchema: {} }, async () => ({
+      content: [{ type: "text" as const, text: "reply-awaited" }],
+    }));
+    server.registerTool("provide_review_feedback", { title: "Provide review feedback", inputSchema: {} }, async () => ({
+      content: [{ type: "text" as const, text: "must stay hidden over PTY" }],
+    }));
   }
   const client = new Client({ name: "lease-fence-test", version: "1.0.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -346,13 +402,19 @@ try {
   });
   leaseClients.push(ptyReview);
   const ptyTools = await ptyReview.client.listTools();
-  assert.deepEqual(ptyTools.tools.map((tool) => tool.name).sort(), ["await_review_feedback", "submit_for_review"],
-    "PTY review credentials expose only the two worker review tools");
+  assert.deepEqual(ptyTools.tools.map((tool) => tool.name).sort(),
+    ["await_agent_reply", "await_review_feedback", "post_agent_message", "submit_for_review"],
+    "PTY credentials expose the bounded worker relay set: review submission/feedback plus agent messaging");
   const ptyHiddenTool = await ptyReview.client.callTool({
     name: "open_workspace",
     arguments: { path: canonicalLeaseWorkspaceRoot, mode: "checkout" },
   });
   assert.equal(ptyHiddenTool.isError, true, "hidden tools remain unavailable even when invoked directly by name");
+  const ptyReviewerOnlyTool = await ptyReview.client.callTool({
+    name: "provide_review_feedback",
+    arguments: {},
+  });
+  assert.equal(ptyReviewerOnlyTool.isError, true, "reviewer-only tools stay forbidden over a PTY worker credential");
 
   const workerReopen = await worker.client.callTool({
     name: "open_workspace",
@@ -490,18 +552,17 @@ mkdirSync(gitRoot, { recursive: true });
 writeFileSync(join(gitRoot, "README.md"), "git inspection fixture\n");
 writeFileSync(join(gitRoot, "stable.txt"), "unchanged tracked file contents\n");
 writeFileSync(join(gitRoot, "empty.txt"), "");
-const gitFixtureIdentity = {
-  name: execFileSync("git", ["config", "user.name"], { cwd: process.cwd(), encoding: "utf8" }).trim(),
-  email: execFileSync("git", ["config", "user.email"], { cwd: process.cwd(), encoding: "utf8" }).trim(),
-};
+// Single fixture-identity source (ambient with synthetic fallback): the same
+// helper checkpoint-coverage, peer-jobs-enqueue, and workspaces use.
+const gitFixtureIdentity = resolveTestGitIdentity();
 execFileSync("git", ["init", "-q"], { cwd: gitRoot });
 execFileSync("git", ["config", "user.name", gitFixtureIdentity.name], { cwd: gitRoot });
 execFileSync("git", ["config", "user.email", gitFixtureIdentity.email], { cwd: gitRoot });
 execFileSync("git", ["add", "README.md", "stable.txt", "empty.txt"], { cwd: gitRoot });
-execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: gitRoot });
+execFileSync("git", ["-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "init"], { cwd: gitRoot });
 writeFileSync(join(gitRoot, "README.md"), "updated tracked file contents\n");
 execFileSync("git", ["add", "README.md"], { cwd: gitRoot });
-execFileSync("git", ["commit", "-q", "-m", "update README"], { cwd: gitRoot });
+execFileSync("git", ["-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "update README"], { cwd: gitRoot });
 {
   await createMcpServerForGitFixture();
 }

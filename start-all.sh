@@ -86,7 +86,7 @@ if [[ "$QUALIFY_MODE" == "1" ]]; then
     const requested = Number(process.argv[1]);
     const minimum = Number(process.argv[2]);
     process.exit(Number.isFinite(requested) && requested > 0 && Number.isFinite(minimum) && minimum > 0 ? 0 : 1);
-  ' "${KONTROL_BETA_SOAK_HOURS:-12}" "${KONTROL_BETA_MIN_SOAK_HOURS:-12}"; then
+  ' "${KONTROL_BETA_SOAK_HOURS:-1}" "${KONTROL_BETA_MIN_SOAK_HOURS:-1}"; then
     echo "ERROR: KONTROL_BETA_SOAK_HOURS and KONTROL_BETA_MIN_SOAK_HOURS must be positive numbers." >&2
     exit 1
   fi
@@ -323,6 +323,17 @@ read_json_field() {
   node -e 'try { const value = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))[process.argv[2]]; if (value !== undefined && value !== null) process.stdout.write(String(value)); } catch {}' "$path" "$field"
 }
 
+# curl -w "%{http_code}" already prints 000 on connection failure; appending
+# another 000 via `|| echo 000` produces 000000. Normalize to exactly 3 digits.
+normalize_http_code() {
+  local raw="$1"
+  if [[ "$raw" =~ ^[0-9]{3}$ ]]; then
+    printf '%s' "$raw"
+  else
+    printf '000'
+  fi
+}
+
 read_mcp_tool_surface_version() {
   local artifact_path="$1"
   node --input-type=module -e '
@@ -446,6 +457,18 @@ restore_database_if_needed() {
   fi
 }
 
+tmux_releases_root() {
+  printf '%s' "$DESKTOP_PWD/releases"
+}
+
+systemd_releases_root() {
+  # Installed (systemd) backend store, independently owned by src/service.ts.
+  # Kept distinct from the tmux/source-checkout store: artifacts are imported
+  # across stores only after verification, never treated as interchangeable.
+  local data_root="${KONTROL_SERVICE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/kontrol}"
+  printf '%s' "$data_root/releases"
+}
+
 resolve_artifact_path() {
   local requested_path="$1"
   local resolved_path
@@ -454,8 +477,16 @@ resolve_artifact_path() {
     echo "ERROR: immutable artifact does not exist: $requested_path" >&2
     return 1
   fi
+  local tmux_root systemd_root
+  tmux_root="$(tmux_releases_root)"
+  systemd_root="$(systemd_releases_root)"
+  # readlink -f already canonicalized; ensure roots are too for prefix compare.
+  local tmux_root_canon systemd_root_canon
+  tmux_root_canon="$(readlink -f -- "$tmux_root" 2>/dev/null || echo "$tmux_root")"
+  systemd_root_canon="$(readlink -f -- "$systemd_root" 2>/dev/null || echo "$systemd_root")"
   case "$resolved_path" in
-    "$DESKTOP_PWD/releases/"*) ;;
+    "$tmux_root_canon/"*) ACTIVE_ARTIFACT_BACKEND="tmux" ;;
+    "$systemd_root_canon/"*) ACTIVE_ARTIFACT_BACKEND="systemd" ;;
     *)
       echo "ERROR: serving artifact is outside immutable releases/: $resolved_path" >&2
       return 1
@@ -471,6 +502,57 @@ resolve_artifact_path() {
   fi
   ACTIVE_ARTIFACT_PATH="$resolved_path"
   ARTIFACT_BUILD_ID="$metadata_build_id"
+  return 0
+}
+
+# import_artifact_to_tmux: if the resolved artifact lives in the systemd store
+# but this tmux launch needs it, perform a verified atomic import into the
+# tmux store before activation. Never mutates the systemd record; the import
+# is a copy keyed by build ID with identical metadata.
+import_artifact_to_tmux() {
+  local source_path="$ACTIVE_ARTIFACT_PATH" build_id="$ARTIFACT_BUILD_ID" backend="${ACTIVE_ARTIFACT_BACKEND:-tmux}"
+  if [[ "$backend" == "tmux" ]]; then
+    return 0
+  fi
+  local tmux_root dest
+  tmux_root="$(tmux_releases_root)"
+  dest="$tmux_root/$build_id"
+  mkdir -p -- "$tmux_root"
+  if [[ -d "$dest" ]]; then
+    # Same build already present in tmux store; verify identity matches source.
+    local existing_build_id
+    existing_build_id="$(read_json_field "$dest/build-meta.json" buildId)"
+    if [[ "$existing_build_id" != "$build_id" ]]; then
+      echo "ERROR: tmux store already has inconsistent artifact for build $build_id." >&2
+      return 1
+    fi
+    ACTIVE_ARTIFACT_PATH="$(readlink -f -- "$dest")"
+    ACTIVE_ARTIFACT_BACKEND="tmux"
+    return 0
+  fi
+  local tmp_import="$tmux_root/.import-$build_id-$$"
+  rm -rf -- "$tmp_import"
+  cp -a -- "$source_path" "$tmp_import" || {
+    echo "ERROR: failed to copy $source_path into tmux store." >&2
+    rm -rf -- "$tmp_import"
+    return 1
+  }
+  local imported_build_id
+  imported_build_id="$(read_json_field "$tmp_import/build-meta.json" buildId)"
+  if [[ "$imported_build_id" != "$build_id" ]]; then
+    echo "ERROR: imported artifact identity mismatch (expected $build_id, found ${imported_build_id:-missing})." >&2
+    rm -rf -- "$tmp_import"
+    return 1
+  fi
+  # Atomic publish: mv within same filesystem is atomic.
+  mv -- "$tmp_import" "$dest" || {
+    echo "ERROR: failed to publish imported artifact to $dest." >&2
+    rm -rf -- "$tmp_import"
+    return 1
+  }
+  ACTIVE_ARTIFACT_PATH="$(readlink -f -- "$dest")"
+  ACTIVE_ARTIFACT_BACKEND="tmux"
+  echo "[*] Imported systemd artifact $build_id into tmux release store at $ACTIVE_ARTIFACT_PATH." >&2
   return 0
 }
 
@@ -553,13 +635,13 @@ update_dist_projection() {
 
 start_beta_soak_monitor() {
   local configured_hours minimum_hours hours soak_url workspace_path read_path report_path log_path soak_transport
-  configured_hours="${KONTROL_BETA_SOAK_HOURS:-12}"
-  minimum_hours="${KONTROL_BETA_MIN_SOAK_HOURS:-12}"
+  configured_hours="${KONTROL_BETA_SOAK_HOURS:-1}"
+  minimum_hours="${KONTROL_BETA_MIN_SOAK_HOURS:-1}"
   if ! hours="$(node -e '
     const requested = Number(process.argv[1]);
     const minimum = Number(process.argv[2]);
     if (!Number.isFinite(requested) || requested <= 0 || !Number.isFinite(minimum) || minimum <= 0) process.exit(1);
-    process.stdout.write(String(Math.max(12, requested, minimum)));
+    process.stdout.write(String(Math.max(requested, minimum)));
   ' "$configured_hours" "$minimum_hours")"; then
     echo "ERROR: KONTROL_BETA_SOAK_HOURS and KONTROL_BETA_MIN_SOAK_HOURS must be positive numbers." >&2
     return 1
@@ -630,6 +712,14 @@ if [[ "$EXPECTED_BUILD_ID" != "$ARTIFACT_BUILD_ID" ]]; then
   echo "ERROR: candidate build metadata changed while selecting the immutable artifact." >&2
   return 1
 fi
+# Backend ownership: tmux launches serve only from the tmux store. A systemd
+# artifact selected for rollback is imported (verified, atomic) before any
+# component starts; the installed systemd record is never mutated.
+import_artifact_to_tmux || return 1
+if [[ "$EXPECTED_BUILD_ID" != "$ARTIFACT_BUILD_ID" ]]; then
+  echo "ERROR: imported artifact build identity changed while resolving." >&2
+  return 1
+fi
 MCP_TOOL_SURFACE_VERSION="$(read_mcp_tool_surface_version "$ACTIVE_ARTIFACT_PATH" || true)"
 if [[ -n "${COMMITTED_MCP_TOOL_SURFACE_VERSION:-}" && -n "$MCP_TOOL_SURFACE_VERSION" && "$COMMITTED_MCP_TOOL_SURFACE_VERSION" != "$MCP_TOOL_SURFACE_VERSION" ]]; then
   echo "[*] MCP tool surface old=${COMMITTED_MCP_TOOL_SURFACE_VERSION} new=${MCP_TOOL_SURFACE_VERSION}; fresh client initialize required"
@@ -657,6 +747,7 @@ node --import tsx src/runtime-lock.ts update \
   --artifact-path "$ACTIVE_ARTIFACT_PATH" \
   --port "$DEV_PORT"
 export KONTROL_ARTIFACT_PATH="$ACTIVE_ARTIFACT_PATH"
+export KONTROL_RUNTIME_CLI_PATH="$ACTIVE_ARTIFACT_PATH/cli.js"
 CRUSH_ACP_PORT="${ACP_ADAPTER_PORT:-9877}"
 HERMES_ACP_PORT="${HERMES_ACP_ADAPTER_PORT:-9911}"
 HERMES_ACP_COMPAT_PATH="$DESKTOP_PWD/scripts/hermes-acp-compat"
@@ -686,6 +777,62 @@ if [[ "$START_CRUSH_ADAPTER" == "true" ]]; then
   fi
   export CRUSH_BIN="$CRUSH_CLI_BIN"
   echo "[*] Coding agent: CRUSH ($CRUSH_BIN)"
+fi
+
+# Muse Code, MuseFI, and OpenMuse run through the generic ACP stdio duplex
+# adapter as three independent profiles. They are opt-in (START_MUSE_ADAPTER /
+# START_MUSEFI_ADAPTER / START_OPENMUSE_ADAPTER, default false): each gets its
+# own adapter port, agent name, state root, and child environment. The
+# experimental ACP gate must be enabled in the launched agent's environment
+# via ACP_STDIO_AGENT_ENV_JSON — safeEnv() and the child-env allowlist both
+# refuse names containing "ACP", so the allowlist can never carry the
+# experimental gate. OpenMuse is the OpenRouter free/stealth-only profile
+# (~/.config/muse-open, X-FI-Local-Client: openmuse); it never shares MuseFI's
+# config home, sessions, or agent identity.
+MUSE_ACP_PORT="${MUSE_ACP_PORT:-9922}"
+MUSEFI_ACP_PORT="${MUSEFI_ACP_PORT:-9923}"
+OPENMUSE_ACP_PORT="${OPENMUSE_ACP_PORT:-9924}"
+MUSE_ADAPTER_LOG="${TMPDIR:-/tmp}/kontrol-adapter-muse.log"
+MUSEFI_ADAPTER_LOG="${TMPDIR:-/tmp}/kontrol-adapter-musefi.log"
+OPENMUSE_ADAPTER_LOG="${TMPDIR:-/tmp}/kontrol-adapter-openmuse.log"
+START_MUSE_ADAPTER="${START_MUSE_ADAPTER:-false}"
+START_MUSEFI_ADAPTER="${START_MUSEFI_ADAPTER:-false}"
+START_OPENMUSE_ADAPTER="${START_OPENMUSE_ADAPTER:-false}"
+
+# check_muse_acp <bin-var-name> <label>: resolve the binary and prove its
+# experimental ACP entry point exists. Fail closed when explicitly enabled.
+check_muse_acp() {
+  local bin_var_name="$1" label="$2"
+  local bin_path="${!bin_var_name:-}"
+  if [[ -z "$bin_path" ]]; then
+    bin_path="$(command -v "$3" 2>/dev/null || true)"
+  fi
+  if [[ -z "$bin_path" || ! -x "$bin_path" ]]; then
+    echo "ERROR: ${label} binary not executable: ${bin_path:-<not found>}. Set $1 to the agent executable, or set START_${label}_ADAPTER=false." >&2
+    return 1
+  fi
+  local acp_help
+  acp_help="$(MUSE_EXPERIMENTAL_ACP=on "$bin_path" acp --help 2>&1 || true)"
+  if ! grep -q "Agent Client Protocol (ACP v1)" <<<"$acp_help"; then
+    echo "ERROR: ${label} binary does not expose an ACP v1 interface (MUSE_EXPERIMENTAL_ACP=on $bin_path acp --help)." >&2
+    return 1
+  fi
+  printf -v "$bin_var_name" "%s" "$bin_path"
+}
+
+if [[ "$START_MUSE_ADAPTER" == "true" ]]; then
+  if ! check_muse_acp MUSE_BIN "MUSE" "muse"; then return 1; fi
+  echo "[*] Coding agent: Muse Code ACP ($MUSE_BIN)"
+fi
+
+if [[ "$START_MUSEFI_ADAPTER" == "true" ]]; then
+  if ! check_muse_acp MUSEFI_BIN "MUSEFI" "musefi"; then return 1; fi
+  echo "[*] Coding agent: MuseFI ACP ($MUSEFI_BIN)"
+fi
+
+if [[ "$START_OPENMUSE_ADAPTER" == "true" ]]; then
+  if ! check_muse_acp OPENMUSE_BIN "OPENMUSE" "openmuse"; then return 1; fi
+  echo "[*] Coding agent: OpenMuse ACP ($OPENMUSE_BIN)"
 fi
 
 if [[ "$START_HERMES_ADAPTER" != "false" ]]; then
@@ -731,6 +878,18 @@ fi
 if [[ "$START_HERMES_ADAPTER" == "true" ]]; then
   REQUIRED_AGENT_CONFIG="${REQUIRED_AGENT_CONFIG:+$REQUIRED_AGENT_CONFIG,}hermes-agent=http://127.0.0.1:${HERMES_ACP_PORT}"
 fi
+# Opt-in Muse profiles pin their own agent names. The smoke step below proves
+# each adapter is reachable, authenticated, and negotiating ACP before the
+# probe asserts it dispatchable; a failed smoke aborts boot (fail closed).
+if [[ "$START_MUSE_ADAPTER" == "true" ]]; then
+  REQUIRED_AGENT_CONFIG="${REQUIRED_AGENT_CONFIG:+$REQUIRED_AGENT_CONFIG,}muse-code=http://127.0.0.1:${MUSE_ACP_PORT}"
+fi
+if [[ "$START_MUSEFI_ADAPTER" == "true" ]]; then
+  REQUIRED_AGENT_CONFIG="${REQUIRED_AGENT_CONFIG:+$REQUIRED_AGENT_CONFIG,}musefi=http://127.0.0.1:${MUSEFI_ACP_PORT}"
+fi
+if [[ "$START_OPENMUSE_ADAPTER" == "true" ]]; then
+  REQUIRED_AGENT_CONFIG="${REQUIRED_AGENT_CONFIG:+$REQUIRED_AGENT_CONFIG,}openmuse=http://127.0.0.1:${OPENMUSE_ACP_PORT}"
+fi
 if [[ -n "$REQUIRED_AGENT_CONFIG" ]]; then
   export KONTROL_ACP_AGENTS="$REQUIRED_AGENT_CONFIG"
 fi
@@ -763,9 +922,12 @@ for _ in $(seq 1 60); do
     fi
     return 1
   fi
-  D=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://${DEV_HOST}:${DEV_PORT}/healthz" 2>/dev/null || echo 000)
-  R=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://${DEV_HOST}:${DEV_PORT}/core-readyz" 2>/dev/null || echo 000)
-  W=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://${DEV_HOST}:${DEV_PORT}/.well-known/oauth-protected-resource" 2>/dev/null || echo 000)
+  D_RAW=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://${DEV_HOST}:${DEV_PORT}/healthz" 2>/dev/null || true)
+  R_RAW=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://${DEV_HOST}:${DEV_PORT}/core-readyz" 2>/dev/null || true)
+  W_RAW=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://${DEV_HOST}:${DEV_PORT}/.well-known/oauth-protected-resource" 2>/dev/null || true)
+  D="$(normalize_http_code "$D_RAW")"
+  R="$(normalize_http_code "$R_RAW")"
+  W="$(normalize_http_code "$W_RAW")"
   if [[ "$D" == "200" && "$R" == "200" && "$W" == "200" ]]; then
     DEV_READY=1; break
   fi
@@ -900,6 +1062,32 @@ if [[ "$START_HERMES_ADAPTER" == "true" || "$START_HERMES_ADAPTER" == "auto" ]];
   fi
 fi
 
+# launch_muse_adapter <Label> <session> <port> <bin> <agent-name> <log>:
+# start one generic stdio duplex adapter instance for a Muse profile with an
+# isolated state root, agent name, and child environment. The child inherits
+# only the sanitized base plus the allowlisted experimental ACP gate.
+launch_muse_adapter() {
+  local label="$1" session="$2" port="$3" bin="$4" agent_name="$5" log="$6"
+  echo "[*] Starting ${label} ACP adapter on 127.0.0.1:${port} ..."
+  tmux new-session -d -s "$session" -c "$DESKTOP_PWD" "set -a && source ${ENV_FILE_QUOTED} && set +a && ${GENERATION_EXPORT} exec env ACP_STDIO_AGENT_NAME=${agent_name} ACP_STDIO_AGENT_DESCRIPTION='${label} (experimental ACP v1) via generic stdio duplex adapter' ACP_STDIO_COMMAND='${bin}' ACP_STDIO_ARGS_JSON='[\"acp\"]' ACP_STDIO_ADAPTER_PORT=${port} KONTROL_STATE_DIR='${KONTROL_STATE_DIR}/adapters/stdio-${agent_name}' ACP_STDIO_AGENT_ENV_JSON='{\"MUSE_EXPERIMENTAL_ACP\":\"on\"}' node scripts/acp-stdio-duplex-adapter.mjs > '$log' 2>&1"
+  LAUNCHED_SESSIONS+=("$session")
+  wait_adapter_health "$label" "$port" "$session" "$log" || return 1
+  smoke_adapter "$label" "$port" "$agent_name" "$session" || return 1
+  EXPECTED_AGENT_ARGS+=(--agent "${agent_name}=http://127.0.0.1:${port}")
+}
+
+if [[ "$START_MUSE_ADAPTER" == "true" ]]; then
+  launch_muse_adapter "Muse" "kontrol-adapter-muse" "$MUSE_ACP_PORT" "$MUSE_BIN" "muse-code" "$MUSE_ADAPTER_LOG" || return 1
+fi
+
+if [[ "$START_MUSEFI_ADAPTER" == "true" ]]; then
+  launch_muse_adapter "MuseFI" "kontrol-adapter-musefi" "$MUSEFI_ACP_PORT" "$MUSEFI_BIN" "musefi" "$MUSEFI_ADAPTER_LOG" || return 1
+fi
+
+if [[ "$START_OPENMUSE_ADAPTER" == "true" ]]; then
+  launch_muse_adapter "OpenMuse" "kontrol-adapter-openmuse" "$OPENMUSE_ACP_PORT" "$OPENMUSE_BIN" "openmuse" "$OPENMUSE_ADAPTER_LOG" || return 1
+fi
+
 # Prove the registry and the real MCP tool path after adapters have registered.
 # A listening port or adapter /health response alone is not readiness.
 echo "[*] Probing registered agents and MCP workspace round-trip..."
@@ -913,11 +1101,16 @@ fi
 # capability is computed by the same policy loader used by the server and
 # tunnel launcher; this checkout fallback executes the source CLI only when
 # its immutable dist projection is stale.
-if [[ -n "${KONTROL_POLICY_CLI_PATH:-}" ]]; then
-  POLICY_COMMAND=(node "$KONTROL_POLICY_CLI_PATH")
-elif [[ -f "$DESKTOP_PWD/dist/cli.js" && -f "$DESKTOP_PWD/dist/build-meta.json" ]] \
-  && node "$DESKTOP_PWD/dist/cli.js" config effective-policy --json >/dev/null 2>&1; then
-  POLICY_COMMAND=(node "$DESKTOP_PWD/dist/cli.js")
+# Generation-pinned: compute policy from the exact immutable candidate under
+# launch. Fall back to checkout source only when the candidate CLI cannot
+# answer effective-policy (e.g. minimal test fixtures); never pick stale dist/.
+# The source loader is the same policy implementation the candidate shipped.
+if [[ -n "${KONTROL_RUNTIME_CLI_PATH:-}" && -f "${KONTROL_RUNTIME_CLI_PATH}" ]] \
+  && node "${KONTROL_RUNTIME_CLI_PATH}" config effective-policy --json >/dev/null 2>&1; then
+  POLICY_COMMAND=(node "$KONTROL_RUNTIME_CLI_PATH")
+elif [[ -n "${ACTIVE_ARTIFACT_PATH:-}" && -f "${ACTIVE_ARTIFACT_PATH}/cli.js" ]] \
+  && node "${ACTIVE_ARTIFACT_PATH}/cli.js" config effective-policy --json >/dev/null 2>&1; then
+  POLICY_COMMAND=(node "${ACTIVE_ARTIFACT_PATH}/cli.js")
 else
   POLICY_COMMAND=(node --import tsx "$DESKTOP_PWD/src/cli.ts")
 fi
@@ -939,7 +1132,8 @@ fi
 echo "[*] KONTROL readiness round-trip passed."
 
 if [[ "${KONTROL_ACP_ENABLED:-true}" != "false" ]]; then
-  STRICT_READY_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "http://${DEV_HOST}:${DEV_PORT}/readyz" 2>/dev/null || echo 000)
+  STRICT_READY_RAW=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "http://${DEV_HOST}:${DEV_PORT}/readyz" 2>/dev/null || true)
+  STRICT_READY_CODE="$(normalize_http_code "$STRICT_READY_RAW")"
   if [[ "$STRICT_READY_CODE" != "200" ]]; then
     echo "ERROR: strict KONTROL /readyz did not become ready after agent registration (HTTP $STRICT_READY_CODE)." >&2
     return 1
@@ -965,8 +1159,20 @@ if [[ "${KONTROL_TUNNEL_DOCTOR:-true}" != "false" ]]; then
 fi
 
 # --- Start tunnel ---
+# Generation-pinned: pass the exact immutable candidate's CLI and identity so
+# the wrapper never falls back to a stale dist/ projection. Output is fsynced
+# to a deployment-scoped log so a dead tmux pane still leaves diagnostics.
 echo "[*] Starting tunnel-client (profile=${KONTROL_TUNNEL_PROFILE:-sample_mcp_with_dcr}${KONTROL_TUNNEL_ID:+, tunnel=${KONTROL_TUNNEL_ID}}) ..."
-tmux new-session -d -s kontrol-tunnel -c "$DESKTOP_PWD" "$DESKTOP_PWD/scripts/kontrol-tunnel.sh"
+TUNNEL_LOG="${KONTROL_TUNNEL_LOG:-$KONTROL_STATE_DIR/tunnel.log}"
+mkdir -p -- "$(dirname -- "$TUNNEL_LOG")"
+printf -v TUNNEL_CLI_QUOTED '%q' "$ACTIVE_ARTIFACT_PATH/cli.js"
+printf -v TUNNEL_BUILD_QUOTED '%q' "$EXPECTED_BUILD_ID"
+printf -v TUNNEL_ARTIFACT_QUOTED '%q' "$ACTIVE_ARTIFACT_PATH"
+printf -v TUNNEL_STATE_QUOTED '%q' "$KONTROL_STATE_DIR"
+printf -v TUNNEL_PORT_QUOTED '%q' "${PORT:-7676}"
+printf -v TUNNEL_SCRIPT_QUOTED '%q' "$DESKTOP_PWD/scripts/kontrol-tunnel.sh"
+printf -v TUNNEL_LOG_QUOTED '%q' "$TUNNEL_LOG"
+tmux new-session -d -s kontrol-tunnel -c "$DESKTOP_PWD" "KONTROL_RUNTIME_CLI_PATH=$TUNNEL_CLI_QUOTED KONTROL_EXPECTED_BUILD_ID=$TUNNEL_BUILD_QUOTED KONTROL_ARTIFACT_PATH=$TUNNEL_ARTIFACT_QUOTED KONTROL_STATE_DIR=$TUNNEL_STATE_QUOTED PORT=$TUNNEL_PORT_QUOTED exec $TUNNEL_SCRIPT_QUOTED > $TUNNEL_LOG_QUOTED 2>&1"
 LAUNCHED_SESSIONS+=("kontrol-tunnel")
 
 # Mandatory: tunnel-client readiness. /healthz only proves the daemon exists;
@@ -976,8 +1182,18 @@ TUNNEL_OK=0
 T="000"
 R="000"
 for _ in $(seq 1 60); do
-  T=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://127.0.0.1:8080/healthz" 2>/dev/null || echo 000)
-  R=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://127.0.0.1:8080/readyz" 2>/dev/null || echo 000)
+  if ! tmux has-session -t kontrol-tunnel 2>/dev/null; then
+    echo ""
+    echo "ERROR: tunnel child exited before readiness (tmux session kontrol-tunnel gone)." >&2
+    echo "  Tunnel log: $TUNNEL_LOG" >&2
+    [[ -f "$TUNNEL_LOG" ]] && tail -n 120 "$TUNNEL_LOG" >&2 || true
+    echo "  Class: tunnel wrapper/CLI/core-readiness or daemon termination — see log tail above." >&2
+    return 1
+  fi
+  T_RAW=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://127.0.0.1:8080/healthz" 2>/dev/null || true)
+  R_RAW=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://127.0.0.1:8080/readyz" 2>/dev/null || true)
+  T="$(normalize_http_code "$T_RAW")"
+  R="$(normalize_http_code "$R_RAW")"
   if [[ "$T" == "200" && "$R" == "200" ]]; then
     TUNNEL_OK=1; break
   fi
@@ -986,7 +1202,16 @@ for _ in $(seq 1 60); do
 done
 if [[ "$TUNNEL_OK" != "1" ]]; then
   echo ""
-  echo "ERROR: tunnel MCP readiness failed (healthz=$T readyz=$R)." >&2
+  if ! tmux has-session -t kontrol-tunnel 2>/dev/null; then
+    echo "ERROR: tunnel child exited during readiness polling (healthz=$T readyz=$R)." >&2
+    echo "  Class: daemon termination (CLI/core-readiness) — see tunnel log." >&2
+  elif [[ "$T" == "200" && "$R" != "200" ]]; then
+    echo "ERROR: tunnel MCP readiness failed (healthz=$T readyz=$R; daemon alive, upstream/MCP probe not ready)." >&2
+  else
+    echo "ERROR: tunnel MCP readiness failed (healthz=$T readyz=$R; local HTTP liveness unproven)." >&2
+  fi
+  echo "  Tunnel log: $TUNNEL_LOG" >&2
+  [[ -f "$TUNNEL_LOG" ]] && tail -n 120 "$TUNNEL_LOG" >&2 || true
   echo "  Check: tunnel-client health --port 8080 --json" >&2
   return 1
 fi
@@ -1232,9 +1457,86 @@ ensure_runtime_lock_for_recovery() {
   RUNTIME_LOCK_OWNED=1
 }
 
+validate_rollback_target() {
+  # Preflight BEFORE stopping the serving generation: the recorded rollback
+  # target must exist in the expected backend store, its build ID/content
+  # metadata must match its immutable directory, and it must be a previously
+  # qualified generation — not merely a path saved in a record.
+  if [[ -z "$LAST_KNOWN_GOOD_ARTIFACT_PATH" || -z "$LAST_KNOWN_GOOD_BUILD_ID" ]]; then
+    echo "ERROR: rollback preflight failed: no last-known-good artifact recorded." >&2
+    return 1
+  fi
+  if [[ "$LAST_KNOWN_GOOD_ARTIFACT_PATH" == "$CANDIDATE_ARTIFACT_PATH" ]]; then
+    echo "ERROR: rollback preflight failed: last-known-good equals failed candidate ($LAST_KNOWN_GOOD_ARTIFACT_PATH)." >&2
+    return 1
+  fi
+  if ! resolve_artifact_path "$LAST_KNOWN_GOOD_ARTIFACT_PATH" >/dev/null 2>&1; then
+    echo "ERROR: rollback preflight failed: last-known-good artifact does not exist in an immutable releases store: $LAST_KNOWN_GOOD_ARTIFACT_PATH" >&2
+    return 1
+  fi
+  if [[ "$ARTIFACT_BUILD_ID" != "$LAST_KNOWN_GOOD_BUILD_ID" ]]; then
+    echo "ERROR: rollback preflight failed: last-known-good build mismatch (record $LAST_KNOWN_GOOD_BUILD_ID vs metadata $ARTIFACT_BUILD_ID)." >&2
+    return 1
+  fi
+  # Schema compatibility: the rollback build must be able to read the live DB
+  # (or the pre-migration backup image). Use maxReadableSchemaVersion when
+  # present; fall back to schemaVersion.
+  local rollback_schema rollback_max
+  rollback_schema="$(read_json_field "$LAST_KNOWN_GOOD_ARTIFACT_PATH/build-meta.json" schemaVersion)"
+  rollback_max="$(read_json_field "$LAST_KNOWN_GOOD_ARTIFACT_PATH/build-meta.json" maxReadableSchemaVersion)"
+  [[ -n "$rollback_max" && "$rollback_max" =~ ^[0-9]+$ ]] || rollback_max="$rollback_schema"
+  if [[ ! "$rollback_max" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: rollback preflight failed: last-known-good has no valid schema metadata." >&2
+    return 1
+  fi
+  if [[ -n "${DATABASE_ORIGINAL_SCHEMA_VERSION:-}" && "$rollback_max" =~ ^[0-9]+$ && "$DATABASE_ORIGINAL_SCHEMA_VERSION" =~ ^[0-9]+$ ]] && (( rollback_max < DATABASE_ORIGINAL_SCHEMA_VERSION )); then
+    echo "ERROR: rollback preflight failed: last-known-good schema range max $rollback_max cannot read live DB schema $DATABASE_ORIGINAL_SCHEMA_VERSION." >&2
+    return 1
+  fi
+  # Previously-qualified check: a bare record is not enough. Require at least
+  # one durable qualification signal referencing this build.
+  local qualified=0
+  if [[ -f "$GENERATION_RECORD" ]]; then
+    local gen_active gen_previous
+    gen_active="$(read_json_field "$GENERATION_RECORD" activeBuildId)"
+    gen_previous="$(read_json_field "$GENERATION_RECORD" previousBuildId)"
+    if [[ "$gen_active" == "$LAST_KNOWN_GOOD_BUILD_ID" || "$gen_previous" == "$LAST_KNOWN_GOOD_BUILD_ID" ]]; then
+      qualified=1
+    fi
+  fi
+  if [[ "$qualified" != "1" ]]; then
+    local service_json="${KONTROL_SERVICE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/kontrol}/service.json"
+    if [[ -f "$service_json" ]]; then
+      local installed_build
+      installed_build="$(read_json_field "$service_json" buildId)"
+      if [[ "$installed_build" == "$LAST_KNOWN_GOOD_BUILD_ID" ]]; then
+        qualified=1
+      fi
+    fi
+  fi
+  if [[ "$qualified" != "1" ]]; then
+    echo "ERROR: rollback preflight failed: last-known-good build $LAST_KNOWN_GOOD_BUILD_ID has no recorded qualification (not an active/previous committed generation or installed service build)." >&2
+    return 1
+  fi
+  # Verified import into tmux store happens in launch_generation before any
+  # component starts; preflight proves the source is importable.
+  echo "[*] Rollback preflight passed: $LAST_KNOWN_GOOD_BUILD_ID at $LAST_KNOWN_GOOD_ARTIFACT_PATH (backend=${ACTIVE_ARTIFACT_BACKEND:-unknown}, schema max $rollback_max)." >&2
+  return 0
+}
+
 rollback() {
   if [[ "$STARTUP_COMMITTED" == "1" ]]; then
     return 0
+  fi
+  # Transactional guarantee: validate the rollback target BEFORE stopping the
+  # previous serving generation. An invalid pointer must fail here, not after
+  # sessions are killed.
+  if [[ "$ROLLBACK_IN_PROGRESS" == "0" && "$CANDIDATE_ACTIVATION_ATTEMPTED" == "1" && -n "$LAST_KNOWN_GOOD_ARTIFACT_PATH" && "${KONTROL_ROLLBACK_ATTEMPT:-false}" != "true" ]]; then
+    if ! validate_rollback_target; then
+      echo "ERROR: rollback preflight failed; previous generation left running." >&2
+      write_generation_record "failed" "${REQUESTED_BUILD_ID:-unknown}" "" "true" "${REQUESTED_BUILD_ID:-unknown}" "rollback preflight failed before cutover" "$LAST_KNOWN_GOOD_ARTIFACT_PATH" "$COMMITTED_PREVIOUS_BUILD_ID" "$COMMITTED_PREVIOUS_ARTIFACT_PATH" "$COMMITTED_PREVIOUS_BUILD_ID" "$COMMITTED_PREVIOUS_ARTIFACT_PATH" || true
+      return 1
+    fi
   fi
   echo "[!] Rolling back launched components..." >&2
   write_deployment_record "rolling_back" "candidate activation did not reach committed readiness" "" || true
@@ -1304,6 +1606,16 @@ rollback() {
 
 on_exit() {
   local status=$?
+  # A lifecycle-fence refusal is a clean pre-launch abort, not a failed
+  # activation: release owned locks, record the refusal, and exit without
+  # entering rollback (which would restore the tmux generation and create
+  # the mixed-mode stack the fence refused).
+  if [[ "${LIFECYCLE_FENCE_REFUSED:-0}" == "1" ]]; then
+    write_deployment_record "failed" "refused: a systemd-owned Kontrol stack is already active" "failed" || true
+    cleanup
+    trap - EXIT
+    exit 1
+  fi
   if [[ "$PREPARE_ONLY" == "1" ]]; then
     if [[ "$status" != "0" ]]; then
       write_deployment_record "failed" "candidate preparation failed before activation" "failed" || true
@@ -1371,6 +1683,34 @@ fi
 export KONTROL_DEPLOYMENT_ID="$DEPLOYMENT_ID"
 export KONTROL_DEPLOYMENT_OPERATION="$([[ "$PREPARE_ONLY" == "1" ]] && echo prepare || echo activate)"
 write_deployment_record "preparing" "deployment controller owns the transaction" "" || true
+
+# Lifecycle fence: a tmux launch must refuse to create a second stack while a
+# systemd-owned Kontrol stack is already live. The decision lives in
+# src/lifecycle-coordinator.ts (via src/lifecycle-cli.ts), not in shell
+# state-machine logic. --prepare-only only builds a candidate and launches
+# nothing, so it is exempt. An explicit operator takeover
+# (KONTROL_TAKEOVER_AUTHORIZED=1) stops the conflicting stack through the
+# fenced takeover transaction first; it is never a blind bypass and remains
+# reversible by stopping the tmux stack again.
+if [[ "$PREPARE_ONLY" != "1" ]]; then
+  if [[ "${KONTROL_TAKEOVER_AUTHORIZED:-0}" == "1" ]]; then
+    if ! node --import tsx src/lifecycle-cli.ts takeover-stack --to=tmux; then
+      echo "ERROR: start-all.sh refused: the authorized takeover did not clear the conflicting stack." >&2
+      # A fence refusal must never enter rollback: restoring the tmux
+      # generation here would create exactly the mixed-mode stack refused.
+      LIFECYCLE_FENCE_REFUSED=1
+      exit 1
+    fi
+  fi
+  if ! node --import tsx src/lifecycle-cli.ts check-start --backend=tmux; then
+    echo "ERROR: start-all.sh refused: a systemd-owned Kontrol stack is already active." >&2
+    echo "Stop it first (./stop-all.sh), or set KONTROL_TAKEOVER_AUTHORIZED=1 to stop that stack through the fenced takeover before launch." >&2
+    # A fence refusal must never enter rollback: restoring the tmux
+    # generation here would create exactly the mixed-mode stack refused.
+    LIFECYCLE_FENCE_REFUSED=1
+    exit 1
+  fi
+fi
 
 # runtime.lock is the serving-owner lock. In activation mode this check is
 # intentionally after the recovery trap: restart-kontrol.sh has stopped the

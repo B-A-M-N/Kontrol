@@ -1,28 +1,23 @@
 // Final stable-beta qualification gate.
 //
-// This is intentionally a small evidence joiner. The expensive code gate,
-// wall-clock soak, and fresh external host-catalog probe run independently;
-// this command qualifies only when all evidence describes the same candidate
-// and the checkout is still clean and unchanged at the final decision point.
+// This is intentionally a small evidence joiner. The code gate, continuity
+// workload, CI-observed deployment uptime, and fresh external host-catalog
+// probe run independently; qualify only when all evidence describes the same
+// candidate and the checkout is clean and unchanged at the final decision.
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { validateBetaFaultMatrix, validateBetaSoakAssertions } from "./beta-soak-contract.mjs";
+import { MINIMUM_DEPLOYMENT_UPTIME_MS, validateBetaDeploymentUptimeReceipt, validateBetaFaultMatrix, validateBetaSoakAssertions } from "./beta-soak-contract.mjs";
 import { validateBetaExternalCatalogReceipt } from "./beta-external-catalog-contract.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const codeReceiptPath = resolve(process.env.KONTROL_BETA_CODE_RECEIPT ?? join(root, "beta-code-qualification.json"));
 const soakReportPath = resolve(process.env.KONTROL_BETA_SOAK_REPORT ?? join(root, "beta-soak.json"));
+const deploymentUptimeReceiptPath = resolve(process.env.KONTROL_BETA_DEPLOYMENT_UPTIME_RECEIPT ?? join(root, "deployment-uptime-qualification.json"));
 const externalCatalogReceiptPath = resolve(process.env.KONTROL_BETA_EXTERNAL_CATALOG_RECEIPT ?? join(root, "beta-external-catalog.json"));
 const receiptPath = resolve(process.env.KONTROL_BETA_RECEIPT ?? join(root, "beta-qualification.json"));
-const STABLE_BETA_MIN_SOAK_HOURS = 12;
-const configuredMinimumSoakHours = Number(process.env.KONTROL_BETA_MIN_SOAK_HOURS ?? STABLE_BETA_MIN_SOAK_HOURS);
-// The environment may require a longer soak, but it must never weaken the
-// stable-beta release policy.
-const minimumSoakHours = Number.isFinite(configuredMinimumSoakHours)
-  ? Math.max(STABLE_BETA_MIN_SOAK_HOURS, configuredMinimumSoakHours)
-  : STABLE_BETA_MIN_SOAK_HOURS;
+const MINIMUM_DEPLOYMENT_UPTIME_HOURS = MINIMUM_DEPLOYMENT_UPTIME_MS / 3_600_000;
 
 function gitSha() {
   try {
@@ -58,9 +53,11 @@ function writeReceipt(receipt) {
 
 const codeResult = readJson(codeReceiptPath);
 const soakResult = readJson(soakReportPath);
+const deploymentUptimeResult = readJson(deploymentUptimeReceiptPath);
 const externalCatalogResult = readJson(externalCatalogReceiptPath);
 const code = codeResult.value;
 const soak = soakResult.value;
+const deploymentUptime = deploymentUptimeResult.value;
 const externalCatalog = externalCatalogResult.value;
 const finalGitSha = gitSha();
 const finalDirtyPaths = gitStatus();
@@ -76,12 +73,19 @@ const soakAssertionCheck = validateBetaSoakAssertions(soakAssertions);
 const faultMatrixCheck = validateBetaFaultMatrix(code?.faultMatrix, { candidateBuildId });
 const soakStartedAtMs = Date.parse(soak?.startedAt ?? "");
 const soakFinishedAtMs = Date.parse(soak?.finishedAt ?? "");
-const soakDuration = Boolean(
-  Number(soak?.requestedHours) >= minimumSoakHours
-  && Number.isFinite(soakStartedAtMs)
+const soakWindowValid = Boolean(
+  Number.isFinite(soakStartedAtMs)
   && Number.isFinite(soakFinishedAtMs)
-  && soakFinishedAtMs - soakStartedAtMs >= minimumSoakHours * 60 * 60_000,
+  && soakFinishedAtMs >= soakStartedAtMs,
 );
+const uptimeChecks = deploymentUptime?.checks;
+const deploymentUptimeCheck = validateBetaDeploymentUptimeReceipt(deploymentUptime, {
+  candidateBuildId,
+  sourceSha: codeStart?.gitSha,
+  contentSha256: candidateMetadata?.contentSha256,
+  minimumCheckedAt: soak?.finishedAt,
+});
+const deploymentUptimeQualified = deploymentUptimeCheck.valid;
 
 const sourceUnchanged = Boolean(
   code?.codeQualified === true
@@ -137,14 +141,16 @@ const receipt = {
   policy: {
     cleanCheckoutRequired: true,
     matchingCodeReceiptRequired: true,
-    matchingWallClockSoakRequired: true,
+    matchingDeploymentUptimeReceiptRequired: true,
+    minimumDeploymentUptimeHours: MINIMUM_DEPLOYMENT_UPTIME_HOURS,
+    soakContinuityWorkloadRequired: true,
     diagnosticsRequired: true,
     tunnelMonitoringRequired: true,
-    minimumSoakHours,
   },
   inputs: {
     codeReceiptPath,
     soakReportPath,
+    deploymentUptimeReceiptPath,
     externalCatalogReceiptPath,
   },
   candidate: candidate ? {
@@ -170,10 +176,22 @@ const receipt = {
     assertions: soakAssertions,
     missingAssertions: soakAssertionCheck.missing,
     invalidAssertions: soakAssertionCheck.invalid,
-    duration: soakDuration,
+    windowValid: soakWindowValid,
     identity: soakIdentity,
     assertionsPass: soakAssertionsPass,
   } : { error: soakResult.error, identity: false, assertionsPass: false },
+  deploymentUptime: deploymentUptime ? {
+    status: deploymentUptime.status,
+    qualified: deploymentUptime.qualified === true,
+    path: deploymentUptimeReceiptPath,
+    startedAt: deploymentUptime.startedAt,
+    checkedAt: deploymentUptime.checkedAt,
+    uptimeMs: deploymentUptime.uptimeMs,
+    deployment: deploymentUptime.deployment,
+    checks: uptimeChecks,
+    invalidReasons: deploymentUptimeCheck.reasons,
+    valid: deploymentUptimeQualified,
+  } : { path: deploymentUptimeReceiptPath, error: deploymentUptimeResult.error, valid: false },
   externalCatalog: externalCatalog ? {
     status: externalCatalog.status,
     path: externalCatalogReceiptPath,
@@ -211,9 +229,10 @@ const receipt = {
     supervisedMissionLoopQualified: faultMatrixCheck.valid,
     candidateIdentity,
     sourceUnchanged,
-    soakDuration,
+    soakWindowValid,
     soakIdentity,
     soakAssertionsPass,
+    deploymentUptimeQualified,
     externalCatalogFresh,
   },
 };

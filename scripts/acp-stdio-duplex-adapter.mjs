@@ -12,6 +12,7 @@
 // session/prompt handshake. A custom dispatch method remains available for
 // known nonstandard ACP-compatible wrappers.
 
+import { statSync } from "node:fs";
 import { createServer } from "node:http";
 import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
@@ -20,6 +21,7 @@ import { pathToFileURL } from "node:url";
 import { clearAgentIdentity, identityHeaders, loadAgentIdentity, saveAgentIdentity } from "./lib/acp-agent-identity.mjs";
 import { readJsonBody } from "./lib/adapter-http.mjs";
 import { adapterStatePath, atomicWriteJson, prepareOwnedChild, processStartToken, reconcileOwnedProcesses, terminateProcessGroup } from "./lib/managed-agent-process.mjs";
+import { scrubAdapterDiagnostic } from "./lib/adapter-diagnostics.mjs";
 import { acknowledgeAdapterDispatchReceipt, adapterDispatchFingerprint, findAdapterDispatchReceipt, isTerminalAdapterDispatchStatus, loadAdapterDispatchReceipts, reconcileAdapterDispatchReceipts, recordAdapterDispatchReceipt } from "./lib/adapter-dispatch-receipts.mjs";
 import { createAdapterEventSpool } from "./lib/adapter-event-spool.mjs";
 import { workspaceLeaseDeadline } from "./lib/workspace-lease.mjs";
@@ -39,11 +41,35 @@ const KONTROL_ACP_URL = process.env.KONTROL_ACP_URL || "http://127.0.0.1:7676/ac
 const AGENT_SECRET = process.env.KONTROL_ACP_AGENT_SECRET;
 const ADAPTER_SECRET = process.env.KONTROL_ACP_ADAPTER_SECRET;
 const ADAPTER_HOST = process.env.ACP_STDIO_ADAPTER_HOST || "127.0.0.1";
-const ADAPTER_PORT = Number(process.env.ACP_STDIO_ADAPTER_PORT || process.env.ACP_ADAPTER_PORT || "9921");
+const ADAPTER_PORT_RAW = process.env.ACP_STDIO_ADAPTER_PORT || process.env.ACP_ADAPTER_PORT || "9921";
+const ADAPTER_PORT = Number(ADAPTER_PORT_RAW);
 const AGENT_NAME = process.env.ACP_STDIO_AGENT_NAME || "stdio-duplex-agent";
 const AGENT_DESCRIPTION = process.env.ACP_STDIO_AGENT_DESCRIPTION || "Generic stdio ACP duplex adapter";
 const AGENT_COMMAND = process.env.ACP_STDIO_COMMAND;
 const AGENT_ARGS = parseJsonArray(process.env.ACP_STDIO_ARGS_JSON) ?? [];
+// Explicit operator-authored child environment, merged over safeEnv() for
+// ordinary (non-sandboxed) agent launches. This is the only channel for
+// vendor feature gates such as MUSE_EXPERIMENTAL_ACP: readOnlyWorkerEnvironment
+// rightly refuses any name containing transport substrings like "ACP", so the
+// child-env allowlist can never carry the experimental gate. Keys must be
+// strict env identifiers and must never name credential material; values must
+// be short strings. Secrets do not belong here — the child process
+// environment is observable to the agent.
+function parseAgentEnvJson(raw) {
+  if (raw === undefined || raw === "") return {};
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { return null; }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const out = {};
+  for (const [name, value] of Object.entries(parsed)) {
+    if (!/^[A-Z][A-Z0-9_]{1,64}$/.test(name)) return null;
+    if (/(SECRET|TOKEN|PASSWORD|PRIVATE_KEY|CREDENTIAL|COOKIE|SESSION_KEY|AUTHORIZATION)/i.test(name)) return null;
+    if (typeof value !== "string" || value.length > 8192) return null;
+    out[name] = value;
+  }
+  return out;
+}
+const AGENT_ENV_EXTRA = parseAgentEnvJson(process.env.ACP_STDIO_AGENT_ENV_JSON);
 const RESUME_IDLE_TIMEOUT_MS = Math.max(1_000, Math.min(300_000,
   Number(process.env.KONTROL_ACP_RESUME_IDLE_TIMEOUT_MS) || 60_000));
 const DISPATCH_METHOD = process.env.ACP_STDIO_DISPATCH_METHOD;
@@ -78,6 +104,13 @@ const acpDuplexModuleUrl = process.env.KONTROL_ARTIFACT_PATH
   ? pathToFileURL(resolve(process.env.KONTROL_ARTIFACT_PATH, "acp-duplex.js"))
   : new URL("../dist/acp-duplex.js", import.meta.url);
 const { createAcpDuplex } = await import(acpDuplexModuleUrl);
+// Operator-authored child env is validated before anything else: a malformed
+// or credential-bearing value must never reach registration or dispatch, and
+// --validate-imports callers get the same fail-fast behavior.
+if (AGENT_ENV_EXTRA === null) {
+  console.error("[stdio-duplex] ACP_STDIO_AGENT_ENV_JSON must be a JSON object of non-credential UPPERCASE_NAME:string pairs");
+  process.exit(1);
+}
 if (VALIDATE_IMPORTS) {
   console.log("[stdio-duplex] import validation ok");
   process.exit(0);
@@ -91,8 +124,91 @@ if (!AGENT_COMMAND) {
   console.error("[stdio-duplex] ACP_STDIO_COMMAND is required");
   process.exit(1);
 }
+// Fail fast at startup: a misconfigured agent executable must never pass
+// registration only to fail every dispatch. PATH lookup matches dispatch.
+if (!resolveExecutablePath(AGENT_COMMAND)) {
+  console.error(`[stdio-duplex] ACP_STDIO_COMMAND does not resolve to an executable file: ${AGENT_COMMAND}`);
+  process.exit(1);
+}
+// Fail fast on an unusable listen port: a NaN or out-of-range port would
+// otherwise throw from .listen() after registration side effects.
+if (!Number.isInteger(ADAPTER_PORT) || ADAPTER_PORT < 1 || ADAPTER_PORT > 65535) {
+  console.error(`[stdio-duplex] ACP_STDIO_ADAPTER_PORT must be a TCP port 1-65535, got: ${ADAPTER_PORT_RAW}`);
+  process.exit(1);
+}
+if (AGENT_NAME.trim().length === 0) {
+  console.error("[stdio-duplex] ACP_STDIO_AGENT_NAME must not be blank");
+  process.exit(1);
+}
 
 const active = new Map();
+// Capability claims are scoped to the agent executable generation: a
+// replaced/upgraded/downgraded agent binary must never inherit the previous
+// binary's negotiated versions or session-load support. The fingerprint
+// covers the resolved executable path plus size and mtime, so in-place
+// replacement advances the generation even when the path is stable.
+const capabilityState = {
+  generation: 1,
+  agentExecutable: agentExecutableFingerprint(),
+  negotiatedVersions: [],
+  sessionLoadSupported: false,
+  initialized: false,
+  liveProvenVersions: [],
+};
+function agentExecutableFingerprint() {
+  try {
+    const resolved = resolveExecutablePath(AGENT_COMMAND);
+    if (!resolved) return null;
+    const st = statSync(resolved);
+    return `${resolved}|${st.size}|${st.mtimeMs}`;
+  } catch {
+    return null;
+  }
+}
+function ensureCapabilityGeneration() {
+  const current = agentExecutableFingerprint();
+  if (current !== capabilityState.agentExecutable) {
+    capabilityState.generation += 1;
+    capabilityState.agentExecutable = current;
+    capabilityState.negotiatedVersions = [];
+    capabilityState.sessionLoadSupported = false;
+    capabilityState.initialized = false;
+    capabilityState.liveProvenVersions = [];
+    // Derived claims reset with the generation: the next supported
+    // handshake re-registers reply-resume, a downgraded agent never keeps it.
+    nativeReplyResumeSupported = false;
+  }
+  return capabilityState.generation;
+}
+function markNegotiatedVersion(protocolVersion) {
+  if (!capabilityState.negotiatedVersions.includes(protocolVersion)) {
+    capabilityState.negotiatedVersions.push(protocolVersion);
+    capabilityState.negotiatedVersions.sort();
+  }
+}
+function markLiveProvenVersion(protocolVersion) {
+  if (!capabilityState.liveProvenVersions.includes(protocolVersion)) {
+    capabilityState.liveProvenVersions.push(protocolVersion);
+    capabilityState.liveProvenVersions.sort();
+  }
+}
+let lastAdapterFailure = null;
+function recordAdapterFailure(category, detail) {
+  // Externally readable health carries only a stable category, a diagnostic
+  // correlation id, and a timestamp — never raw error text, which may embed
+  // tokens, private paths, or user prompt content. The scrubbed detail stays
+  // in process logs for operators.
+  const entry = { category, id: randomUUID(), at: new Date().toISOString() };
+  if (typeof detail === "string" && detail.length > 0) {
+    console.warn(`[stdio-duplex] failure ${entry.id} [${category}]: ${scrubAdapterDiagnostic(detail).slice(0, 200)}`);
+  }
+  lastAdapterFailure = entry;
+}
+function failureCategoryFor(message) {
+  const text = typeof message === "string" ? message : "";
+  const prefix = text.split(":")[0].trim();
+  return /^[a-z][a-z0-9_]*$/.test(prefix) ? prefix : "dispatch_failed";
+}
 const ownedProcesses = new Map();
 let agentIdentity = null;
 let nativeReplyResumeSupported = false;
@@ -231,11 +347,23 @@ async function heartbeat() {
 async function handle(req, res) {
   const url = req.url || "";
   if (req.method === "GET" && url === "/health") {
+    ensureCapabilityGeneration();
     return writeJson(res, 200, {
       ok: true,
       ready: true,
       agent: AGENT_NAME,
       active: active.size,
+      negotiatedVersions: [...capabilityState.negotiatedVersions],
+      sessionLoadSupported: capabilityState.sessionLoadSupported,
+      capabilityGeneration: capabilityState.generation,
+      liveProvenVersions: [...capabilityState.liveProvenVersions],
+      capabilityStages: {
+        configured: true,
+        initialized: capabilityState.initialized,
+        negotiated: capabilityState.negotiatedVersions.length > 0,
+        liveProven: capabilityState.liveProvenVersions.length > 0,
+      },
+      ...(lastAdapterFailure ? { lastFailure: lastAdapterFailure } : {}),
       duplex: true,
       dispatchMethod: DISPATCH_METHOD || "session/prompt",
       protocolMode: DISPATCH_METHOD ? "custom" : process.env.ACP_STDIO_ENABLE_V2 === "1" ? "acp-v2-enabled" : "acp-v1",
@@ -402,7 +530,7 @@ async function handle(req, res) {
   const agentLaunch = {
     command: run.readOnlySandbox?.command ?? AGENT_COMMAND,
     args: run.readOnlySandbox?.args ?? AGENT_ARGS,
-    env: run.readOnlySandbox?.env ?? safeEnv(),
+    env: run.readOnlySandbox?.env ?? { ...safeEnv(), ...AGENT_ENV_EXTRA },
   };
 
   // Persist the idempotency claim before process creation. After a crash,
@@ -428,6 +556,7 @@ async function handle(req, res) {
   }
   active.set(run.remoteRunId, run);
   const heartbeatTimer = setInterval(() => reportEvent(run, "heartbeat"), 20_000);
+  run.heartbeatTimer = heartbeatTimer;
 
   try {
     const launchGate = await prepareOwnedChild(agentLaunch.command, agentLaunch.args, {
@@ -622,7 +751,11 @@ async function dispatchTurn(run) {
       throw new Error("ACP v2 agent did not advertise the required session capability.");
     }
     run.acpProtocolVersion = protocolVersion;
+    ensureCapabilityGeneration();
+    markNegotiatedVersion(protocolVersion);
+    capabilityState.initialized = true;
     const supportsSessionLoad = initialization.agentCapabilities?.loadSession === true;
+    if (supportsSessionLoad || protocolVersion === 2) capabilityState.sessionLoadSupported = true;
     if (!DISPATCH_METHOD && (protocolVersion === 2 || supportsSessionLoad) && !nativeReplyResumeSupported) {
       nativeReplyResumeSupported = true;
       try {
@@ -724,13 +857,47 @@ async function dispatchTurn(run) {
     const stopReason = typeof result?.stopReason === "string" ? result.stopReason : "missing";
     throw new Error(`ACP prompt did not complete successfully (stopReason: ${stopReason}).`);
   }
-  if (run.acpProtocolVersion !== 2) run.finalOutput = normalizeAcpPromptOutput(result);
+  if (run.acpProtocolVersion != null) markLiveProvenVersion(run.acpProtocolVersion);
+  if (run.acpProtocolVersion !== 2) {
+    run.finalOutput = (normalizeAcpPromptOutput(result)
+      ?? [...(run.v1AgentMessages?.values() ?? [])].join("")) || undefined;
+  }
   reportStructured(run, "output_delta", {
     channel: "result",
     ...(run.finalOutput !== undefined ? { text: run.finalOutput } : {}),
     resultType: typeof result,
   });
   run.authoritativeCompletion = true;
+  await settleSuccessfulTurn(run);
+}
+
+// An authoritative end_turn finalizes the logical run immediately: a
+// persistent ACP server stays alive after completing a turn, so waiting for
+// process exit would stall the terminal event forever. Settlement is
+// idempotent with the process-exit and cancellation paths via run.finalized
+// and removal from the active map: whoever settles first wins, and the exit
+// handler never emits a second terminal event.
+async function settleSuccessfulTurn(run) {
+  if (run.finalized) return;
+  run.finalized = true;
+  active.delete(run.remoteRunId);
+  if (run.heartbeatTimer) clearInterval(run.heartbeatTimer);
+  run.terminalDeliveryPromise = reportEvent(run, "completed", undefined, {
+    onEventCreated: (event) => { run.terminalEvent = event; },
+  });
+  const delivered = await run.terminalDeliveryPromise;
+  // Close the ACP transport, then bounded process-group shutdown. Durable
+  // process ownership is retained until shutdown is confirmed: an event
+  // receipt alone never proves the child was reaped.
+  try { run.conn?.close(); } catch { /* transport already gone */ }
+  if (run.child?.pid) {
+    await terminateProcessGroup({
+      pid: run.child.pid,
+      processGroupId: run.child.pid,
+      processStartToken: processStartToken(run.child.pid),
+    }, 5_000).catch(() => false);
+  }
+  await finalizeOwnedProcessAfterTerminal(run, run.terminalEvent, delivered);
 }
 
 async function waitForResumedSessionIdle(run) {
@@ -820,6 +987,21 @@ function createKontrolHttpHandler(run) {
             : "");
         } else if (update.sessionUpdate === "agent_message_chunk" && update.content?.type === "text" && typeof update.content.text === "string") {
           run.v2AgentMessages.set(update.messageId, (run.v2AgentMessages.get(update.messageId) ?? "") + update.content.text);
+        }
+      }
+      // ACP v1 servers (including Muse) stream turn text as agent_message /
+      // agent_message_chunk notifications while the bare session/prompt
+      // response carries only stopReason. Accumulate the streamed text so a
+      // textless response frame does not erase the turn's actual output.
+      if (run.acpProtocolVersion !== 2 && (!params?.sessionId || params.sessionId === run.acpSessionId)) {
+        if (!run.v1AgentMessages) run.v1AgentMessages = new Map();
+        if (update?.sessionUpdate === "agent_message" && typeof update?.messageId === "string") {
+          run.v1AgentMessages.set(update.messageId, Array.isArray(update.content)
+            ? update.content.filter((part) => part?.type === "text" && typeof part.text === "string").map((part) => part.text).join("")
+            : "");
+        } else if (update?.sessionUpdate === "agent_message_chunk" && update?.content?.type === "text" && typeof update.content.text === "string") {
+          const key = typeof update?.messageId === "string" ? update.messageId : "stream";
+          run.v1AgentMessages.set(key, (run.v1AgentMessages.get(key) ?? "") + update.content.text);
         }
       }
       if (run.v2TurnWaiter && params?.sessionId === run.acpSessionId
@@ -1012,6 +1194,12 @@ function createAdapterEvent(run, type, payload) {
 }
 
 function reportEvent(run, type, errorMessage, { reportAvailability, payloadOverride, onEventCreated } = {}) {
+  if (type === "failed") {
+    const detail = typeof errorMessage === "string" && errorMessage.length > 0
+      ? errorMessage
+      : (payloadOverride && typeof payloadOverride.error === "string" ? payloadOverride.error : "");
+    recordAdapterFailure(failureCategoryFor(detail), detail);
+  }
   const availability = reportAvailability ?? (typeof run.finalOutput === "string" && run.finalOutput.length > 0
     ? "available"
     : type === "completed" ? "no_output" : "unavailable");

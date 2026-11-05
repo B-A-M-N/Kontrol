@@ -1,0 +1,72 @@
+name: Deployment uptime qualification
+
+on:
+  schedule:
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
+    inputs:
+      buildId:
+        description: "Optional immutable buildId to qualify (defaults to the active deployment)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kontrol-deployment-uptime
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    name: Qualify active deployment after 12 hours
+    runs-on: [self-hosted, linux, kontrol-deployment]
+    if: github.ref == 'refs/heads/main'
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+    env:
+      KONTROL_STATE_DIR: ${{ vars.KONTROL_STATE_DIR }}
+      KONTROL_SERVICE_DATA_DIR: ${{ vars.KONTROL_SERVICE_DATA_DIR }}
+      KONTROL_QUALIFY_EXPECTED_BUILD_ID: ${{ inputs.buildId }}
+      KONTROL_QUALIFY_REPORT: ${{ runner.temp }}/deployment-uptime-qualification.json
+    steps:
+      - name: Checkout workflow source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22.19.0
+
+      - name: Inspect the active deployment
+        id: qualify
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
+            node scripts/qualify-deployment-uptime.mjs --persist
+          else
+            node scripts/qualify-deployment-uptime.mjs
+          fi
+
+      - name: Sign the qualified uptime receipt
+        if: steps.qualify.outputs.newlyQualified == 'true'
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: ${{ runner.temp }}/deployment-uptime-qualification.json
+
+      - name: Retain the qualification receipt
+        if: steps.qualify.outputs.newlyQualified == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: deployment-uptime-${{ steps.qualify.outputs.buildId }}-${{ steps.qualify.outputs.generationId }}
+          path: ${{ runner.temp }}/deployment-uptime-qualification.json
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Persist this generation's completed qualification
+        if: steps.qualify.outputs.newlyQualified == 'true'
+        run: node scripts/qualify-deployment-uptime.mjs --commit-persistent-receipt
