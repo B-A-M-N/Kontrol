@@ -14,6 +14,8 @@ const stateDir = await mkdtemp(join(tmpdir(), "kontrol-goal-tools-test-"));
 const rootA = join(stateDir, "workspace-a");
 const rootB = join(stateDir, "workspace-b");
 const config = loadConfig({
+  KONTROL_CONFIG_DIR: join(stateDir, "config"),
+  KONTROL_AUTH_MODE: "oauth",
   KONTROL_ALLOWED_ROOTS: stateDir,
   KONTROL_TOOL_MODE: "codex",
   KONTROL_WIDGETS: "off",
