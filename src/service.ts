@@ -809,8 +809,11 @@ export function renderComponentServiceUnit(options: {
  * Every member starts with the target (Wants) and stops with it (each
  * member carries PartOf=kontrol.target); the core is additionally Required
  * so a dead core fails the aggregate instead of reporting a healthy stack.
- * Shutdown propagation relies on the members' PartOf, not on BindsTo here,
- * so an auxiliary failure degrades the stack without killing the core.
+ * The core also carries PartOf=kontrol.target so stopping the target drains
+ * the whole stack, which the lifecycle stop verification requires (a target
+ * stop alone never stops a Wants-only unit). Shutdown propagation relies on
+ * PartOf, not on BindsTo here, so an auxiliary failure degrades the stack
+ * without killing the core.
  */
 export function renderKontrolTargetUnit(memberUnits: string[], coreUnit: string): string {
   const wanted = [...new Set([coreUnit, ...memberUnits])];
@@ -841,6 +844,7 @@ export function renderUserServiceUnit(options: {
   return [
     "[Unit]",
     "Description=Kontrol local MCP core",
+    "PartOf=kontrol.target",
     "After=default.target",
     "StartLimitIntervalSec=60",
     "StartLimitBurst=5",
@@ -1056,7 +1060,7 @@ async function activate(paths: ServicePaths, operation: "start" | "stop" | "rest
     if (operation === "stop") {
       systemctl(paths, ["stop", "kontrol.target"], dependencies);
       const components = readServiceComponents(env);
-      verifyStackStopped(buildLifecycleManifest({ coreServiceName: paths.serviceName, components }), dependencies);
+      await verifyStackStopped(buildLifecycleManifest({ coreServiceName: paths.serviceName, components }), dependencies);
     } else {
       // Refuse to (re)start a build that cannot read the live database
       // instead of launching another doomed start loop.
@@ -1093,10 +1097,21 @@ function stackStopScope(manifest: { systemdUnit: string }[]): string[] {
 }
 
 /** Throw when any owned unit survived a stack stop; success means gone. */
-function verifyStackStopped(manifest: { systemdUnit: string }[], dependencies: ServiceCommandDependencies): void {
-  const survivors = stackStopScope(manifest).filter((unit) => probeUnitActive(unit, dependencies));
-  if (survivors.length > 0) {
-    throw new Error(`stop did not fully shut down the owned stack; still active: ${survivors.join(", ")}`);
+/**
+ * Bounded stop verification: stopping the target only starts the drain
+ * (PartOf units exit asynchronously; the core takes ~0.5s with a live
+ * session attached), so poll briefly instead of failing on the first probe
+ * while a unit is still deactivating. A unit that never drains still fails.
+ */
+async function verifyStackStopped(manifest: { systemdUnit: string }[], dependencies: ServiceCommandDependencies, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const survivors = stackStopScope(manifest).filter((unit) => probeUnitActive(unit, dependencies));
+    if (survivors.length === 0) return;
+    if (Date.now() >= deadline) {
+      throw new Error(`stop did not fully shut down the owned stack; still active: ${survivors.join(", ")}`);
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
   }
 }
 
@@ -1397,7 +1412,7 @@ async function upgrade(paths: ServicePaths, dependencies: ServiceCommandDependen
       if (members.length > 0) systemctl(paths, ["enable", ...members], dependencies);
       record = updateDeploymentRecord(paths, record, { stage: "stop" });
       systemctl(paths, ["stop", "kontrol.target"], dependencies);
-      verifyStackStopped(manifest, dependencies);
+      await verifyStackStopped(manifest, dependencies);
       // No obsolete managed member may survive: removal ends stopped.
       verifyNoObsoleteSurvivors(removedMembers, dependencies);
       record = updateDeploymentRecord(paths, record, { stage: "activate" });
@@ -1413,7 +1428,7 @@ async function upgrade(paths: ServicePaths, dependencies: ServiceCommandDependen
         // Do not touch the live database until systemd confirms that the
         // candidate stack is stopped and no longer owns the runtime lock.
         systemctl(paths, ["stop", "kontrol.target"], dependencies);
-        verifyStackStopped(manifest, dependencies);
+        await verifyStackStopped(manifest, dependencies);
         const databaseRestore = restoreDeploymentDatabaseBackup({
           stateDir: paths.stateDir,
           deploymentId,
@@ -1793,9 +1808,13 @@ export async function runServiceCommand(args: string[], env: NodeJS.ProcessEnv =
     if (explicitPort !== undefined && (!Number.isInteger(explicitPort) || explicitPort <= 0 || explicitPort > 65535)) {
       throw new Error("Usage: kontrol service wait-core-ready [--port N] (1-65535)");
     }
-    // Backend-aware: tmux launcher passes the exact candidate identity; the
-    // systemd path (no explicit flags) keeps the installed-service behavior.
-    const tmuxIdentity = expectedBuildId !== undefined || expectedArtifactPath !== undefined || portFlag !== undefined || stateDirFlag !== undefined;
+    // Backend-aware: tmux launcher passes the exact candidate identity as
+    // flags; the systemd path (no explicit flags) keeps the installed-service
+    // behavior. Classify on flags only: component units export
+    // KONTROL_EXPECTED_BUILD_ID in their environment, which must not be
+    // mistaken for a tmux candidate identity (that misclassification made
+    // the tunnel gate demand --artifact-path and fail every systemd start).
+    const tmuxIdentity = flagValue("--expected-build-id") !== undefined || flagValue("--artifact-path") !== undefined || portFlag !== undefined || stateDirFlag !== undefined;
     if (tmuxIdentity) {
       if (!expectedBuildId || !expectedArtifactPath) {
         throw new Error("wait-core-ready with explicit identity requires --expected-build-id and --artifact-path (tmux candidate identity)");

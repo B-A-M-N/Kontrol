@@ -48,6 +48,9 @@ assert.match(unit, /EnvironmentFile=.*environment with spaces/);
 assert.doesNotMatch(unit, /EnvironmentFile="/);
 assert.doesNotMatch(unit, /EnvironmentFile=-/);
 assert.match(unit, /RestartPreventExitStatus=78/);
+// Target stop drains the whole stack, core included: the lifecycle stop
+// verification requires it, and the mini-systemd model assumes it.
+assert.match(unit, /PartOf=kontrol\.target/);
 assert.match(unit, /Environment="KONTROL_ARTIFACT_PATH=.*release with spaces"/);
 assert.match(normalizedUnitPaths, /ExecStart=\/usr\/bin\/env node ".*release with spaces\/cli\.js" serve/);
 assert.doesNotMatch(unit, /tsx|src\/config|kontrol-user-service\.sh/);
@@ -512,6 +515,14 @@ try {
         /still active/,
         "partial shutdown is a failure, not a success",
       );
+      // A draining stack (PartOf stop propagates, the core exits ~0.5s
+      // later) passes: the verification polls briefly instead of failing
+      // on the first probe while the core is still deactivating.
+      {
+        let probes = 0;
+        await runServiceCommand(["stop"], env, { ...baseDeps, probeUnitActive: () => ++probes <= 3 });
+        assert.ok(probes > 1, "stop verification polls while the stack drains");
+      }
     }
 
     // 4. Start preflight refuses a build that cannot read the live database.
@@ -1253,6 +1264,47 @@ try {
         workingDirectory: "/w",
       });
       assert.doesNotMatch(coreUnit, /ExecStartPre/);
+      assert.match(coreUnit, /PartOf=kontrol\.target/);
+    }
+
+    // 23. wait-core-ready classifies identity on flags, not environment:
+    // a systemd unit exports KONTROL_EXPECTED_BUILD_ID without flags, so
+    // the gate must use the installed service, not demand --artifact-path.
+    // A partial explicit identity (one flag only) still fails closed.
+    {
+      const env = gateEnv("wait-core-ready-env-identity");
+      const coreServer = createHttpServer((_req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end('{"ok":true}');
+      });
+      await new Promise<void>((resolve) => coreServer.listen(0, "127.0.0.1", () => resolve()));
+      const corePort = (coreServer.address() as { port: number }).port;
+      try {
+        mkdirSync(join(gateRoot, "wait-core-ready-env-identity"), { recursive: true });
+        writeFileSync(join(gateRoot, "wait-core-ready-env-identity", "environment"), `PORT=${corePort}\n`, { mode: 0o600 });
+        writeKontrolConfig({ serviceComponents: [{ name: "cache", kind: "adapter", command: ["node", "agent.js"] }] }, env);
+        const deps: GateDeps = {
+          currentArtifactPath: () => freshArtifact,
+          requireSystemd: () => undefined,
+          systemctl: () => undefined,
+          waitForReady: async () => undefined,
+          probeUnit: () => "active",
+        };
+        await runServiceCommand(["install"], env, deps);
+        const fixturePaths = servicePaths(env);
+        const installed = JSON.parse(readFileSync(fixturePaths.statePath, "utf8")) as { buildId: string; artifactPath: string };
+        writeFileSync(join(fixturePaths.stateDir, "server.identity.json"), JSON.stringify({ buildId: installed.buildId, artifactPath: installed.artifactPath }));
+        // Environment-only identity (what a systemd component unit exports):
+        // no flags, so the installed-service path is used and the gate passes.
+        await runServiceCommand(["wait-core-ready", "--timeout-ms", "5000"], { ...env, KONTROL_EXPECTED_BUILD_ID: installed.buildId }, deps);
+        // One explicit flag without its pair still fails closed.
+        await assert.rejects(
+          () => runServiceCommand(["wait-core-ready", "--timeout-ms", "5000", "--expected-build-id", installed.buildId], env, deps),
+          /requires --expected-build-id and --artifact-path/,
+        );
+      } finally {
+        await new Promise<void>((resolve) => coreServer.close(() => resolve()));
+      }
     }
 
     // 22b. The channel probe parses the live /api/status shape: an enabled
