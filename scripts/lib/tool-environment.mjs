@@ -27,6 +27,11 @@ const ORDINARY_KEYS = new Set([
   "TMPDIR",
   "TMP",
   "TEMP",
+  // Session bus for user systemd probes (systemctl --user). Not a secret;
+  // stripping it makes lifecycle probes report unknown and correctly refuse,
+  // which breaks isolated deployment-transaction tests.
+  "DBUS_SESSION_BUS_ADDRESS",
+  "XDG_RUNTIME_DIR",
   "LANG",
   "LC_ALL",
   "LC_CTYPE",
@@ -72,6 +77,9 @@ const ORDINARY_KEYS = new Set([
 ]);
 
 export function isControlPlaneEnvironmentKey(key) {
+  // DBUS_SESSION_BUS_ADDRESS is a socket path, not a session credential; the
+  // broad SESSION match must not strip it or systemctl --user probes fail.
+  if (key === "DBUS_SESSION_BUS_ADDRESS") return false;
   return /(?:KONTROL|ACP|OAUTH|REVIEWER|DIAGNOSTIC|TUNNEL|SECRET|TOKEN|PASSWORD|CREDENTIAL|PRIVATE_KEY|COOKIE|SESSION)/i.test(key);
 }
 
