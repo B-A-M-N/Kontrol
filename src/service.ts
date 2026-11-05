@@ -108,6 +108,16 @@ function defaultStateDir(env: NodeJS.ProcessEnv): string {
   return resolve(env.KONTROL_STATE_DIR ?? files.config.stateDir ?? defaultDataRoot(env));
 }
 
+/**
+ * Systemd-backend ownership: dataRoot + releasesRoot are the *installed*
+ * store (~/.local/share/kontrol/releases). The tmux/source-checkout launcher
+ * (start-all.sh) owns a separate store at <checkout>/releases. The two stores
+ * are never interchangeable: a tmux launch that selects a systemd artifact
+ * must import it (verified, atomic) into the tmux store before activation,
+ * and must never mutate service.json / the installed record as a shortcut.
+ * stateDir (shared generation.json) lives under the same data root by default,
+ * which is why artifact ownership must be explicit in the record.
+ */
 export function servicePaths(env: NodeJS.ProcessEnv = process.env): ServicePaths {
   const configHome = resolve(env.XDG_CONFIG_HOME ?? join(homedir(), ".config"));
   const serviceName = env.KONTROL_USER_SERVICE_NAME?.trim() || "kontrol-core.service";
@@ -1770,7 +1780,38 @@ export async function runServiceCommand(args: string[], env: NodeJS.ProcessEnv =
   if (command === "wait-core-ready") {
     const timeoutFlag = args.indexOf("--timeout-ms");
     const timeoutMs = timeoutFlag === -1 ? TUNNEL_CORE_WAIT_TIMEOUT_MS : Number(args[timeoutFlag + 1]);
-    if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) throw new Error("Usage: kontrol service wait-core-ready [--timeout-ms N]");
+    if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) throw new Error("Usage: kontrol service wait-core-ready [--timeout-ms N] [--expected-build-id ID] [--artifact-path PATH] [--port N] [--state-dir DIR]");
+    const flagValue = (name: string): string | undefined => {
+      const index = args.indexOf(name);
+      return index === -1 ? undefined : args[index + 1];
+    };
+    const expectedBuildId = flagValue("--expected-build-id") ?? env.KONTROL_EXPECTED_BUILD_ID;
+    const expectedArtifactPath = flagValue("--artifact-path") ?? env.KONTROL_ARTIFACT_PATH;
+    const portFlag = flagValue("--port");
+    const stateDirFlag = flagValue("--state-dir");
+    const explicitPort = portFlag !== undefined ? Number(portFlag) : (env.PORT ? Number(env.PORT) : undefined);
+    if (explicitPort !== undefined && (!Number.isInteger(explicitPort) || explicitPort <= 0 || explicitPort > 65535)) {
+      throw new Error("Usage: kontrol service wait-core-ready [--port N] (1-65535)");
+    }
+    // Backend-aware: tmux launcher passes the exact candidate identity; the
+    // systemd path (no explicit flags) keeps the installed-service behavior.
+    const tmuxIdentity = expectedBuildId !== undefined || expectedArtifactPath !== undefined || portFlag !== undefined || stateDirFlag !== undefined;
+    if (tmuxIdentity) {
+      if (!expectedBuildId || !expectedArtifactPath) {
+        throw new Error("wait-core-ready with explicit identity requires --expected-build-id and --artifact-path (tmux candidate identity)");
+      }
+      const stateDir = stateDirFlag ?? env.KONTROL_STATE_DIR ?? paths.stateDir;
+      const port = explicitPort ?? readInstalledPort(paths);
+      await waitForCoreReady({
+        stateDir,
+        port,
+        expectedBuildId,
+        expectedArtifactPath,
+        timeoutMs,
+      });
+      console.log(`core ready: build ${expectedBuildId} (tmux candidate)`);
+      return;
+    }
     const installed = readInstalledState(paths);
     if (!installed) throw new Error("No installed Kontrol service; run `kontrol service install` first.");
     await waitForCoreReady({

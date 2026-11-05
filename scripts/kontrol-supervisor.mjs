@@ -680,7 +680,7 @@ function buildComponents({ kontrolUrl, tunnelUrl, agents, crushPort, hermesPort,
       urls: [{ url: `${tunnelUrl}/healthz`, timeoutMs: DEFAULT_PROBE_TIMEOUT_MS }],
       readinessUrls: [{ url: `${tunnelUrl}/readyz`, timeoutMs: TUNNEL_READINESS_TIMEOUT_MS }],
       session: "kontrol-tunnel",
-      command: "exec scripts/kontrol-tunnel.sh",
+      command: `${environmentPrelude} ${identityEnv} export KONTROL_POLICY_CLI_PATH=${shellQuote(join(artifactPath, "cli.js"))} KONTROL_STATE_DIR=${shellQuote(process.env.KONTROL_STATE_DIR || "")} PORT=${shellQuote(process.env.PORT || "7676")}; exec bash scripts/kontrol-tunnel.sh >> ${shellQuote(join(process.env.KONTROL_STATE_DIR || ".kontrol-state", "tunnel.log"))} 2>&1`,
     },
   };
   if (startCrush) {

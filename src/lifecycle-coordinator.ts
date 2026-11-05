@@ -239,6 +239,66 @@ export function planFencedTakeover(request: StackStartRequest): FencedTakeoverPl
   };
 }
 
+// ── Tunnel ownership ──────────────────────────────────────────────────
+
+export interface TunnelObservation {
+  /** Observed owner from BackendSnapshot: which backend owns the tunnel unit/session. */
+  owningBackend: "systemd" | "tmux" | "none" | "unknown";
+  /** Tunnel health port observed listening (e.g. 8080), if any. */
+  healthPort?: number;
+  /** Application-level channel state (from probeTunnelChannel in service.ts). */
+  channelOperational?: boolean;
+  /** Profile the observed tunnel was started with, when known. */
+  profile?: string;
+  /** Configured MCP target the observed tunnel points at, when known. */
+  mcpTarget?: string;
+  /** Own lookup errors; never conflate with absence. */
+  probeErrors?: string[];
+}
+
+export interface TunnelExpectation {
+  requestedBackend: "systemd" | "tmux";
+  expectedProfile: string;
+  expectedMcpTarget: string;
+  healthPort: number;
+}
+
+export type TunnelReuseDecision = { ok: true; reason: string } | { ok: false; reason: string };
+
+/**
+ * Decide whether an existing tunnel may be reused. A process-alive tunnel with
+ * a disabled channel, a foreign backend owner, a mismatched profile/MCP
+ * target, or an unrelated daemon on the same port must never be assumed to
+ * belong to this deployment. No bypass: reuse requires all four checks.
+ */
+export function decideTunnelReuse(observation: TunnelObservation, expected: TunnelExpectation): TunnelReuseDecision {
+  if (observation.owningBackend === "unknown") {
+    return { ok: false, reason: `refusing tunnel reuse: tunnel ownership unknown (${(observation.probeErrors ?? []).join("; ") || "probe unavailable"}); refusing to assume an unrelated daemon belongs to this deployment` };
+  }
+  if (observation.owningBackend === "none") {
+    return { ok: false, reason: "no existing tunnel; start a new tunnel (not a reuse)" };
+  }
+  if (observation.owningBackend !== expected.requestedBackend) {
+    return {
+      ok: false,
+      reason: `refusing tunnel reuse: tunnel owned by ${observation.owningBackend} backend but ${expected.requestedBackend} launch requested; stop the foreign tunnel first (fenced takeover)`,
+    };
+  }
+  if (observation.healthPort !== undefined && observation.healthPort !== expected.healthPort) {
+    return { ok: false, reason: `refusing tunnel reuse: observed tunnel on port ${observation.healthPort}, expected ${expected.healthPort}` };
+  }
+  if (observation.profile !== undefined && observation.profile !== expected.expectedProfile) {
+    return { ok: false, reason: `refusing tunnel reuse: observed profile ${observation.profile}, expected ${expected.expectedProfile}` };
+  }
+  if (observation.mcpTarget !== undefined && observation.mcpTarget !== expected.expectedMcpTarget) {
+    return { ok: false, reason: `refusing tunnel reuse: observed MCP target ${observation.mcpTarget}, expected ${expected.expectedMcpTarget}` };
+  }
+  if (observation.channelOperational !== true) {
+    return { ok: false, reason: `refusing tunnel reuse: main MCP channel is not operational; a process-alive tunnel with a disabled channel must be recovered, not reused` };
+  }
+  return { ok: true, reason: `tunnel owned by ${observation.owningBackend}, profile ${expected.expectedProfile}, target ${expected.expectedMcpTarget}, channel operational — safe to reuse` };
+}
+
 // ── Aggregate status ──────────────────────────────────────────────────
 
 export type LifecycleVerdict = "READY" | "RUNNING" | "DEGRADED" | "BLOCKED" | "STOPPED";
