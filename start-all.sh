@@ -747,6 +747,7 @@ node --import tsx src/runtime-lock.ts update \
   --artifact-path "$ACTIVE_ARTIFACT_PATH" \
   --port "$DEV_PORT"
 export KONTROL_ARTIFACT_PATH="$ACTIVE_ARTIFACT_PATH"
+export KONTROL_RUNTIME_CLI_PATH="$ACTIVE_ARTIFACT_PATH/cli.js"
 CRUSH_ACP_PORT="${ACP_ADAPTER_PORT:-9877}"
 HERMES_ACP_PORT="${HERMES_ACP_ADAPTER_PORT:-9911}"
 HERMES_ACP_COMPAT_PATH="$DESKTOP_PWD/scripts/hermes-acp-compat"
@@ -1100,11 +1101,12 @@ fi
 # capability is computed by the same policy loader used by the server and
 # tunnel launcher; this checkout fallback executes the source CLI only when
 # its immutable dist projection is stale.
-if [[ -n "${KONTROL_POLICY_CLI_PATH:-}" ]]; then
-  POLICY_COMMAND=(node "$KONTROL_POLICY_CLI_PATH")
-elif [[ -f "$DESKTOP_PWD/dist/cli.js" && -f "$DESKTOP_PWD/dist/build-meta.json" ]] \
-  && node "$DESKTOP_PWD/dist/cli.js" config effective-policy --json >/dev/null 2>&1; then
-  POLICY_COMMAND=(node "$DESKTOP_PWD/dist/cli.js")
+# Generation-pinned: always compute policy from the exact immutable candidate
+# under launch; never select a stale dist/ projection because it can answer.
+if [[ -n "${KONTROL_RUNTIME_CLI_PATH:-}" && -f "${KONTROL_RUNTIME_CLI_PATH}" ]]; then
+  POLICY_COMMAND=(node "$KONTROL_RUNTIME_CLI_PATH")
+elif [[ -n "${ACTIVE_ARTIFACT_PATH:-}" && -f "${ACTIVE_ARTIFACT_PATH}/cli.js" ]]; then
+  POLICY_COMMAND=(node "${ACTIVE_ARTIFACT_PATH}/cli.js")
 else
   POLICY_COMMAND=(node --import tsx "$DESKTOP_PWD/src/cli.ts")
 fi
@@ -1166,7 +1168,7 @@ printf -v TUNNEL_STATE_QUOTED '%q' "$KONTROL_STATE_DIR"
 printf -v TUNNEL_PORT_QUOTED '%q' "${PORT:-7676}"
 printf -v TUNNEL_SCRIPT_QUOTED '%q' "$DESKTOP_PWD/scripts/kontrol-tunnel.sh"
 printf -v TUNNEL_LOG_QUOTED '%q' "$TUNNEL_LOG"
-tmux new-session -d -s kontrol-tunnel -c "$DESKTOP_PWD" "KONTROL_POLICY_CLI_PATH=$TUNNEL_CLI_QUOTED KONTROL_EXPECTED_BUILD_ID=$TUNNEL_BUILD_QUOTED KONTROL_ARTIFACT_PATH=$TUNNEL_ARTIFACT_QUOTED KONTROL_STATE_DIR=$TUNNEL_STATE_QUOTED PORT=$TUNNEL_PORT_QUOTED exec $TUNNEL_SCRIPT_QUOTED > $TUNNEL_LOG_QUOTED 2>&1"
+tmux new-session -d -s kontrol-tunnel -c "$DESKTOP_PWD" "KONTROL_RUNTIME_CLI_PATH=$TUNNEL_CLI_QUOTED KONTROL_EXPECTED_BUILD_ID=$TUNNEL_BUILD_QUOTED KONTROL_ARTIFACT_PATH=$TUNNEL_ARTIFACT_QUOTED KONTROL_STATE_DIR=$TUNNEL_STATE_QUOTED PORT=$TUNNEL_PORT_QUOTED exec $TUNNEL_SCRIPT_QUOTED > $TUNNEL_LOG_QUOTED 2>&1"
 LAUNCHED_SESSIONS+=("kontrol-tunnel")
 
 # Mandatory: tunnel-client readiness. /healthz only proves the daemon exists;

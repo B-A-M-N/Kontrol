@@ -61,15 +61,15 @@ fi
 # `config effective-policy` — a stale dist/ projection (e.g. schema 53 build)
 # lacks `service wait-core-ready` and would make `tunnel-client run` unreachable.
 POLICY_CLI=""
-if [[ -n "${KONTROL_POLICY_CLI_PATH:-}" ]]; then
-  POLICY_CLI="$KONTROL_POLICY_CLI_PATH"
+if [[ -n "${KONTROL_RUNTIME_CLI_PATH:-}" ]]; then
+  POLICY_CLI="$KONTROL_RUNTIME_CLI_PATH"
 elif [[ -n "${KONTROL_ARTIFACT_PATH:-}" && -f "${KONTROL_ARTIFACT_PATH}/cli.js" ]]; then
   POLICY_CLI="${KONTROL_ARTIFACT_PATH}/cli.js"
 fi
 # No explicit artifact: fail closed when a generation identity is expected,
 # rather than guessing a possibly-stale dist/ projection.
 if [[ -z "$POLICY_CLI" && -n "${KONTROL_EXPECTED_BUILD_ID:-}" ]]; then
-  echo "ERROR: Kontrol CLI is unavailable for expected build $KONTROL_EXPECTED_BUILD_ID; set KONTROL_POLICY_CLI_PATH or KONTROL_ARTIFACT_PATH to the selected immutable candidate." >&2
+  echo "ERROR: Kontrol CLI is unavailable for expected build $KONTROL_EXPECTED_BUILD_ID; set KONTROL_RUNTIME_CLI_PATH or KONTROL_ARTIFACT_PATH to the selected immutable candidate." >&2
   exit 1
 fi
 if [[ -z "$POLICY_CLI" ]]; then

@@ -24,7 +24,17 @@ assert.ok(!tunnelScript.includes('node "${DESKTOP_PWD}/dist/cli.js" config effec
 const startScript = readText("start-all.sh");
 assert.match(startScript, /normalize_http_code/, "start-all.sh must normalize HTTP codes (000000 fix)");
 assert.ok(!startScript.includes('|| echo 000)'), "start-all.sh must not append a second 000 to curl output");
-assert.match(startScript, /KONTROL_POLICY_CLI_PATH/, "launcher must pass generation-pinned CLI to tunnel");
+assert.match(startScript, /KONTROL_RUNTIME_CLI_PATH/, "launcher must pass generation-pinned CLI to tunnel");
+assert.ok(!startScript.includes("KONTROL_POLICY_CLI_PATH"), "launcher must not use POLICY-prefixed CLI var (trips strict policy scanner)");
+assert.ok(!tunnelScript.includes("KONTROL_POLICY_CLI_PATH"), "tunnel wrapper must not use POLICY-prefixed CLI var");
+// Policy scanner must ignore the runtime CLI var (no KONTROL_POLICY_ prefix)
+// but still fail closed on genuinely unknown KONTROL_POLICY_* keys.
+{
+  const { loadPolicyConfig } = await import("./policy.js");
+  const cfg = loadPolicyConfig({ KONTROL_RUNTIME_CLI_PATH: "/tmp/cli.js", KONTROL_POLICY_MODE: "allow" });
+  assert.equal(cfg.defaultMode, "allow", "runtime CLI var must not be treated as unknown policy key");
+  assert.throws(() => loadPolicyConfig({ KONTROL_POLICY_FOO: "allow" }), /Unknown policy configuration key/, "unknown policy keys still fail closed");
+}
 assert.match(startScript, /tunnel child exited/, "launcher must detect dead tunnel child");
 assert.match(startScript, /Tunnel log:/, "launcher must report durable tunnel log");
 assert.match(startScript, /validate_rollback_target/, "launcher must preflight rollback before cutover");
