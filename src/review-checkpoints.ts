@@ -334,10 +334,23 @@ export function createReviewCheckpointManager(options: {
 
       state.gitRoot = eligibility.gitRoot;
       state.workspaceRelativePath = relative(eligibility.gitRoot, root) || ".";
-      const commit = await createWorkingTreeSnapshot(eligibility.gitRoot, state.workspaceRelativePath);
-      await git(eligibility.gitRoot, ["update-ref", state.openRef, commit]);
-      await git(eligibility.gitRoot, ["update-ref", state.presentationRef, commit]);
-      await git(eligibility.gitRoot, ["update-ref", state.legacyBaselineRef, commit]);
+      // Git refs are the durable checkpoint journal for this workspace. A
+      // fresh manager is created after a server restart, so replacing these
+      // refs unconditionally would advance the review baseline to the current
+      // tree and hide edits that were made before the restart. Capture a new
+      // baseline only for a workspace with no persisted open ref; initialize
+      // missing compatibility/presentation refs from that durable baseline.
+      const hadOpenBaseline = await hasRef(eligibility.gitRoot, state.openRef);
+      if (!hadOpenBaseline) {
+        const commit = await createWorkingTreeSnapshot(eligibility.gitRoot, state.workspaceRelativePath);
+        await git(eligibility.gitRoot, ["update-ref", state.openRef, commit]);
+      } else {
+        // A ref that exists but no longer resolves is corruption, not an
+        // invitation to silently replace the review baseline.
+        await git(eligibility.gitRoot, ["rev-parse", "--verify", `${state.openRef}^{commit}`]);
+      }
+      await ensureRef(eligibility.gitRoot, state.presentationRef, state.openRef);
+      await ensureRef(eligibility.gitRoot, state.legacyBaselineRef, state.openRef);
       // P1 #15: Clear diagnostic on success
       state.diagnostic = undefined;
       state.backend = new GitCheckpointBackend();
@@ -897,6 +910,19 @@ function sessionBaselineRef(workspaceId: string, workSessionId: string | undefin
   const workspaceSegment = safeWorkspaceRefSegment(workspaceId);
   const sessionSegment = workSessionId ? safeWorkspaceRefSegment(workSessionId) : "_legacy";
   return `refs/kontrol/session/${workspaceSegment}/${sessionSegment}/baseline`;
+}
+
+async function hasRef(gitRoot: string, ref: string): Promise<boolean> {
+  try {
+    await git(gitRoot, ["show-ref", "--verify", "--quiet", ref]);
+    return true;
+  } catch (error) {
+    const exitCode = error !== null && typeof error === "object"
+      ? (error as { code?: unknown }).code
+      : undefined;
+    if (exitCode === 1) return false;
+    throw error;
+  }
 }
 
 async function ensureRef(gitRoot: string, ref: string, fallbackRef: string): Promise<void> {

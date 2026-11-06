@@ -55,6 +55,33 @@ try {
   await writeFile(join(root, "README.md"), "hello\nworld\n");
   await writeFile(join(root, "new.txt"), "new\n");
 
+  // A new checkpoint manager models a Kontrol process restart. Persisted Git
+  // refs must retain the workspace-open and last-shown baselines so work made
+  // before restart remains visible for review afterward.
+  const restartedManager = createReviewCheckpointManager();
+  await restartedManager.initializeWorkspace({ workspaceId: "ws_review", root });
+  const changesAfterRestart = await restartedManager.reviewChanges({
+    workspaceId: "ws_review",
+    root,
+    markReviewed: false,
+  });
+  assert.equal(changesAfterRestart.summary.files, 2,
+    "restart must not advance the persisted baseline over unreviewed changes");
+  assert.equal(changesAfterRestart.files.some((file) => file.path === "README.md"), true);
+  assert.equal(changesAfterRestart.files.some((file) => file.path === "new.txt"), true);
+
+  // Repeat initialization is idempotent: a third manager still sees the
+  // original baseline (failure-recovery: init never silently rebaselines).
+  const thirdManager = createReviewCheckpointManager();
+  await thirdManager.initializeWorkspace({ workspaceId: "ws_review", root });
+  const changesAfterThirdInit = await thirdManager.reviewChanges({
+    workspaceId: "ws_review",
+    root,
+    markReviewed: false,
+  });
+  assert.equal(changesAfterThirdInit.summary.files, 2,
+    "repeat initialization must be idempotent");
+
   const firstReview = await manager.reviewChanges({
     workspaceId: "ws_review",
     root,
