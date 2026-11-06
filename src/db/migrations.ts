@@ -139,6 +139,7 @@ const migrations: Migration[] = [
   { version: 114, name: "review-route-skill-provenance", up: migrateReviewRouteSkillProvenance },
   { version: 115, name: "review-browser-partial-observations", up: migrateReviewBrowserPartialObservations },
   { version: 116, name: "review-browser-terminal-outcome", up: migrateReviewBrowserTerminalOutcome },
+  { version: 117, name: "review-mutation-reassessments", up: migrateReviewMutationReassessments },
 ];
 
 function migrateWorkspaceGoals(sqlite: Database.Database): void {
@@ -338,6 +339,27 @@ function migrateDurableReviewMutationProvenance(sqlite: Database.Database): void
     );
     create index if not exists review_mutation_provenance_scope_idx
       on review_mutation_provenance(workspace_id, work_session_id, state, created_at);
+  `);
+}
+
+function migrateReviewMutationReassessments(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists review_mutation_reassessments (
+      id text primary key not null,
+      workspace_id text not null,
+      work_session_id text not null default '',
+      operation_ids_json text not null,
+      snapshot_kind text not null,
+      snapshot_ref text not null,
+      fresh_coverage_status text not null,
+      reviewer_authority text not null,
+      reviewer_principal_id text,
+      reviewer_owner_context_id text,
+      reason text not null,
+      created_at text not null
+    );
+    create index if not exists review_mutation_reassessments_scope_idx
+      on review_mutation_reassessments(workspace_id, work_session_id, created_at);
   `);
 }
 

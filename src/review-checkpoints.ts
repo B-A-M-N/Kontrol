@@ -239,6 +239,24 @@ export interface ReviewCheckpointManager {
   checkpointCoverage(input: { workspaceId: string; root: string; workSessionId?: string }): Promise<CheckpointCoverage>;
   /** Drop one work-session ledger, or the direct/unscoped ledger when omitted. */
   clearRecordedMutations(input: { workspaceId: string; workSessionId?: string }): Promise<void>;
+  /**
+   * Explicit, audited recovery for unknown shell mutation provenance.
+   * Verifies the inspected snapshot against the live workspace, records a
+   * fresh coverage assessment, and supersedes the scope's unknown
+   * provenance operations. Original unknown rows are preserved as evidence;
+   * they are never deleted or rewritten. Pending (unresolved) provenance
+   * must be resolved first and cannot be reassessed.
+   */
+  reassessUnknownProvenance(input: {
+    workspaceId: string;
+    root: string;
+    workSessionId?: string;
+    snapshot: WorkspaceSnapshot;
+    reviewerAuthority: "authenticated_reviewer" | "internal_supervisor";
+    reviewerPrincipalId?: string;
+    reviewerOwnerContextId?: string;
+    reason: string;
+  }): Promise<{ reassessmentId: string; operationIds: string[]; coverage: CheckpointCoverage }>;
   /** Raw store surface for maintenance/CLI (GC, stats, reconciliation). */
   getSnapshotStore(): FilesystemSnapshotStore;
   /** Drop a terminal work-session's baseline pin so GC can reclaim it. */
@@ -383,6 +401,61 @@ export function createReviewCheckpointManager(options: {
       resolveInit();
     }
     return state;
+  }
+
+  /** Operation IDs superseded by an audited reassessment in this scope. */
+  function loadReassessedOperationIds(workspaceId: string, workSessionId: string): Set<string> {
+    const ids = new Set<string>();
+    if (!options.mutationProvenanceSqlite) return ids;
+    let rows: Array<{ operationIdsJson: string }> = [];
+    try {
+      rows = options.mutationProvenanceSqlite.prepare(`
+        select operation_ids_json as operationIdsJson from review_mutation_reassessments
+         where workspace_id = ? and work_session_id in (?, '')
+      `).all(workspaceId, workSessionId) as Array<{ operationIdsJson: string }>;
+    } catch {
+      // A database predating migration 117 has no reassessments; it must
+      // not make unknown provenance look resolved.
+      return ids;
+    }
+    for (const row of rows) {
+      try {
+        const parsed = JSON.parse(row.operationIdsJson) as unknown;
+        if (Array.isArray(parsed)) for (const id of parsed) if (typeof id === "string") ids.add(id);
+      } catch { /* malformed reassessment evidence cannot supersede provenance */ }
+    }
+    return ids;
+  }
+
+  /** Classify known mutation paths against the active backend. */
+  async function classifyCoveragePaths(state: WorkspaceReviewStateWithInit, paths: string[]): Promise<CheckpointCoverage> {
+    if (paths.length === 0) {
+      return { status: "complete", uncoveredPaths: [], reasons: [], backend: state.backend?.kind ?? "unknown", assessedAt: new Date().toISOString() };
+    }
+    if (state.backend?.kind === "git" && state.gitRoot) {
+      // Cheap per-path ignore probe via git's own machinery.
+      // `check-ignore -q` exits 0 when the path IS ignored and 1 when it is
+      // not; the git() helper throws on non-zero, so exit code 1 means "not
+      // ignored". Any other failure conservatively counts as ignored (a
+      // false positive merely marks a path for explicit reviewer attention;
+      // a false negative would hide it).
+      const isIgnored = async (path: string): Promise<boolean> => {
+        try {
+          await git(state.gitRoot!, ["check-ignore", "-q", "--", join(state.workspaceRelativePath ?? ".", path)]);
+          return true;
+        } catch (error) {
+          return (error as { code?: unknown } | undefined)?.code !== 1;
+        }
+      };
+      // classifyGitCoverage consumes a sync predicate; resolve the async
+      // probes up front so the classifier itself stays pure.
+      const ignoredPaths = new Set<string>();
+      for (const path of paths) {
+        if (await isIgnored(path)) ignoredPaths.add(path);
+      }
+      return classifyGitCoverage(paths, (path) => ignoredPaths.has(path), options.excludedDirectories);
+    }
+    return classifyFilesystemCoverage(paths, options.excludedDirectories);
   }
 
   return {
@@ -659,10 +732,17 @@ export function createReviewCheckpointManager(options: {
         ...(workSessionId ? state.reviewMutationsByWorkSession.get(workSessionId)?.keys() ?? [] : []),
       ])];
       const durableRows = options.mutationProvenanceSqlite?.prepare(`
-        select path, state from review_mutation_provenance
+        select path, state, operation_id as operationId from review_mutation_provenance
          where workspace_id = ? and work_session_id in (?, '')
-      `).all(workspaceId, workSessionId ?? "") as Array<{ path: string | null; state: string }> | undefined;
-      if (durableRows?.some((row) => row.state !== "applied" || !row.path)) {
+      `).all(workspaceId, workSessionId ?? "") as Array<{ path: string | null; state: string; operationId: string }> | undefined;
+      // Unknown provenance superseded by an audited reassessment no longer
+      // blocks coverage; the original rows remain as preserved evidence.
+      // Pending (unresolved) provenance can never be superseded.
+      const reassessedOps = loadReassessedOperationIds(workspaceId, workSessionId ?? "");
+      if (durableRows?.some((row) => {
+        if (row.state === "unknown" && reassessedOps.has(row.operationId)) return false;
+        return row.state !== "applied" || !row.path;
+      })) {
         return {
           status: "unknown",
           uncoveredPaths: [],
@@ -676,41 +756,83 @@ export function createReviewCheckpointManager(options: {
         ...memoryPaths,
         ...(durableRows ?? []).map((row) => row.path).filter((path): path is string => Boolean(path)),
       ])];
-      if (paths.length === 0) {
-        return { status: "complete", uncoveredPaths: [], reasons: [], backend: state.backend?.kind ?? "unknown", assessedAt: new Date().toISOString() };
-      }
-      if (state.backend?.kind === "git" && state.gitRoot) {
-        // Cheap per-path ignore probe via git's own machinery.
-        // `check-ignore -q` exits 0 when the path IS ignored and 1 when it is
-        // not; the git() helper throws on non-zero, so exit code 1 means "not
-        // ignored". Any other failure conservatively counts as ignored (a
-        // false positive merely marks a path for explicit reviewer attention;
-        // a false negative would hide it).
-        const isIgnored = async (path: string): Promise<boolean> => {
-          try {
-            await git(state.gitRoot!, ["check-ignore", "-q", "--", join(state.workspaceRelativePath ?? ".", path)]);
-            return true;
-          } catch (error) {
-            return (error as { code?: unknown } | undefined)?.code !== 1;
-          }
-        };
-        // classifyGitCoverage consumes a sync predicate; resolve the async
-        // probes up front so the classifier itself stays pure.
-        const ignoredPaths = new Set<string>();
-        for (const path of paths) {
-          if (await isIgnored(path)) ignoredPaths.add(path);
-        }
-        return classifyGitCoverage(paths, (path) => ignoredPaths.has(path), options.excludedDirectories);
-      }
-      return classifyFilesystemCoverage(paths, options.excludedDirectories);
+      return classifyCoveragePaths(state, paths);
     },
 
     async clearRecordedMutations({ workspaceId, workSessionId }) {
       const state = states.get(workspaceId);
       if (state) clearMutationScope(state, workSessionId);
+      // Only applied provenance is cleared when the checkpoint advances.
+      // Unknown rows are preserved evidence: clearing the ledger must
+      // never convert unknown provenance into complete coverage. Unknown
+      // rows leave the blocking state only via an audited reassessment.
       options.mutationProvenanceSqlite?.prepare(`
-        delete from review_mutation_provenance where workspace_id = ? and work_session_id = ?
+        delete from review_mutation_provenance where workspace_id = ? and work_session_id = ? and state = 'applied'
       `).run(workspaceId, workSessionId ?? "");
+    },
+
+    async reassessUnknownProvenance({ workspaceId, root, workSessionId, snapshot, reviewerAuthority, reviewerPrincipalId, reviewerOwnerContextId, reason }) {
+      const sqlite = options.mutationProvenanceSqlite;
+      if (!sqlite) throw new Error("Mutation provenance store unavailable; unknown provenance cannot be reassessed.");
+      if (!reason?.trim()) throw new Error("Reassessment requires an explicit reason.");
+      const state = await ensureInitialized(workspaceId, root);
+      const rows = sqlite.prepare(`
+        select operation_id as operationId, state from review_mutation_provenance
+         where workspace_id = ? and work_session_id in (?, '')
+      `).all(workspaceId, workSessionId ?? "") as Array<{ operationId: string; state: string }>;
+      if (rows.some((row) => row.state === "pending")) {
+        throw new Error("Unresolved (pending) mutation provenance must be resolved before it can be reassessed.");
+      }
+      const alreadyReassessed = loadReassessedOperationIds(workspaceId, workSessionId ?? "");
+      const operationIds = [...new Set(
+        rows.filter((row) => row.state === "unknown").map((row) => row.operationId),
+      )].filter((operationId) => !alreadyReassessed.has(operationId));
+      if (operationIds.length === 0) {
+        throw new Error("No unreassessed unknown mutation provenance in scope.");
+      }
+      // The reassessment is only as good as the inspection it binds: the
+      // live workspace must still equal the snapshot the reviewer verified.
+      const matches = Boolean(state.backend && state.backend.kind === snapshot.kind
+        && await state.backend.compare(root, snapshot));
+      if (!matches) {
+        throw new Error("Reassessment snapshot does not match the live workspace; inspect the current tree and reassess against it.");
+      }
+      // Fresh assessment over the paths whose provenance is known (memory
+      // ledger + applied durable rows). The unknown rows' own paths, when
+      // structured, still classify here because the snapshot verification
+      // above bound their current content.
+      const appliedPaths = rows.length > 0
+        ? (sqlite.prepare(`
+            select path from review_mutation_provenance
+             where workspace_id = ? and work_session_id in (?, '') and state = 'applied'
+          `).all(workspaceId, workSessionId ?? "") as Array<{ path: string | null }>).map((row) => row.path).filter((path): path is string => Boolean(path))
+        : [];
+      const memoryPaths = [...new Set([
+        ...state.unscopedReviewMutations.keys(),
+        ...(workSessionId ? state.reviewMutationsByWorkSession.get(workSessionId)?.keys() ?? [] : []),
+      ])];
+      const coverage = await classifyCoveragePaths(state, [...new Set([...memoryPaths, ...appliedPaths])]);
+      const reassessmentId = randomUUID();
+      sqlite.prepare(`
+        insert into review_mutation_reassessments
+          (id, workspace_id, work_session_id, operation_ids_json, snapshot_kind, snapshot_ref,
+           fresh_coverage_status, reviewer_authority, reviewer_principal_id, reviewer_owner_context_id, reason, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        reassessmentId,
+        workspaceId,
+        workSessionId ?? "",
+        JSON.stringify(operationIds),
+        snapshot.kind,
+        snapshot.ref,
+        coverage.status,
+        reviewerAuthority,
+        reviewerPrincipalId ?? null,
+        reviewerOwnerContextId ?? null,
+        reason.trim(),
+        new Date().toISOString(),
+      );
+      return { reassessmentId, operationIds, coverage };
     },
   };
 }

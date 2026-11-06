@@ -10,6 +10,7 @@ import type { ContinuationManager, CreateContinuationInput } from "./continuatio
 import type { AgentRegistryManager } from "./acp-registry.js";
 import type { WorkspaceRegistry } from "./workspaces.js";
 import type { ReviewCheckpointManager, ReviewFile, WorkspaceSnapshot, WorkspaceSnapshotKind } from "./review-checkpoints.js";
+import { normalizeWorkspaceSnapshotIdentity } from "./review-checkpoints.js";
 import type { CheckpointCoverage } from "./checkpoint-coverage.js";
 import { reviewCoverageApprovalBlock } from "./review-coverage-policy.js";
 import { withFileMutationLock, workspaceMutationLockKey } from "./mutation-version.js";
@@ -130,6 +131,25 @@ export interface ProvideFeedbackResult {
   handoffStatus?: string;
 }
 
+export interface ReassessUnknownProvenanceInput {
+  sessionId: string;
+  snapshotKind: WorkspaceSnapshotKind;
+  snapshotRef: string;
+  /** Why the inspected tree bounds the unknown shell effects. */
+  reason: string;
+  /** Server-established invocation origin (never a public argument). */
+  invocationOrigin: ReviewInvocationOrigin;
+  reviewerPrincipalId?: string;
+  reviewerOwnerContextId?: string;
+}
+
+export interface ReassessUnknownProvenanceResult {
+  reassessmentId: string;
+  operationIds: string[];
+  coverageStatus: CheckpointCoverage["status"];
+  coverage: CheckpointCoverage;
+}
+
 export interface CancelSessionInput {
   sessionId: string;
   reason?: string;
@@ -146,6 +166,7 @@ export interface CancelSessionInput {
 export interface ReviewWorkflowService {
   submitForReview(input: SubmitForReviewInput): Promise<SubmitForReviewResult>;
   provideFeedback(input: ProvideFeedbackInput): Promise<ProvideFeedbackResult>;
+  reassessUnknownProvenance(input: ReassessUnknownProvenanceInput): Promise<ReassessUnknownProvenanceResult>;
   cancelSession(input: CancelSessionInput): { status: string };
   finalizeCancellation(input: CancelSessionInput): { status: string };
 }
@@ -499,6 +520,33 @@ export function createReviewWorkflowService(
   }
 
   /**
+   * Run approval-time validation/commit inside the shared
+   * workspace-mutation boundary (the same key structured mutations
+   * serialize on). Falls back to running directly when the workspace
+   * registry is unavailable (legacy harnesses) or the session does not
+   * exist (the inner implementation surfaces the canonical error).
+   */
+  async function withWorkspaceBoundary<T>(sessionId: string, run: () => Promise<T>): Promise<T> {
+    const session = workSessions.get(sessionId);
+    if (!session || !workspaces || typeof workspaces.getWorkspace !== "function") {
+      return run();
+    }
+    let keys: string[] | undefined;
+    try {
+      const ws = workspaces.getWorkspace(session.workspaceSessionId);
+      if (ws?.root) {
+        keys = [workspaceMutationLockKey(ws.root)];
+        const canonical = await realpath(ws.root).catch(() => undefined);
+        if (canonical && canonical !== ws.root) keys.push(workspaceMutationLockKey(canonical));
+      }
+    } catch {
+      return run();
+    }
+    if (!keys) return run();
+    return withFileMutationLock(keys, run);
+  }
+
+  /**
    * Approval entry point. For approve verdicts the exact-snapshot check,
    * the fresh coverage revalidation, and the feedback commit all run inside
    * the shared workspace-mutation boundary (the same key structured
@@ -513,25 +561,7 @@ export function createReviewWorkflowService(
    */
   async function provideFeedback(input: ProvideFeedbackInput): Promise<ProvideFeedbackResult> {
     if (input.verdict !== "approve") return provideFeedbackInner(input);
-    const session = workSessions.get(input.sessionId);
-    if (!session || !workspaces || typeof workspaces.getWorkspace !== "function") {
-      return provideFeedbackInner(input);
-    }
-    let keys: string[] | undefined;
-    try {
-      const ws = workspaces.getWorkspace(session.workspaceSessionId);
-      if (ws?.root) {
-        keys = [workspaceMutationLockKey(ws.root)];
-        const canonical = await realpath(ws.root).catch(() => undefined);
-        if (canonical && canonical !== ws.root) keys.push(workspaceMutationLockKey(canonical));
-      }
-    } catch {
-      // The inner implementation surfaces workspace errors with the same
-      // semantics as before; run it directly so error shapes are unchanged.
-      return provideFeedbackInner(input);
-    }
-    if (!keys) return provideFeedbackInner(input);
-    return withFileMutationLock(keys, () => provideFeedbackInner(input));
+    return withWorkspaceBoundary(input.sessionId, () => provideFeedbackInner(input));
   }
 
   async function provideFeedbackInner(input: ProvideFeedbackInput): Promise<ProvideFeedbackResult> {
@@ -1014,6 +1044,95 @@ export function createReviewWorkflowService(
     };
   }
 
+  /**
+   * Explicit, audited recovery for unknown shell mutation provenance.
+   * Review authority only: an authenticated reviewer must present its
+   * principal identity, and the server-owned supervisor runtime is
+   * authorized by construction. The worker whose provenance is unknown
+   * cannot self-authorize a reassessment. The inspected snapshot must
+   * still match the live workspace (verified inside the shared
+   * workspace-mutation boundary), the fresh coverage assessment is
+   * recorded, the original unknown rows are preserved, and an audit
+   * event binds the reassessment to its authority and reason. A
+   * replacement submission becomes approvable only after this workflow;
+   * the pre-reassessment submission keeps its unknown coverage.
+   */
+  async function reassessUnknownProvenance(input: ReassessUnknownProvenanceInput): Promise<ReassessUnknownProvenanceResult> {
+    const session = workSessions.get(input.sessionId);
+    if (!session) {
+      throw new WorkflowError(`Session not found: ${input.sessionId}`, "not_found", 404);
+    }
+    if (TERMINAL_STATUSES.has(session.status)) {
+      throw new WorkflowError(`Session ${input.sessionId} is already ${session.status}; provenance cannot be reassessed.`, "terminal", 409);
+    }
+    if (input.invocationOrigin === "authenticated_reviewer" && !input.reviewerPrincipalId) {
+      throw new WorkflowError("Reassessment requires an authenticated reviewer principal; authority cannot be asserted by the reviewed worker.", "bad_request", 400);
+    }
+    if (input.invocationOrigin !== "authenticated_reviewer" && input.invocationOrigin !== "internal_supervisor") {
+      throw new WorkflowError("Reassessment requires review authority.", "bad_request", 400);
+    }
+    if (!input.reason?.trim()) {
+      throw new WorkflowError("Reassessment requires an explicit reason.", "bad_request", 400);
+    }
+    if (!reviewCheckpoints || typeof reviewCheckpoints.reassessUnknownProvenance !== "function" || !workspaces) {
+      throw new WorkflowError("Review-checkpoint service unavailable; unknown provenance cannot be reassessed.", "server_error", 500);
+    }
+    let snapshotIdentity: ReturnType<typeof normalizeWorkspaceSnapshotIdentity>;
+    try {
+      snapshotIdentity = normalizeWorkspaceSnapshotIdentity({ snapshotKind: input.snapshotKind, snapshotRef: input.snapshotRef });
+    } catch (error) {
+      throw new WorkflowError(error instanceof Error ? error.message : "Invalid reassessment snapshot.", "bad_request", 400);
+    }
+    if (!snapshotIdentity) {
+      throw new WorkflowError("Reassessment requires the exact snapshot the reviewer inspected.", "bad_request", 400);
+    }
+    const snapshot: WorkspaceSnapshot = { ...snapshotIdentity, createdAt: new Date().toISOString() };
+    const ws = workspaces.getWorkspace(session.workspaceSessionId);
+    return withWorkspaceBoundary(input.sessionId, async () => {
+      let record: Awaited<ReturnType<NonNullable<ReviewCheckpointManager["reassessUnknownProvenance"]>>>;
+      try {
+        record = await reviewCheckpoints.reassessUnknownProvenance({
+          workspaceId: session.workspaceSessionId,
+          root: ws.root,
+          workSessionId: session.id,
+          snapshot,
+          reviewerAuthority: input.invocationOrigin,
+          reviewerPrincipalId: input.reviewerPrincipalId,
+          reviewerOwnerContextId: input.reviewerOwnerContextId,
+          reason: input.reason,
+        });
+      } catch (error) {
+        throw new WorkflowError(error instanceof Error ? error.message : "Reassessment failed.", "conflict", 409);
+      }
+      const publishQueue: EventStoreEvent[] = [];
+      db.sqlite.transaction(() => {
+        const appended = eventStore.appendEvent({
+          type: "review.coverage.reassessed",
+          sessionId: input.sessionId,
+          payload: {
+            reassessmentId: record.reassessmentId,
+            operationIds: record.operationIds,
+            snapshotKind: snapshot.kind,
+            snapshotRef: snapshot.ref,
+            coverageStatus: record.coverage.status,
+            reviewerAuthority: input.invocationOrigin,
+            reviewerPrincipalId: input.reviewerPrincipalId,
+            reviewerOwnerContextId: input.reviewerOwnerContextId,
+            reason: input.reason.trim(),
+          },
+        }, { publish: false });
+        publishQueue.push(appended);
+      })();
+      eventStore.publishEvents(publishQueue);
+      return {
+        reassessmentId: record.reassessmentId,
+        operationIds: record.operationIds,
+        coverageStatus: record.coverage.status,
+        coverage: record.coverage,
+      };
+    });
+  }
+
   function cancelSession(input: CancelSessionInput): { status: string } {
     const session = workSessions.get(input.sessionId);
     if (!session) {
@@ -1140,6 +1259,7 @@ export function createReviewWorkflowService(
   return {
     submitForReview,
     provideFeedback,
+    reassessUnknownProvenance,
     cancelSession,
     finalizeCancellation,
   };
