@@ -39,9 +39,14 @@ assert.equal(isExcludedFromCheckpoint("dist",), false, "bare name is a file path
 assert.equal(workspaceRelativePath("/tmp/r", "/tmp/r/a/b.txt"), "a/b.txt");
 assert.equal(workspaceRelativePath("/tmp/r", "a/b.txt"), "a/b.txt");
 assert.equal(workspaceRelativePath("/tmp/r", "/tmp/other/x"), undefined);
+assert.equal(workspaceRelativePath("/tmp/r", "/tmp/r/..cache/file.txt"), "..cache/file.txt");
+assert.equal(workspaceRelativePath("/tmp/r", ".../file.txt"), ".../file.txt");
+assert.equal(workspaceRelativePath("/tmp/r", "../outside.txt"), undefined);
+assert.equal(workspaceRelativePath("/tmp/r", "a/../../outside.txt"), undefined);
 
 const fsCoverage = classifyFilesystemCoverage(["src/app.ts", "node_modules/pkg/index.js"]);
 assert.deepEqual(fsCoverage.uncoveredPaths, ["node_modules/pkg/index.js"]);
+assert.equal(fsCoverage.status, "incomplete");
 assert.equal(fsCoverage.backend, "filesystem");
 assert.equal(fsCoverage.reasons.length, 1);
 
@@ -50,6 +55,7 @@ const gitCoverage = classifyGitCoverage(
   (path) => path === ".env.local" || path.startsWith("node_modules/"),
 );
 assert.deepEqual(gitCoverage.uncoveredPaths, ["node_modules/pkg/index.js", ".env.local"]);
+assert.equal(gitCoverage.status, "incomplete");
 assert.equal(gitCoverage.backend, "git");
 // Both-reason case is named explicitly.
 assert.match(gitCoverage.reasons[0], /AND git-ignored/);

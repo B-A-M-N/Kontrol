@@ -54,7 +54,7 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
         continuationId: z.string().optional().describe("Continuation ID returned by await_review_feedback; completed only after this submission is persisted."),
         clientMutationId: z.string().min(1).max(200).optional(),
       },
-      outputSchema: { submissionId: z.string(), status: z.string(), files: z.array(z.object({ path: z.string(), previousPath: z.string().optional(), type: z.string().optional(), operation: z.string().optional(), additions: z.number(), removals: z.number() })), fileCount: z.number(), additions: z.number(), removals: z.number(), diffSha256: z.string().optional(), reviewEpoch: z.number(), snapshotKind: z.enum(["git", "filesystem"]).optional(), snapshotRef: z.string().optional(), housekeepingWarnings: z.array(z.string()).optional(), coverage: z.object({ backend: z.enum(["git", "filesystem"]), uncoveredPaths: z.array(z.string()), reasons: z.array(z.string()) }).optional() },
+      outputSchema: { submissionId: z.string(), status: z.string(), files: z.array(z.object({ path: z.string(), previousPath: z.string().optional(), type: z.string().optional(), operation: z.string().optional(), additions: z.number(), removals: z.number() })), fileCount: z.number(), additions: z.number(), removals: z.number(), diffSha256: z.string().optional(), reviewEpoch: z.number(), snapshotKind: z.enum(["git", "filesystem"]).optional(), snapshotRef: z.string().optional(), housekeepingWarnings: z.array(z.string()).optional(), coverage: z.object({ status: z.enum(["complete", "incomplete", "unknown"]), backend: z.enum(["git", "filesystem", "unknown"]), uncoveredPaths: z.array(z.string()), reasons: z.array(z.string()), assessedAt: z.string(), errorCode: z.string().optional() }).optional() },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: false },
     },
@@ -225,8 +225,8 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
             removals: review.summary.removals,
             message: message ?? review.result,
             housekeepingWarnings,
-            coverage: submitted.coverage
-              ? { backend: submitted.coverage.backend, uncoveredPaths: submitted.coverage.uncoveredPaths, reasons: submitted.coverage.reasons }
+            coverage: submitted.coverage?.status !== "complete"
+              ? { status: submitted.coverage!.status, backend: submitted.coverage!.backend, uncoveredPaths: submitted.coverage!.uncoveredPaths, reasons: submitted.coverage!.reasons, assessedAt: submitted.coverage!.assessedAt, errorCode: submitted.coverage!.errorCode }
               : undefined,
           } satisfies ReviewSubmissionDTO,
           ...(routedReview ? {} : { _meta: {
@@ -235,7 +235,7 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
               tool: "submit_for_review",
               workspaceId: session.workspaceSessionId,
               status: "awaiting_review",
-              summary: { ...review.summary, submissionId: submission.id, sessionId, submissionNumber: submission.submissionNumber, runId: correlatedRun?.runId, message: message ?? review.result, diffSha256: submitted.diffSha256, reviewEpoch: submitted.reviewEpoch, coverage: submitted.coverage ? { backend: submitted.coverage.backend, uncoveredPaths: submitted.coverage.uncoveredPaths, reasons: submitted.coverage.reasons } : undefined },
+              summary: { ...review.summary, submissionId: submission.id, sessionId, submissionNumber: submission.submissionNumber, runId: correlatedRun?.runId, message: message ?? review.result, diffSha256: submitted.diffSha256, reviewEpoch: submitted.reviewEpoch, coverage: submitted.coverage?.status !== "complete" ? { status: submitted.coverage!.status, backend: submitted.coverage!.backend, uncoveredPaths: submitted.coverage!.uncoveredPaths, reasons: submitted.coverage!.reasons, assessedAt: submitted.coverage!.assessedAt, errorCode: submitted.coverage!.errorCode } : undefined },
               files: review.files,
               payload: { patch: review.patch },
             },
@@ -270,7 +270,7 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
         additions: z.number(),
         removals: z.number(),
         message: z.string().optional(),
-        coverage: z.object({ backend: z.enum(["git", "filesystem"]), uncoveredPaths: z.array(z.string()), reasons: z.array(z.string()) }).optional(),
+        coverage: z.object({ status: z.enum(["complete", "incomplete", "unknown"]), backend: z.enum(["git", "filesystem", "unknown"]), uncoveredPaths: z.array(z.string()), reasons: z.array(z.string()), assessedAt: z.string(), errorCode: z.string().optional() }).optional(),
       },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: true },
@@ -325,8 +325,8 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
         additions: Number(summary.additions ?? 0),
         removals: Number(summary.removals ?? 0),
         message: submission.message,
-        coverage: submission.coverage && submission.coverage.uncoveredPaths.length > 0
-          ? { backend: submission.coverage.backend, uncoveredPaths: submission.coverage.uncoveredPaths, reasons: submission.coverage.reasons }
+        coverage: submission.coverage?.status !== "complete"
+          ? { status: submission.coverage!.status, backend: submission.coverage!.backend, uncoveredPaths: submission.coverage!.uncoveredPaths, reasons: submission.coverage!.reasons, assessedAt: submission.coverage!.assessedAt, errorCode: submission.coverage!.errorCode }
           : undefined,
       };
 

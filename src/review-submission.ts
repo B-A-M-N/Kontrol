@@ -12,9 +12,12 @@ export interface ReviewFile {
  * nonempty exactly when this submission's diff cannot represent every
  * structured mutation the work session made. */
 export interface ReviewCoverageDTO {
-  backend: "git" | "filesystem";
+  status: "complete" | "incomplete" | "unknown";
+  backend: "git" | "filesystem" | "unknown";
   uncoveredPaths: string[];
   reasons: string[];
+  assessedAt: string;
+  errorCode?: string;
 }
 
 export interface ReviewSubmissionDTO {

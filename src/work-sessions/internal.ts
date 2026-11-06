@@ -96,30 +96,49 @@ export function rowToSubmission(row: WorkSessionSubmissionRow): WorkSessionSubmi
     message: row.message ?? undefined,
     summaryJson: row.summaryJson ?? undefined,
     files: parseReviewFiles(row.filesJson),
-    coverage: parseCheckpointCoverage(row.coverageJson),
+    coverage: parseCheckpointCoverage(row.coverageJson, row.coverageStatus),
+    coverageStatus: row.coverageStatus ?? "unknown",
     status: (row.status as "pending" | "reviewed") ?? "pending",
     createdAt: row.createdAt,
   };
 }
 
-/** Parse a persisted coverage_json cell. Malformed/legacy rows simply have no
- * coverage record — fail-open on PARSE but the workflow still fails closed on
- * approval by treating a missing record on a submission whose session has
- * recorded mutations as uncovered (see review-workflow). */
-export function parseCheckpointCoverage(value: string | null | undefined): CheckpointCoverage | undefined {
-  if (!value) return undefined;
+/** Parse a persisted coverage_json cell. A missing or malformed cell is an
+ * explicit unknown assessment; it can never be treated as complete. */
+export function parseCheckpointCoverage(value: string | null | undefined, persistedStatus?: string): CheckpointCoverage {
+  const unknown = (errorCode = "coverage_record_unavailable"): CheckpointCoverage => ({
+    status: "unknown",
+    uncoveredPaths: [],
+    backend: "unknown",
+    reasons: ["Coverage classification is unavailable for this submission."],
+    assessedAt: new Date().toISOString(),
+    errorCode,
+  });
+  if (!value) return unknown();
   try {
     const parsed = JSON.parse(value) as Partial<CheckpointCoverage> | null;
-    if (!parsed || typeof parsed !== "object") return undefined;
-    if (!Array.isArray(parsed.uncoveredPaths) || !Array.isArray(parsed.reasons)) return undefined;
-    if (parsed.backend !== "git" && parsed.backend !== "filesystem") return undefined;
+    if (!parsed || typeof parsed !== "object") return unknown("coverage_record_malformed");
+    if (!Array.isArray(parsed.uncoveredPaths) || !Array.isArray(parsed.reasons)) return unknown("coverage_record_malformed");
+    const uncoveredPaths = parsed.uncoveredPaths.filter((p): p is string => typeof p === "string");
+    const reasons = parsed.reasons.filter((r): r is string => typeof r === "string");
+    const backend = parsed.backend === "git" || parsed.backend === "filesystem" ? parsed.backend : "unknown";
+    const status = parsed.status === "complete" || parsed.status === "incomplete" || parsed.status === "unknown"
+      ? parsed.status
+      : "unknown";
+    if (status !== persistedStatus && persistedStatus !== undefined) return unknown("coverage_status_mismatch");
+    if ((status === "complete" || status === "incomplete") && backend === "unknown") return unknown("coverage_record_malformed");
     return {
-      uncoveredPaths: parsed.uncoveredPaths.filter((p): p is string => typeof p === "string"),
-      backend: parsed.backend,
-      reasons: parsed.reasons.filter((r): r is string => typeof r === "string"),
+      status,
+      uncoveredPaths,
+      backend,
+      reasons,
+      assessedAt: typeof parsed.assessedAt === "string" && Number.isFinite(Date.parse(parsed.assessedAt))
+        ? parsed.assessedAt
+        : new Date().toISOString(),
+      ...(typeof parsed.errorCode === "string" && /^[A-Za-z0-9_:-]{1,80}$/.test(parsed.errorCode) ? { errorCode: parsed.errorCode } : {}),
     };
   } catch {
-    return undefined;
+    return unknown("coverage_record_malformed");
   }
 }
 

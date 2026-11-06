@@ -265,7 +265,8 @@ export function renderFeedbackFormForSubmission(view: WorkSessionViewState, subm
   // approved. The reviewer must check the explicit acknowledgment, which is
   // then sent as acceptIncompleteCoverage (the server independently refuses an
   // approval without it — the checkbox only unlocks the attempt).
-  const hasIncompleteCoverage = Boolean(submission.coverage && submission.coverage.uncoveredPaths.length > 0);
+  const hasIncompleteCoverage = submission.coverage?.status === "incomplete";
+  const hasUnknownCoverage = submission.coverage?.status === "unknown";
   const acceptCoverageId = stableDomId(`accept-coverage-${submission.submissionId}`);
   const acceptCoverage = document.createElement("input");
   acceptCoverage.type = "checkbox";
@@ -277,6 +278,12 @@ export function renderFeedbackFormForSubmission(view: WorkSessionViewState, subm
       element("div", {
         text: `⚠ Incomplete checkpoint coverage: this diff does not represent mutations in ${submission.coverage!.uncoveredPaths.join(", ")}. `
           + `Review these paths out-of-band before approving (${submission.coverage!.reasons.join("; ")}).`,
+      }),
+    );
+  } else if (hasUnknownCoverage) {
+    coverageWarning.append(
+      element("div", {
+        text: "⚠ Checkpoint coverage is unknown. This submission cannot be approved until it is resubmitted with a successful coverage assessment.",
       }),
     );
   }
@@ -291,6 +298,8 @@ export function renderFeedbackFormForSubmission(view: WorkSessionViewState, subm
   }
   if (hasIncompleteCoverage) {
     container.append(coverageWarning, acceptLabel);
+  } else if (hasUnknownCoverage) {
+    container.append(coverageWarning);
   }
   if (outcomeUnknown) {
     container.append(element("div", { className: "feedback-error", text: "Feedback outcome is unknown after a connection interruption. Refresh authoritative session state before trying again." }));
@@ -305,7 +314,7 @@ export function renderFeedbackFormForSubmission(view: WorkSessionViewState, subm
     const btn = element("button", { className: `feedback-btn ${cls}`, type: "button", text });
     // P1 #11: disable verdict buttons while a submission is in flight.
     if (isSubmitting || outcomeUnknown || !host.uiMutationsAllowed()) btn.disabled = true;
-    if (verdict === "approve" && hasIncompleteCoverage) {
+    if (verdict === "approve" && (hasIncompleteCoverage || hasUnknownCoverage)) {
       // Locked until the explicit acknowledgment is checked; re-render on toggle.
       btn.disabled = true;
       acceptCoverage.addEventListener("change", () => {
@@ -363,7 +372,7 @@ export async function submitFeedbackForSubmission(view: WorkSessionViewState, su
           comments,
           // P1 (audit): only ever true when the reviewer explicitly checked the
           // incomplete-coverage acknowledgment for a flagged submission.
-          ...(verdict === "approve" && submission.coverage?.uncoveredPaths.length ? { acceptIncompleteCoverage } : {}),
+          ...(verdict === "approve" && submission.coverage?.status === "incomplete" ? { acceptIncompleteCoverage } : {}),
           clientMutationId: host.newClientMutationId(),
         },
       });

@@ -16,26 +16,32 @@ import { DEFAULT_SNAPSHOT_EXCLUDED_DIRECTORIES } from "./filesystem-snapshot-sto
 import type { WorkspaceSnapshotKind } from "./review-checkpoints.js";
 
 export interface CheckpointCoverage {
+  /** Classification certainty. Unknown is never equivalent to fully covered. */
+  status: "complete" | "incomplete" | "unknown";
   /** Workspace-relative paths structured mutations touched that the active
    * checkpoint backend cannot represent in a review diff. */
   uncoveredPaths: string[];
   /** The backend the coverage was classified against. */
-  backend: WorkspaceSnapshotKind;
+  backend: WorkspaceSnapshotKind | "unknown";
   /** Human-readable reason each path is outside coverage (parallel to
    * uncoveredPaths). */
   reasons: string[];
+  assessedAt: string;
+  /** Stable error category only; exception messages may contain local paths. */
+  errorCode?: string;
 }
 
 /** Workspace-relative POSIX path of an absolute path under root, or undefined
  * when the path escapes the root (escape is its own coverage problem but is
  * rejected upstream by the confinement checks). */
 export function workspaceRelativePath(root: string, absoluteOrRelative: string): string | undefined {
-  if (!isAbsolute(absoluteOrRelative)) {
-    return absoluteOrRelative.split(sep).join("/").replace(/^\.\//, "");
-  }
-  const rel = relative(resolve(root), resolve(absoluteOrRelative));
-  if (rel.startsWith("..") || isAbsolute(rel)) return undefined;
-  return rel.split(sep).join("/");
+  const workspaceRoot = resolve(root);
+  const target = isAbsolute(absoluteOrRelative)
+    ? resolve(absoluteOrRelative)
+    : resolve(workspaceRoot, absoluteOrRelative);
+  const rel = relative(workspaceRoot, target);
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return undefined;
+  return (rel || ".").split(sep).join("/");
 }
 
 /**
@@ -73,7 +79,13 @@ export function classifyFilesystemCoverage(
       reasons.push("inside a directory the filesystem checkpoint excludes (generated/cache tree)");
     }
   }
-  return { uncoveredPaths, backend: "filesystem", reasons };
+  return {
+    status: uncoveredPaths.length > 0 ? "incomplete" : "complete",
+    uncoveredPaths,
+    backend: "filesystem",
+    reasons,
+    assessedAt: new Date().toISOString(),
+  };
 }
 
 /**
@@ -104,5 +116,11 @@ export function classifyGitCoverage(
       );
     }
   }
-  return { uncoveredPaths, backend: "git", reasons };
+  return {
+    status: uncoveredPaths.length > 0 ? "incomplete" : "complete",
+    uncoveredPaths,
+    backend: "git",
+    reasons,
+    assessedAt: new Date().toISOString(),
+  };
 }

@@ -637,7 +637,7 @@ export function createReviewCheckpointManager(options: {
         ...(workSessionId ? state.reviewMutationsByWorkSession.get(workSessionId)?.keys() ?? [] : []),
       ])];
       if (paths.length === 0) {
-        return { uncoveredPaths: [], reasons: [], backend: state.backend?.kind ?? "filesystem" };
+        return { status: "complete", uncoveredPaths: [], reasons: [], backend: state.backend?.kind ?? "filesystem", assessedAt: new Date().toISOString() };
       }
       if (state.backend?.kind === "git" && state.gitRoot) {
         // Cheap per-path ignore probe via git's own machinery.

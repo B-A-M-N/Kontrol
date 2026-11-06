@@ -10,6 +10,7 @@ import type { AgentRegistryManager } from "./acp-registry.js";
 import type { WorkspaceRegistry } from "./workspaces.js";
 import type { ReviewCheckpointManager, ReviewFile, WorkspaceSnapshot, WorkspaceSnapshotKind } from "./review-checkpoints.js";
 import type { CheckpointCoverage } from "./checkpoint-coverage.js";
+import { reviewCoverageApprovalBlock } from "./review-coverage-policy.js";
 import type { MissionLedger } from "./mission-ledger.js";
 import type { DispatchOutbox } from "./dispatch-outbox.js";
 import { reviewThreads, reviewThreadMessages } from "./db/schema.js";
@@ -68,7 +69,8 @@ export interface SubmitForReviewResult {
   status: string;
   runId?: string;
   /** P1 (audit): structured mutations this submission's diff cannot represent. */
-  coverage?: CheckpointCoverage;
+  coverageStatus: CheckpointCoverage["status"];
+  coverage: CheckpointCoverage;
   handoffId?: string;
   handoffStatus?: string;
   roundNumber?: number;
@@ -248,7 +250,14 @@ export function createReviewWorkflowService(
     // means this diff LOOKS complete while omitting real edits (excluded
     // trees, git-ignored material). The record travels with the submission so
     // approval can be gated on it and the UI can name the paths.
-    let coverage: CheckpointCoverage | undefined;
+    let coverage: CheckpointCoverage = {
+      status: "unknown",
+      backend: "unknown",
+      uncoveredPaths: [],
+      reasons: ["Coverage was not classified before submission."],
+      assessedAt: new Date().toISOString(),
+      errorCode: "coverage_unavailable",
+    };
     if (reviewCheckpoints && typeof reviewCheckpoints.checkpointCoverage === "function") {
       try {
         coverage = await reviewCheckpoints.checkpointCoverage({
@@ -256,12 +265,18 @@ export function createReviewWorkflowService(
           root: workspaces?.getWorkspace(session.workspaceSessionId)?.root ?? "",
           workSessionId: session.id,
         });
-        if (coverage && coverage.uncoveredPaths.length === 0) coverage = undefined;
-      } catch {
-        // Classification is advisory at submission time (the paths were already
-        // recorded); approval still fails closed below on any recorded-but-
-        // unclassifiable state because coverage stays undefined while mutations
-        // remain tracked.
+      } catch (error) {
+        // Persist uncertainty explicitly. A missing record is never interpreted
+        // as proof that the snapshot represents every mutation.
+        const code = (error as { code?: unknown } | undefined)?.code;
+        coverage = {
+          status: "unknown",
+          backend: "unknown",
+          uncoveredPaths: [],
+          reasons: ["Coverage classification failed; the submission requires a new successful assessment."],
+          assessedAt: new Date().toISOString(),
+          errorCode: typeof code === "string" && /^[A-Za-z0-9_:-]{1,80}$/.test(code) ? code : "classification_failed",
+        };
       }
     }
 
@@ -323,7 +338,7 @@ export function createReviewWorkflowService(
           files: input.files ?? 0,
           additions: input.additions ?? 0,
           removals: input.removals ?? 0,
-          uncoveredPaths: coverage?.uncoveredPaths ?? [],
+          uncoveredPaths: coverage.uncoveredPaths,
         },
       });
 
@@ -405,6 +420,7 @@ export function createReviewWorkflowService(
       reviewEpoch: result.submission.reviewEpoch,
       status: "awaiting_review",
       runId: result.runId,
+      coverageStatus: coverage.status,
       coverage,
       handoffId: result.handoff?.id,
       handoffStatus: result.handoff?.status,
@@ -526,14 +542,12 @@ export function createReviewWorkflowService(
     // explicit acceptIncompleteCoverage acknowledgment, which is recorded in
     // the feedback event. Rejections/changes-requests are never gated: a
     // reviewer must always be able to refuse incomplete work.
-    if (input.verdict === "approve" && currentPending.coverage && currentPending.coverage.uncoveredPaths.length > 0 && !input.acceptIncompleteCoverage) {
-      throw new WorkflowError(
-        `Submission ${input.submissionId} has mutations the review checkpoint cannot represent: `
-        + `${currentPending.coverage.uncoveredPaths.join(", ")}. `
-        + "Review those paths out-of-band and re-approve with acceptIncompleteCoverage to accept the incomplete coverage explicitly.",
-        "conflict",
-        409,
+    if (input.verdict === "approve") {
+      const coverageBlock = reviewCoverageApprovalBlock(
+        currentPending.coverage,
+        input.acceptIncompleteCoverage === true,
       );
+      if (coverageBlock) throw new WorkflowError(`Submission ${input.submissionId}: ${coverageBlock}`, "conflict", 409);
     }
 
     // P0 #4 / P0 #5 / P1 #1: approval must require the workspace to
@@ -741,7 +755,7 @@ export function createReviewWorkflowService(
           reviewerId: input.reviewerId,
           // P1 (audit): durable audit trail of an explicit incomplete-coverage
           // acceptance (and which paths it covered).
-          ...(input.verdict === "approve" && currentPending.coverage?.uncoveredPaths.length
+          ...(input.verdict === "approve" && currentPending.coverage.status === "incomplete"
             ? { acceptedIncompleteCoverage: true, uncoveredPaths: currentPending.coverage.uncoveredPaths }
             : {}),
         },

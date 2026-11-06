@@ -126,6 +126,7 @@ export interface WorkSessionSubmission {
    * means the review is INCOMPLETE and ordinary approval must be refused
    * until the reviewer explicitly accepts the condition. */
   coverage?: CheckpointCoverage;
+  coverageStatus: "complete" | "incomplete" | "unknown";
 }
 
 export interface WorkSessionFeedback {

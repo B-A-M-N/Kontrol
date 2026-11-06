@@ -17,6 +17,12 @@ import { createAgentRegistryManager } from "./acp-registry.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { createWorkSessionManager } from "./work-sessions.js";
 import { createReviewWorkflowService, WorkflowError } from "./review-workflow.js";
+import { parseCheckpointCoverage } from "./work-sessions/internal.js";
+
+assert.equal(parseCheckpointCoverage("{\"uncoveredPaths\":[],\"reasons\":[],\"backend\":\"git\"}", "complete").status,
+  "unknown", "a complete status without a complete assessment payload is not trusted");
+assert.equal(parseCheckpointCoverage("not-json", "complete").status,
+  "unknown", "malformed persisted evidence cannot authorize complete coverage");
 
 const state = mkdtempSync(join(tmpdir(), "kontrol-review-coverage-"));
 const root = mkdtempSync(join(tmpdir(), "kontrol-review-coverage-root-"));
@@ -73,6 +79,8 @@ await checkpoints.commitReviewedSnapshot({
 
 // The submission carries the coverage record naming ONLY the uncovered path.
 assert.ok(submitted.coverage, "submission carries a coverage record");
+assert.equal(submitted.coverageStatus, "incomplete");
+assert.equal(submitted.coverage.status, "incomplete");
 assert.deepEqual(submitted.coverage.uncoveredPaths, ["node_modules/patched.js"]);
 assert.equal(submitted.coverage.backend, "filesystem");
 const persisted = db.sqlite.prepare("select coverage_json from work_session_submissions where id = ?").get(submitted.submissionId) as { coverage_json: string | null };
@@ -137,7 +145,8 @@ assert.deepEqual(payload.uncoveredPaths, ["node_modules/patched.js"]);
     snapshotKind: boundSnapshot.snapshotKind,
     snapshotRef: boundSnapshot.snapshotRef,
   });
-  assert.equal(clean.coverage, undefined, "no coverage record when everything is representable");
+  assert.equal(clean.coverageStatus, "complete", "a successful empty assessment is explicitly complete");
+  assert.equal(clean.coverage?.status, "complete");
   await workflow.provideFeedback({
     sessionId: session2.id,
     submissionId: clean.submissionId,
@@ -148,6 +157,45 @@ assert.deepEqual(payload.uncoveredPaths, ["node_modules/patched.js"]);
     invocationOrigin: "authenticated_reviewer",
   });
   assert.equal(workSessions.get(session2.id)?.status, "approved");
+}
+
+// A classifier exception is durable unknown evidence, never the same as a
+// successful empty assessment. Even the incomplete-path acknowledgment cannot
+// authorize this submission, and denial must not write feedback.
+{
+  const session4 = workSessions.create({ workspaceSessionId: "ws-coverage-e2e", submittedBy: "worker", completionPolicy: "webui_approval_required" });
+  const failingWorkflow = createReviewWorkflowService({
+    workSessions,
+    eventStore,
+    continuationManager: continuations,
+    agentRegistry: agents,
+    db,
+    workspaces,
+    reviewCheckpoints: { checkpointCoverage: async () => { throw Object.assign(new Error("private filesystem path"), { code: "EIO" }); } } as any,
+  });
+  const unknown = await failingWorkflow.submitForReview({ workSessionId: session4.id, diff: "unknown coverage", snapshotKind: boundSnapshot.snapshotKind, snapshotRef: boundSnapshot.snapshotRef });
+  assert.equal(unknown.coverageStatus, "unknown");
+  assert.equal(unknown.coverage?.status, "unknown");
+  assert.equal(unknown.coverage?.errorCode, "EIO");
+  assert.doesNotMatch(JSON.stringify(unknown.coverage), /private filesystem path/);
+  const feedbackCount = () => (db.sqlite.prepare("select count(*) as count from work_session_feedback where work_session_id = ?").get(session4.id) as { count: number }).count;
+  for (const acceptIncompleteCoverage of [false, true]) {
+    await assert.rejects(() => failingWorkflow.provideFeedback({
+      sessionId: session4.id,
+      submissionId: unknown.submissionId,
+      diffSha256: unknown.diffSha256,
+      reviewEpoch: unknown.reviewEpoch,
+      verdict: "approve",
+      reviewerId: "webui",
+      invocationOrigin: "authenticated_reviewer",
+      acceptIncompleteCoverage,
+    }), (error: unknown) => error instanceof WorkflowError && /coverage is unknown/i.test(error.message));
+  }
+  assert.equal(feedbackCount(), 0, "unknown-coverage denials write no feedback rows");
+  assert.equal(workSessions.get(session4.id)?.status, "awaiting_review");
+  const persistedUnknown = db.sqlite.prepare("select coverage_status, coverage_json from work_session_submissions where id = ?").get(unknown.submissionId) as { coverage_status: string; coverage_json: string };
+  assert.equal(persistedUnknown.coverage_status, "unknown");
+  assert.equal(JSON.parse(persistedUnknown.coverage_json).status, "unknown");
 }
 
 // Rejection / changes-requested are never gated by coverage.

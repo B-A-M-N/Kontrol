@@ -99,8 +99,8 @@ export function createReviewSubmissionStore(db: DatabaseHandle, deps: {
         const reviewEpoch = Number(session.review_epoch) + 1;
         db.sqlite.prepare(`
           insert into work_session_submissions
-            (id, work_session_id, submission_number, diff, diff_sha256, files_json, snapshot_commit, snapshot_kind, snapshot_ref, review_epoch, message, summary_json, coverage_json, status, created_at)
-          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            (id, work_session_id, submission_number, diff, diff_sha256, files_json, snapshot_commit, snapshot_kind, snapshot_ref, review_epoch, message, summary_json, coverage_json, coverage_status, status, created_at)
+          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
         `).run(
           submissionId,
           input.workSessionId,
@@ -115,6 +115,7 @@ export function createReviewSubmissionStore(db: DatabaseHandle, deps: {
           input.message ?? null,
           input.summaryJson ?? null,
           input.coverage ? JSON.stringify(input.coverage) : null,
+          input.coverage?.status ?? "unknown",
           now,
         );
         const updated = db.sqlite.prepare(`
@@ -140,6 +141,7 @@ export function createReviewSubmissionStore(db: DatabaseHandle, deps: {
         summaryJson: input.summaryJson,
         files: input.files,
         coverage: input.coverage,
+        coverageStatus: input.coverage?.status ?? "unknown",
         status: "pending",
         createdAt: now,
       };

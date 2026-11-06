@@ -32,7 +32,7 @@ export type ReviewSubmissionView = {
   createdAt?: string;
   /** P1 (audit): present only when the diff cannot represent every structured
    * mutation — the UI must name these paths and gate ordinary approval. */
-  coverage?: { backend: "git" | "filesystem"; uncoveredPaths: string[]; reasons: string[] };
+  coverage?: { status: "complete" | "incomplete" | "unknown"; backend: "git" | "filesystem" | "unknown"; uncoveredPaths: string[]; reasons: string[]; assessedAt: string; errorCode?: string };
 };
 
 export type ApprovalOutcome =
