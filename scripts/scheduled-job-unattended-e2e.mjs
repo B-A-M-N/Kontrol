@@ -107,6 +107,16 @@ async function startAgent() {
       }));
       return;
     }
+    // Authenticated dispatch lookup (readiness probe contract): a request
+    // carrying the adapter credential for an unknown idempotency key is
+    // authoritatively not_found; anything else is unauthorized. This proves
+    // the dispatch protocol without creating a run.
+    if (req.method === "GET" && req.url?.startsWith("/runs/by-dispatch-id/")) {
+      const authorized = req.headers.authorization === `Bearer ${adapterSecret}`;
+      res.writeHead(authorized ? 404 : 401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { code: authorized ? "not_found" : "unauthorized" } }));
+      return;
+    }
     if (req.method === "POST" && req.url === "/runs") {
       const chunks = [];
       for await (const chunk of req) chunks.push(Buffer.from(chunk));
