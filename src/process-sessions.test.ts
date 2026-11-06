@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { HeadTailBuffer, OutputLog, ProcessSessionManager } from "./process-sessions.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -10,6 +11,7 @@ import { createWorkSessionManager } from "./work-sessions/index.js";
 import { createAgentRegistryManager } from "./acp-registry.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { processSessionOwnerId } from "./mcp/connection-context.js";
+import { findLinuxProcessSessionRunnerOwners, parseLinuxProcessOwnerInstanceId } from "./process-session-runner.js";
 
 const smallBuffer = new HeadTailBuffer(100);
 smallBuffer.append("hello\n");
@@ -64,7 +66,9 @@ const idempotentLaunch = await manager.start({
   cwd: process.cwd(),
   command: `${node} -e "console.log('launched-once')"`,
   clientMutationId: "launch-once",
-  yieldTimeMs: 2_000,
+  // Crash-fenced launches spawn through the detached runner (tsx import
+  // overhead); allow enough yield for completion so both snapshots are final.
+  yieldTimeMs: 8_000,
 });
 const idempotentRetry = await manager.start({
   workspaceId: "workspace-a",
@@ -72,7 +76,7 @@ const idempotentRetry = await manager.start({
   cwd: process.cwd(),
   command: `${node} -e "console.log('launched-once')"`,
   clientMutationId: "launch-once",
-  yieldTimeMs: 2_000,
+  yieldTimeMs: 8_000,
 });
 assert.deepEqual(idempotentRetry, idempotentLaunch, "exact command retries reuse the original launch result");
 await assert.rejects(
@@ -449,6 +453,141 @@ try {
   await bounded.shutdown();
 }
 
+// Terminal work-session cancellation fences new launches and terminates the
+// complete owned child tree before a delayed shell write can run.
+if (process.platform !== "win32") {
+  const terminalRoot = await mkdtemp(join(tmpdir(), "kontrol-terminal-process-"));
+  const lateWritePath = join(terminalRoot, "late-write.txt");
+  const terminalProcesses = new ProcessSessionManager({ maxRuntimeMs: 10_000, reaperIntervalMs: 25 });
+  try {
+    const pendingWrite = await terminalProcesses.start({
+      workspaceId: "workspace-terminal",
+      workSessionId: "work-session-terminal",
+      cwd: terminalRoot,
+      command: `sleep 1; printf late > ${JSON.stringify(lateWritePath)}`,
+      yieldTimeMs: 20,
+    });
+    assert.equal(pendingWrite.running, true, "delayed shell operation must still be running before cancellation");
+    await terminalProcesses.terminateByWorkSession("work-session-terminal");
+    assert.equal(terminalProcesses.getMetrics().running, 0, "terminal cleanup confirms the owned child stopped");
+    await assert.rejects(terminalProcesses.start({
+      workspaceId: "workspace-terminal",
+      workSessionId: "work-session-terminal",
+      cwd: terminalRoot,
+      command: "printf should-not-run",
+    }), /terminal; new process operations are fenced/);
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    assert.equal(existsSync(lateWritePath), false, "cancelled work session cannot perform its delayed filesystem write");
+  } finally {
+    await terminalProcesses.shutdown();
+    await rm(terminalRoot, { recursive: true, force: true });
+  }
+}
+
+// Linux is the supported production lifecycle platform. A detached command
+// must stop itself when the owning core dies, even when SIGKILL bypasses the
+// manager's graceful shutdown hook.
+if (process.platform === "linux") {
+  const crashRoot = await mkdtemp(join(tmpdir(), "kontrol-process-crash-owner-"));
+  const lateWritePath = join(crashRoot, "late-write-after-crash.txt");
+  const ownerScript = join(crashRoot, "crash-owner.mjs");
+  try {
+    const managerModule = new URL("./process-sessions.ts", import.meta.url).href;
+    const dbModule = new URL("./db/client.ts", import.meta.url).href;
+    const workSessionsModule = new URL("./work-sessions/index.ts", import.meta.url).href;
+    const workspaceStoreModule = new URL("./workspace-store.ts", import.meta.url).href;
+    const delayedCommand = `sleep 1; printf late > ${JSON.stringify(lateWritePath)}`;
+    writeFileSync(ownerScript, [
+      `import { ProcessSessionManager } from ${JSON.stringify(managerModule)};`,
+      `import { openDatabase } from ${JSON.stringify(dbModule)};`,
+      `import { createWorkSessionManager } from ${JSON.stringify(workSessionsModule)};`,
+      `import { createWorkspaceStore } from ${JSON.stringify(workspaceStoreModule)};`,
+      "const root = process.env.KONTROL_PROCESS_CRASH_FIXTURE_ROOT;",
+      "const stateDir = process.env.KONTROL_PROCESS_CRASH_FIXTURE_STATE;",
+      "const db = openDatabase(stateDir);",
+      "const workspaceStore = createWorkspaceStore(db);",
+      'workspaceStore.createSession({ id: "crash-fixture-workspace", root });',
+      "const workSessions = createWorkSessionManager(db, { onTerminal: () => new Promise(() => {}) });",
+      'const workSession = workSessions.create({ workspaceSessionId: "crash-fixture-workspace", submittedBy: "crash-fixture" });',
+      'const lease = workSessions.acquireWorkspaceLease({ canonicalRoot: root, workspaceSessionId: "crash-fixture-workspace", workSessionId: workSession.id });',
+      'if (!lease.acquired) throw new Error("fixture could not acquire checkout lease");',
+      "const manager = new ProcessSessionManager({ maxRuntimeMs: 10000, reaperIntervalMs: 25 });",
+      `await manager.start({ workspaceId: "crash-fixture-workspace", workSessionId: workSession.id, cwd: root, command: ${JSON.stringify(delayedCommand)}, yieldTimeMs: 20 });`,
+      "workSessions.updateStatus(workSession.id, 'cancelled');",
+      "process.stdout.write('terminal lease persisted\\n');",
+      "setInterval(() => {}, 1000);",
+    ].join("\n"));
+
+    const crashedOwner = spawn(process.execPath, ["--import", import.meta.resolve("tsx"), ownerScript], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        KONTROL_PROCESS_CRASH_FIXTURE_ROOT: crashRoot,
+        KONTROL_PROCESS_CRASH_FIXTURE_STATE: join(crashRoot, "state"),
+      },
+      stdio: ["ignore", "pipe", "inherit"],
+    });
+    let childOutput = "";
+    let resolveStarted!: () => void;
+    const started = new Promise<void>((resolve) => { resolveStarted = resolve; });
+    crashedOwner.stdout?.on("data", (chunk: Buffer) => {
+      childOutput += chunk.toString("utf8");
+      if (childOutput.includes("terminal lease persisted")) resolveStarted();
+    });
+    const childExit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      crashedOwner.once("error", reject);
+      crashedOwner.once("exit", (code, signal) => resolve({ code, signal }));
+    });
+    await started;
+    assert.match(childOutput, /terminal lease persisted/);
+
+    const liveDb = openDatabase(join(crashRoot, "state"));
+    const liveWorkSessions = createWorkSessionManager(liveDb);
+    try {
+      const liveLease = liveWorkSessions.getActiveWorkspaceLease(crashRoot);
+      assert.equal(liveLease?.leaseKind, "cleanup_pending",
+        "terminal checkout remains fenced while its old core and process cleanup are unresolved");
+    } finally {
+      liveWorkSessions.close();
+      liveDb.close();
+    }
+
+    crashedOwner.kill("SIGKILL");
+    const exit = await childExit;
+    assert.equal(exit.signal, "SIGKILL", "fixture core is killed without running graceful cleanup");
+
+    const restartedDb = openDatabase(join(crashRoot, "state"));
+    const restartedWorkSessions = createWorkSessionManager(restartedDb);
+    try {
+      const deadline = Date.now() + 3_000;
+      let activeLease = restartedWorkSessions.getActiveWorkspaceLease(crashRoot);
+      while (activeLease && Date.now() < deadline) {
+        assert.equal(activeLease.leaseKind, "cleanup_pending", "uncertain cleanup never degrades to an ordinary expiring lease");
+        const owner = parseLinuxProcessOwnerInstanceId(activeLease.ownerInstanceId);
+        assert.ok(owner, "new cleanup leases carry a PID-reuse-safe process identity");
+        // Reconcile runs on every lease read; a lease that survives a second
+        // consecutive read while its runner is gone would be a real fence
+        // leak. Two reads close the scan race between reconcile and the
+        // runner-presence check below.
+        const confirmedLease = restartedWorkSessions.getActiveWorkspaceLease(crashRoot);
+        if (!confirmedLease) { activeLease = undefined; break; }
+        assert.ok(findLinuxProcessSessionRunnerOwners([owner]).has(`${owner.pid}:${owner.identity}`),
+          "checkout remains fenced while the old detached runner is still draining");
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        activeLease = restartedWorkSessions.getActiveWorkspaceLease(crashRoot);
+      }
+      assert.equal(activeLease, undefined, "a terminal cleanup lease is released after its crashed owner's runner has exited");
+    } finally {
+      restartedWorkSessions.close();
+      restartedDb.close();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    assert.equal(existsSync(lateWritePath), false, "a detached shell cannot write after an abrupt core exit");
+  } finally {
+    await rm(crashRoot, { recursive: true, force: true });
+  }
+}
+
 // A trusted continuity owner is intentionally independent of one MCP
 // transport. Replacing the transport must not kill the interactive process,
 // while a different trusted identity still cannot attach to it.
@@ -630,7 +769,9 @@ try {
       ownerId: "client:cursor-test",
       cwd: process.cwd(),
       command: `${node} -e "process.stdout.write('ABC'); setInterval(() => {}, 1000)"`,
-      yieldTimeMs: 300,
+      // Crash-fenced launches spawn through the detached runner (tsx import
+      // overhead); allow enough yield for the first output to arrive.
+      yieldTimeMs: 8_000,
     });
     assert.ok(longRunning.sessionId);
     assert.match(longRunning.output, /ABC/);

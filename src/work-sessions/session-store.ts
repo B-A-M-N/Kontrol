@@ -28,12 +28,15 @@ export interface WorkSessionStoreDeps {
   db: DatabaseHandle;
   /** Release this session's workspace leases (lease-store callback). */
   releaseWorkspaceLeasesForSession(workSessionId: string): number;
+  /** Fence leases until owned child processes are confirmed stopped. */
+  markWorkspaceLeaseCleanupPending(workSessionId: string): number;
   /** Optional terminal-status observer (grant revocation in server.ts). */
-  onTerminal?: (workSessionId: string) => void;
+  onTerminal?: (workSessionId: string) => void | Promise<void>;
+  onTerminalFailure?: (workSessionId: string, error: unknown) => void;
 }
 
 export function createWorkSessionStore(deps: WorkSessionStoreDeps) {
-  const { db, releaseWorkspaceLeasesForSession, onTerminal } = deps;
+  const { db, releaseWorkspaceLeasesForSession, markWorkspaceLeaseCleanupPending, onTerminal, onTerminalFailure } = deps;
 
   const projectIdForWorkspace = (workspaceSessionId: string): string | undefined => {
     const row = db.db.select({ projectId: workspaceSessions.projectId })
@@ -191,8 +194,21 @@ export function createWorkSessionStore(deps: WorkSessionStoreDeps) {
         .where(eq(workSessions.id, id))
         .run();
       if (isTerminalStatus(status)) {
-        releaseWorkspaceLeasesForSession(id);
-        onTerminal?.(id);
+        // Fence the checkout lease until owned child processes are confirmed
+        // stopped. Without an onTerminal observer there is nothing to confirm
+        // against, so release immediately (legacy behavior for bare stores).
+        markWorkspaceLeaseCleanupPending(id);
+        if (!onTerminal) {
+          releaseWorkspaceLeasesForSession(id);
+        } else {
+          try {
+            void Promise.resolve(onTerminal(id))
+              .then(() => releaseWorkspaceLeasesForSession(id))
+              .catch((error) => onTerminalFailure?.(id, error));
+          } catch (error) {
+            onTerminalFailure?.(id, error);
+          }
+        }
       }
     },
   };

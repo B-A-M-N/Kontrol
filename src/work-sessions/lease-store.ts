@@ -12,6 +12,27 @@ import type { DatabaseHandle } from "../db/client.js";
 import { workspaceLeases } from "../db/schema.js";
 import type { WorkspaceLease, WorkspaceLeaseResult } from "./types.js";
 import { rowToWorkspaceLease } from "./internal.js";
+import { findLinuxProcessSessionRunnerOwners, linuxProcessOwnerInstanceId, parseLinuxProcessOwnerInstanceId, linuxProcessIdentity } from "../process-session-runner.js";
+
+function reconcileResolvedCleanupLeases(db: DatabaseHandle): void {
+  if (process.platform !== "linux") return;
+  const pending = db.sqlite.prepare("select work_session_id as workSessionId, owner_instance_id as ownerInstanceId from workspace_leases where lease_kind = 'cleanup_pending'")
+    .all() as Array<{ workSessionId: string; ownerInstanceId: string }>;
+  const parsed = pending.map((lease) => ({ lease, owner: parseLinuxProcessOwnerInstanceId(lease.ownerInstanceId) }))
+    .filter((entry): entry is { lease: typeof pending[number]; owner: { pid: number; identity: string } } => entry.owner !== undefined);
+  const deadOwners = [...new Map(parsed
+    .filter(({ owner }) => linuxProcessIdentity(owner.pid) !== owner.identity)
+    .map(({ owner }) => [`${owner.pid}:${owner.identity}`, owner])).values()];
+  const runners = findLinuxProcessSessionRunnerOwners(deadOwners);
+  for (const lease of pending) {
+    const owner = parseLinuxProcessOwnerInstanceId(lease.ownerInstanceId);
+    if (!owner) continue; // Legacy or malformed ownership remains fenced.
+    if (linuxProcessIdentity(owner.pid) === owner.identity) continue;
+    if (runners.has(`${owner.pid}:${owner.identity}`)) continue;
+    db.sqlite.prepare("delete from workspace_leases where work_session_id = ? and owner_instance_id = ? and lease_kind = 'cleanup_pending'")
+      .run(lease.workSessionId, lease.ownerInstanceId);
+  }
+}
 
 export function createWorkspaceLeaseStore(db: DatabaseHandle) {
   return {
@@ -22,17 +43,18 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
       ownerInstanceId?: string;
       ttlMs?: number;
       takeover?: boolean;
-      leaseKind?: "modify" | "peer_job";
+      leaseKind?: "modify" | "peer_job" | "cleanup_pending";
     }): WorkspaceLeaseResult {
       const now = new Date();
       const nowIso = now.toISOString();
       const expiresAt = new Date(now.getTime() + (input.ttlMs ?? 60 * 60 * 1000)).toISOString();
-      const ownerInstanceId = input.ownerInstanceId ?? process.pid.toString();
+      const ownerInstanceId = input.ownerInstanceId ?? linuxProcessOwnerInstanceId(process.pid) ?? process.pid.toString();
 
       return db.db.transaction(() => {
+        reconcileResolvedCleanupLeases(db);
         db.db
           .delete(workspaceLeases)
-          .where(sql`${workspaceLeases.expiresAt} < ${nowIso}`)
+          .where(sql`${workspaceLeases.expiresAt} < ${nowIso} and ${workspaceLeases.leaseKind} not in ('peer_job', 'cleanup_pending')`)
           .run();
 
         const existing = db.db
@@ -137,6 +159,14 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
       return result.changes > 0;
     },
 
+    markWorkspaceLeaseCleanupPending(workSessionId: string): number {
+      const result = db.db.update(workspaceLeases)
+        .set({ leaseKind: "cleanup_pending" })
+        .where(eq(workspaceLeases.workSessionId, workSessionId))
+        .run();
+      return result.changes;
+    },
+
     releaseWorkspaceLeasesForSession(workSessionId: string): number {
       const result = db.sqlite
         .prepare("delete from workspace_leases where work_session_id = ?")
@@ -173,13 +203,15 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
     },
 
     getActiveWorkspaceLease(canonicalRoot: string): WorkspaceLease | undefined {
+      reconcileResolvedCleanupLeases(db);
       const nowIso = new Date().toISOString();
       const lease = db.db
         .select()
         .from(workspaceLeases)
         .where(and(
           eq(workspaceLeases.canonicalRoot, canonicalRoot),
-          gte(workspaceLeases.expiresAt, nowIso),
+          // Durable recovery reservations never degrade by expiry alone.
+          sql`${workspaceLeases.leaseKind} in ('peer_job', 'cleanup_pending') or ${gte(workspaceLeases.expiresAt, nowIso)}`,
         ))
         .get();
       return lease ? rowToWorkspaceLease(lease) : undefined;

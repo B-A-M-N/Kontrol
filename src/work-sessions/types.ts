@@ -159,7 +159,7 @@ export interface WorkspaceLease {
   canonicalRoot: string;
   workspaceSessionId: string;
   workSessionId: string;
-  leaseKind: "modify" | "peer_job";
+  leaseKind: "modify" | "peer_job" | "cleanup_pending";
   ownerInstanceId: string;
   /** Owner-generation fencing token. Explicit takeover rotates it; renewal preserves it. */
   leaseNonce: string;

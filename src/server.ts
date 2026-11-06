@@ -425,7 +425,18 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     listAliveAgents: () => agentRegistry.listAlive(),
   };
   let revokeWorkSessionGrants: ((workSessionId: string) => void) | undefined;
-  const workSessions = createWorkSessionManager(db, { onTerminal: (workSessionId) => revokeWorkSessionGrants?.(workSessionId) });
+  const workSessions = createWorkSessionManager(db, {
+    onTerminal: async (workSessionId) => {
+      revokeWorkSessionGrants?.(workSessionId);
+      await processSessions.terminateByWorkSession(workSessionId);
+    },
+    onTerminalFailure: (workSessionId, error) => {
+      logEvent(config.logging, "error", "work_session_terminal_process_cleanup_failed", {
+        workSessionId,
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    },
+  });
   const agentRegistry = createAgentRegistryManager(db, { enabled: config.webhookEnabled, allowedHosts: config.webhookAllowedHosts });
   // Seed the well-known topology: the WebUI is the ACP reviewer;
   // the CLI coding agent registers itself as the ACP *agent* at runtime.

@@ -30,7 +30,7 @@ export function rowToWorkspaceLease(row: WorkspaceLeaseRow): WorkspaceLease {
     canonicalRoot: row.canonicalRoot,
     workspaceSessionId: row.workspaceSessionId,
     workSessionId: row.workSessionId,
-    leaseKind: row.leaseKind === "peer_job" ? "peer_job" : "modify",
+    leaseKind: row.leaseKind === "peer_job" ? "peer_job" : row.leaseKind === "cleanup_pending" ? "cleanup_pending" : "modify",
     ownerInstanceId: row.ownerInstanceId,
     leaseNonce: row.leaseNonce,
     acquiredAt: row.acquiredAt,

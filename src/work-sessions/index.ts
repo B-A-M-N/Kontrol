@@ -148,7 +148,8 @@ export interface WorkSessionManager {
 }
 
 export interface WorkSessionManagerOptions {
-  onTerminal?: (workSessionId: string) => void;
+  onTerminal?: (workSessionId: string) => void | Promise<void>;
+  onTerminalFailure?: (workSessionId: string, error: unknown) => void;
 }
 
 export function createWorkSessionManager(
@@ -163,7 +164,9 @@ export function createWorkSessionManager(
   const sessions = createWorkSessionStore({
     db: database,
     releaseWorkspaceLeasesForSession: (workSessionId) => leases.releaseWorkspaceLeasesForSession(workSessionId),
+    markWorkspaceLeaseCleanupPending: (workSessionId) => leases.markWorkspaceLeaseCleanupPending(workSessionId),
     onTerminal: options.onTerminal,
+    onTerminalFailure: options.onTerminalFailure,
   });
   const reviews = createReviewSubmissionStore(database, {
     releaseWorkspaceLeasesForSession: (workSessionId) => leases.releaseWorkspaceLeasesForSession(workSessionId),

@@ -1,7 +1,11 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 import { buildChildEnvironment } from "./process-environment.js";
+import { linuxProcessIdentity } from "./process-session-runner.js";
 import type { AgentPtyBindingStore } from "./agent-pty-bindings.js";
 import { isReadOnlyShellInspectionCommand } from "./read-only-shell.js";
 import { HeadTailBuffer, OutputLog } from "./process-output.js";
@@ -222,6 +226,7 @@ export function processEnvironment(additionalKeys?: Iterable<string>): Record<st
 
 export class ProcessSessionManager {
   private readonly sessions = new Map<string, ProcessSession>();
+  private readonly fencedWorkSessions = new Set<string>();
   private readonly launches = new Map<string, LaunchRecord>();
   private readonly maxBufferCharacters: number;
   private readonly completedSessionTtlMs: number;
@@ -249,6 +254,9 @@ export class ProcessSessionManager {
   }
 
   async start(input: StartCommandInput): Promise<ProcessSnapshot> {
+    if (input.workSessionId && this.fencedWorkSessions.has(input.workSessionId)) {
+      throw new Error("Work session is terminal; new process operations are fenced.");
+    }
     if (input.readOnlyInspection && !isReadOnlyShellInspectionCommand(input.command)) {
       throw new Error("Command is not permitted in read-only shell inspection mode.");
     }
@@ -424,6 +432,30 @@ export class ProcessSessionManager {
       if (session.running) session.process?.kill("SIGKILL");
     }
     await this.waitForSessions(running, Math.min(timeoutMs, 500));
+  }
+
+  /** Fence new launches, revoke poll capabilities, and confirm all children
+   * attributed to a terminal work session have stopped before its checkout
+   * lease may be released. A survivor is a hard failure and keeps the lease. */
+  async terminateByWorkSession(workSessionId: string, timeoutMs = 2_000): Promise<void> {
+    this.fencedWorkSessions.add(workSessionId);
+    const running = [...this.sessions.values()].filter((session) =>
+      session.running && session.workSessionId === workSessionId);
+    for (const session of running) {
+      if (session.recoveryCapabilityHash && session.recoveryCapability && session.principalId) {
+        this.revokeRecoveryCapability(session.recoveryCapability, session.principalId);
+      }
+      session.process?.kill("SIGTERM");
+    }
+    await this.waitForSessions(running, timeoutMs);
+    for (const session of running) {
+      if (session.running) session.process?.kill("SIGKILL");
+    }
+    await this.waitForSessions(running, Math.min(timeoutMs, 1_000));
+    const survivors = running.filter((session) => session.running);
+    if (survivors.length > 0) {
+      throw new Error(`Work session process shutdown is unconfirmed for ${survivors.length} child process(es).`);
+    }
   }
 
   getMetrics(): ProcessSessionMetrics {
@@ -694,13 +726,32 @@ export class ProcessSessionManager {
         GIT_CONFIG_VALUE_4: "",
       });
     }
-    const child = spawn(input.command, {
+    const crashFenced = process.platform === "linux";
+    let command = input.command;
+    if (crashFenced) {
+      const ownerIdentity = linuxProcessIdentity(process.pid);
+      if (!ownerIdentity) throw new Error("Cannot establish Linux process identity; refusing to launch an unfenced shell command.");
+      const moduleDir = dirname(fileURLToPath(import.meta.url));
+      const javascriptRunner = resolve(moduleDir, "process-session-runner.js");
+      const typescriptRunner = resolve(moduleDir, "process-session-runner.ts");
+      const runnerPath = existsSync(javascriptRunner) ? javascriptRunner : typescriptRunner;
+      const runnerArgs = existsSync(javascriptRunner)
+        ? [runnerPath, String(process.pid), ownerIdentity]
+        : ["--import", import.meta.resolve("tsx"), runnerPath, String(process.pid), ownerIdentity];
+      const quotedRunnerArgs = runnerArgs.map((value) => `'${value.replaceAll("'", "'\\''")}'`).join(" ");
+      // The runner is the detached process-group leader. It waits on a private
+      // launch pipe until this manager has attached all ownership/output
+      // handlers, then forwards the exact shell args and streams. If the core
+      // dies, the runner kills every descendant still in its process group.
+      command = `exec ${[`'${process.execPath.replaceAll("'", "'\\''")}'`, quotedRunnerArgs].join(" ")}`;
+    }
+    const child = spawn(crashFenced ? shell.executable : input.command, crashFenced ? [...shell.args.slice(0, -1), command] : [], {
       cwd: input.cwd,
       env,
-      stdio: "pipe",
+      stdio: crashFenced ? ["pipe", "pipe", "pipe", "pipe"] : "pipe",
       windowsHide: true,
       detached,
-      shell: shell.executable,
+      ...(!crashFenced && { shell: shell.executable }),
     });
 
     session.process = {
@@ -708,10 +759,26 @@ export class ProcessSessionManager {
       kill: (signal = "SIGTERM") => terminateProcessTree(child, signal, detached),
       resize: input.tty ? () => undefined : undefined,
     };
-    child.stdout.on("data", (data: Buffer) => this.append(session, data.toString("utf8")));
-    child.stderr.on("data", (data: Buffer) => this.append(session, data.toString("utf8")));
+    const handleStreamError = (error: NodeJS.ErrnoException) => {
+      if (error.code === "EPIPE" || error.code === "ECONNRESET") return;
+      this.append(session, `Process stream error (${error.code ?? "unknown"}).\n`);
+    };
+    child.stdin?.on("error", handleStreamError);
+    child.stdout?.on("error", handleStreamError);
+    child.stderr?.on("error", handleStreamError);
+    child.stdout?.on("data", (data: Buffer) => this.append(session, data.toString("utf8")));
+    child.stderr?.on("data", (data: Buffer) => this.append(session, data.toString("utf8")));
     child.on("error", (error) => this.append(session, `${error.message}\n`));
     child.on("close", (code, signal) => this.finish(session, code ?? undefined, signal ?? undefined));
+    if (crashFenced) {
+      const launchGate = child.stdio[3];
+      if (!launchGate || typeof launchGate === "number" || !("write" in launchGate)) {
+        child.kill("SIGKILL");
+        throw new Error("Could not establish process-session ownership launch gate.");
+      }
+      launchGate.on("error", handleStreamError);
+      launchGate.write(`${JSON.stringify({ command: input.command })}\n`);
+    }
   }
 
   private async startPty(session: ProcessSession, input: StartCommandInput): Promise<void> {
