@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -93,6 +94,21 @@ try {
       .some((column) => column.name === "operation_hash"),
     "canonical direct-operation hash column is present after migration",
   );
+  const legacyApprovalCommand = "bash --api-key=ghp_LEGACY_SYNTHETIC_SECRET_VALUE";
+  sqlite.prepare(`
+    insert into approval_requests (id, kind, workspace_session_id, title, command, options_json, status, created_at)
+    values (?, 'tool', ?, ?, ?, '{}', 'pending', ?)
+  `).run("legacy-command-approval", "migration-test-workspace", "legacy tool approval", legacyApprovalCommand, new Date().toISOString());
+  sqlite.prepare("update approval_requests set command_digest = null where id = ?").run("legacy-command-approval");
+  sqlite.prepare("delete from kontrol_schema_migrations where version = ?").run(LATEST_SCHEMA_VERSION);
+  migrateDatabase(sqlite);
+  const migratedApproval = sqlite.prepare("select command, command_digest from approval_requests where id = ?")
+    .get("legacy-command-approval") as { command: string | null; command_digest: string | null };
+  assert.equal(migratedApproval.command_digest, createHash("sha256").update(legacyApprovalCommand).digest("hex"),
+    "legacy approval preserves exact operation identity in a digest");
+  assert.ok(!migratedApproval.command?.includes("ghp_LEGACY_SYNTHETIC_SECRET_VALUE"),
+    "forward migration scrubs synthetic credentials from existing approval commands");
+  assert.ok(migratedApproval.command?.includes("[REDACTED]"), "legacy approval retains a bounded redacted preview");
   assert.ok(
     (sqlite.prepare("pragma table_info(telemetry_ingress)").all() as Array<{ name: string }>)
       .some((column) => column.name === "event_id"),

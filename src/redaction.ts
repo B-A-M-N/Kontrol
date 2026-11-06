@@ -72,6 +72,10 @@ export function redactString(text: string): string {
     /\b(KONTROL_[A-Z0-9_]*|ACP_[A-Z0-9_]*|OAUTH_[A-Z0-9_]*)\s*[=:]\s*("[^"]*"|'[^']*'|[^\s&"'`]+)/g,
     (_match, key: string) => `${key}=${REDACTED}`,
   );
+  // Credentials commonly appear as command-line arguments or bare provider
+  // tokens, including inside heredocs and multiline shell snippets.
+  result = result.replace(/(--?(?:api[-_]?key|access[-_]?token|token|secret|password|authorization)\s+)("[^"]*"|'[^']*'|[^\s&"'`]+)/gi, (_match, prefix: string) => `${prefix}${REDACTED}`);
+  result = result.replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,})\b/g, REDACTED);
   return result;
 }
 

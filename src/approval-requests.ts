@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, inArray, lt, or, sql } from "drizzle-orm";
+import { shellTelemetrySync } from "./redaction.js";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import { approvalRequests, type ApprovalRequestRow } from "./db/schema.js";
 import { DEFAULT_DIRECT_APPROVAL_REATTACH_GRACE_MS } from "./policy-approval-defaults.js";
@@ -25,6 +26,7 @@ export interface ApprovalRequest {
   principalId?: string;
   approvalKey?: string;
   operationHash?: string;
+  commandDigest?: string;
   mcpSessionId?: string;
   mcpRequestId?: string;
   waiterKey?: string;
@@ -65,6 +67,7 @@ export interface CreateApprovalRequestInput {
   principalId?: string;
   approvalKey?: string;
   operationHash?: string;
+  commandDigest?: string;
   mcpSessionId?: string;
   mcpRequestId?: string;
   waiterKey?: string;
@@ -131,6 +134,7 @@ export function createApprovalRequestManager(
 
   function create(input: CreateApprovalRequestInput): ApprovalRequest {
     const now = new Date().toISOString();
+    const commandTelemetry = input.command === undefined ? undefined : shellTelemetrySync(input.command);
     const request: ApprovalRequest = {
       approvalId: input.approvalId ?? `apr_${randomUUID()}`,
       kind: input.kind,
@@ -160,7 +164,8 @@ export function createApprovalRequestManager(
       description: input.description,
       risk: input.risk,
       tool: input.tool,
-      command: input.command,
+      commandDigest: input.commandDigest ?? commandTelemetry?.commandHash,
+      command: commandTelemetry?.commandPreview,
       path: input.path,
       options: input.options?.length ? input.options : defaultOptions(),
       status: "pending",
@@ -203,6 +208,7 @@ export function createApprovalRequestManager(
         description: request.description ?? null,
         risk: request.risk ?? null,
         tool: request.tool ?? null,
+        commandDigest: request.commandDigest ?? null,
         command: request.command ?? null,
         path: request.path ?? null,
         optionsJson: JSON.stringify(request.options),
@@ -510,6 +516,7 @@ function rowToApproval(row: ApprovalRequestRow): ApprovalRequest {
     description: row.description ?? undefined,
     risk: row.risk ?? undefined,
     tool: row.tool ?? undefined,
+    commandDigest: row.commandDigest ?? undefined,
     command: row.command ?? undefined,
     path: row.path ?? undefined,
     options: JSON.parse(row.optionsJson) as ApprovalOption[],

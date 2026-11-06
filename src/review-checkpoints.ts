@@ -189,6 +189,14 @@ export interface ReviewCheckpointManager {
     root: string;
     baseline: WorkspaceSnapshot;
   }): Promise<ReviewChangesResult>;
+  /** Advance only this presentation owner's baseline after an explicit ack of
+   * the exact snapshot they were shown. Returns false if the workspace moved. */
+  acknowledgePresentation(input: {
+    workspaceId: string;
+    root: string;
+    snapshot: WorkspaceSnapshotIdentity;
+    presentationOwnerId: string;
+  }): Promise<boolean>;
   /** Cheap exact-tree binding check for verifiers; does not build a diff. */
   assertTreeMatchesCommit(input: { workspaceId: string; root: string; baselineCommit: string }): Promise<boolean>;
   assertSnapshotMatches(input: { workspaceId: string; root: string; expected: WorkspaceSnapshot }): Promise<boolean>;
@@ -471,6 +479,28 @@ export function createReviewCheckpointManager(options: {
         snapshotRef: current,
         snapshotCommit: current,
       };
+    },
+
+    async acknowledgePresentation({ workspaceId, root, snapshot, presentationOwnerId }) {
+      const state = await ensureInitialized(workspaceId, root);
+      if (!state.backend) return false;
+      if (state.backend.kind !== snapshot.kind
+        || !await state.backend.compare(root, { ...snapshot, createdAt: new Date(0).toISOString() })) return false;
+      if (state.backend.kind === "filesystem") {
+        const current = { ...snapshot, createdAt: new Date().toISOString() };
+        const baselines = state.filesystemBaselines!;
+        baselines.presentations.set(presentationOwnerId, current);
+        if (presentationOwnerId === "default") baselines.presentation = current;
+        await getFsStore().saveBaselines(workspaceId, root, baselines);
+        return true;
+      }
+      const ref = presentationRefForOwner(state, workspaceId, presentationOwnerId);
+      await ensureRef(state.gitRoot!, ref, state.openRef);
+      const previous = (await git(state.gitRoot!, ["rev-parse", "--verify", `${ref}^{commit}`])).stdout.trim();
+      // update-ref with an expected old value is the cross-process CAS. The
+      // snapshot comparison above prevents acknowledging a stale display.
+      await git(state.gitRoot!, ["update-ref", ref, snapshot.ref, previous]);
+      return true;
     },
 
     async reviewChangesAgainstSnapshot({ workspaceId, root, baseline }) {

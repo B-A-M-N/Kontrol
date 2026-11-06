@@ -137,6 +137,25 @@ try {
     presentationOwnerId: "transport-tab-a",
   })).summary.files, 0, "the Git presentation owner sees its own advanced ref");
 
+  // Presentation reads never advance a checkpoint on their own. A separate
+  // owner-bound acknowledgement accepts only the exact tree the owner saw.
+  await writeFile(join(root, "README.md"), "hello\nworld\nshown but unsubmitted\nseparate transport baseline\nacknowledged edit\n");
+  const displayed = await manager.reviewChanges({
+    workspaceId: "ws_review", root, since: "last_shown", markReviewed: false,
+    presentationOwnerId: "ack-owner",
+  });
+  assert.equal(await manager.acknowledgePresentation({
+    workspaceId: "ws_review", root, snapshot: displayed.snapshot, presentationOwnerId: "ack-owner",
+  }), true, "explicit acknowledgement accepts the exact current snapshot");
+  assert.equal((await manager.reviewChanges({
+    workspaceId: "ws_review", root, since: "last_shown", markReviewed: false,
+    presentationOwnerId: "ack-owner",
+  })).summary.files, 0, "acknowledgement advances only that presentation owner's baseline");
+  await writeFile(join(root, "README.md"), "hello\nworld\nshown but unsubmitted\nseparate transport baseline\nacknowledged edit\npost-display edit\n");
+  assert.equal(await manager.acknowledgePresentation({
+    workspaceId: "ws_review", root, snapshot: displayed.snapshot, presentationOwnerId: "ack-owner",
+  }), false, "stale acknowledgement is rejected after the workspace changes");
+
   const sessionReview = await manager.reviewChanges({
     workspaceId: "ws_review",
     root,

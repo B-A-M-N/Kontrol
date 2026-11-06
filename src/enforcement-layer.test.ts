@@ -35,6 +35,25 @@ import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
     );
     assert.equal(decision.allowed, expected, `scheduled read-only policy decision for ${tool}`);
   }
+
+  const forgedAllowlist = { ...policy, allowedTools: ["write", "apply_patch", "bash", "exec_command", "write_stdin", "unknown_tool"] };
+  for (const tool of forgedAllowlist.allowedTools) {
+    const decision = authorizeWorkSessionAction(
+      { get: () => ({ completionPolicy: "webui_approval_required", status: "in_progress" }) } as never,
+      { workSessionId: "scheduled-read-only", tool, scheduledExecutionPolicy: forgedAllowlist },
+    );
+    assert.equal(decision.allowed, false, `signed allowlist cannot grant mutation or unknown tool ${tool}`);
+  }
+
+  const narrowed = { ...policy, allowedTools: ["read"] };
+  assert.equal(authorizeWorkSessionAction(
+    { get: () => ({ completionPolicy: "webui_approval_required", status: "in_progress" }) } as never,
+    { workSessionId: "scheduled-read-only", tool: "read", scheduledExecutionPolicy: narrowed },
+  ).allowed, true, "read-only audit retains explicitly granted inspection tools");
+  assert.equal(authorizeWorkSessionAction(
+    { get: () => ({ completionPolicy: "webui_approval_required", status: "in_progress" }) } as never,
+    { workSessionId: "scheduled-read-only", tool: "glob", scheduledExecutionPolicy: narrowed },
+  ).allowed, false, "a signed allowlist narrows the trusted read-only catalog");
 }
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-enforcement-"));

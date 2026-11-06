@@ -4,6 +4,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
+import { createHash } from "node:crypto";
 import { openDatabase, databasePath } from "./db/client.js";
 import { createPolicyEngine, parseMode, loadPolicyConfig } from "./policy.js";
 import { createSqliteGrantStore } from "./policy-grants.js";
@@ -710,7 +711,8 @@ db.close();
 {
   const resumeDb = openDatabase(mkdtempSync(join(tmpdir(), "kontrol-resume-")));
   const resumeApprovals = createApprovalRequestManager(resumeDb);
-  const resumeEventStore = createEventStore(mkdtempSync(join(tmpdir(), "kontrol-resume-events-")));
+  const resumeEventDir = mkdtempSync(join(tmpdir(), "kontrol-resume-events-"));
+  const resumeEventStore = createEventStore(resumeEventDir);
   const resumePolicy = createPolicyEngine(
     { defaultMode: "ask", toolRules: { bash: "ask" }, pathRules: [] },
     undefined,
@@ -793,6 +795,38 @@ db.close();
   });
   assert.equal(pendingResume.approvalRequired, true);
   assert.equal(pendingResume.approvalId, pendingFirst.approvalId, "pending resume reattaches to the SAME durable card");
+
+  // Approval history retains only a redacted bounded preview; exact retry
+  // identity comes from the operation and command digests, not stored text.
+  const secret = `ghp_${"A".repeat(36)}`;
+  const sensitiveCommand = `printf --api-key ${secret}\ncat <<'EOF'\nGITHUB_TOKEN=${secret}\nEOF`;
+  const sensitive = await resumeEnforcer.enforce({
+    ...base,
+    command: sensitiveCommand,
+    mcpSessionId: "transport-secret",
+    blockingApproval: false,
+  });
+  assert.equal(sensitive.approvalRequired, true);
+  const safeCard = resumePolicy.getPendingApprovals().find((request) => request.id === sensitive.approvalId);
+  assert.ok(safeCard?.command);
+  assert.equal(safeCard.command!.includes(secret), false, "pending approval projection must not expose the credential");
+  assert.equal(safeCard.commandDigest, createHash("sha256").update(sensitiveCommand).digest("hex"));
+  const persistedApproval = resumeDb.sqlite.prepare("select command, command_digest from approval_requests where id = ?")
+    .get(sensitive.approvalId) as { command: string | null; command_digest: string | null };
+  assert.equal(JSON.stringify(persistedApproval).includes(secret), false, "SQLite approval row must not retain the credential");
+  assert.equal(persistedApproval.command_digest, createHash("sha256").update(sensitiveCommand).digest("hex"));
+  const eventDb = new Database(databasePath(resumeEventDir));
+  const eventRows = eventDb.prepare("select payload from event_log").all() as Array<{ payload: string }>;
+  assert.equal(eventRows.some((row) => row.payload.includes(secret)), false, "durable approval events must redact the credential");
+  eventDb.close();
+  const sensitiveRetry = await resumeEnforcer.enforce({
+    ...base,
+    command: sensitiveCommand,
+    mcpSessionId: "transport-secret-retry",
+    approvalResumeId: sensitive.approvalId,
+    blockingApproval: false,
+  });
+  assert.equal(sensitiveRetry.approvalId, sensitive.approvalId, "exact digest-bound retry reattaches to the same approval");
   resumeDb.close();
 }
 

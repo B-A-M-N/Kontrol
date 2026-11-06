@@ -29,6 +29,7 @@ import { randomUUID } from "node:crypto";
 import { brandWorkSessionId, brandWorkspaceId, type WorkSessionId, type WorkspaceId } from "./branded.js";
 import type { ApprovalOption, ApprovalRequestManager } from "./approval-requests.js";
 import { DEFAULT_DIRECT_APPROVAL_REATTACH_GRACE_MS } from "./policy-approval-defaults.js";
+import { shellTelemetrySync } from "./redaction.js";
 
 export type PolicyMode = "allow" | "deny" | "ask";
 export type PolicySource = "path" | "tool" | "default";
@@ -69,6 +70,7 @@ export interface ToolApprovalRequest {
   agentId?: string;
   approvalKey?: string;
   operationHash?: string;
+  commandDigest?: string;
   mcpSessionId?: string;
   mcpRequestId?: string;
   waiterKey?: string;
@@ -112,7 +114,7 @@ export interface OperationResumeContent {
   tool: string;
   approvalKey: string;
   path?: string;
-  command?: string;
+  commandDigest: string;
   operationHash: string;
 }
 
@@ -524,6 +526,7 @@ export function createPolicyEngine(
             agentId: request.agentId,
             approvalKey: request.approvalKey,
             operationHash: request.operationHash,
+            commandDigest: request.commandDigest,
             mcpSessionId: request.mcpSessionId,
             mcpRequestId: request.mcpRequestId,
             waiterKey: request.waiterKey,
@@ -563,6 +566,7 @@ export function createPolicyEngine(
             agentId: request.agentId,
             approvalKey: request.approvalKey,
             operationHash: request.operationHash,
+            commandDigest: request.commandDigest,
             mcpSessionId: request.mcpSessionId,
             mcpRequestId: request.mcpRequestId,
             waiterKey: request.waiterKey,
@@ -666,6 +670,7 @@ export function createPolicyEngine(
           agentId: request.agentId,
           approvalKey: request.approvalKey,
           operationHash: request.operationHash,
+          commandDigest: request.commandDigest,
           mcpSessionId: request.mcpSessionId,
           mcpRequestId: request.mcpRequestId,
           waiterKey: request.waiterKey,
@@ -773,52 +778,59 @@ export function createPolicyEngine(
     if ((durable.tool ?? "") !== content.tool) return undefined;
     if (durable.approvalKey !== content.approvalKey) return undefined;
     if ((durable.path ?? undefined) !== (content.path ?? undefined)) return undefined;
-    if ((durable.command ?? undefined) !== (content.command ?? undefined)) return undefined;
     if (!durable.operationHash || durable.operationHash !== content.operationHash) return undefined;
+    if (!durable.commandDigest || durable.commandDigest !== content.commandDigest) return undefined;
     return durable.waiterKey ?? undefined;
   }
 
   function addPending(request: ToolApprovalRequest): void {
-    pendingApprovals.set(request.id, request);
-    if (request.liveWaiterId) {
-      let set = liveWaitersByApproval.get(request.id);
+    const commandTelemetry = request.command === undefined ? undefined : shellTelemetrySync(request.command);
+    const safeRequest = {
+      ...request,
+      command: commandTelemetry?.commandPreview,
+      commandDigest: request.commandDigest ?? commandTelemetry?.commandHash,
+    };
+    pendingApprovals.set(safeRequest.id, safeRequest);
+    if (safeRequest.liveWaiterId) {
+      let set = liveWaitersByApproval.get(safeRequest.id);
       if (!set) {
         set = new Set();
-        liveWaitersByApproval.set(request.id, set);
+        liveWaitersByApproval.set(safeRequest.id, set);
       }
-      set.add(request.liveWaiterId);
+      set.add(safeRequest.liveWaiterId);
     }
     if (approvalRequests) {
       approvalRequests.create({
-        approvalId: request.id,
+        approvalId: safeRequest.id,
         kind: "tool",
-        workspaceSessionId: request.workspaceId,
-        workSessionId: request.workSessionId,
-        ownerContextId: request.ownerContextId,
-        runId: request.runId,
-        agentId: request.agentId,
-        approvalKey: request.approvalKey,
-        operationHash: request.operationHash,
-        mcpSessionId: request.mcpSessionId,
-        mcpRequestId: request.mcpRequestId,
-        waiterKey: request.waiterKey,
-        liveWaiterId: request.liveWaiterId,
-        principalId: request.principalId,
-        origin: request.origin,
-        conversationId: request.conversationId,
-        orphanedAt: request.orphanedAt,
-        reattachDeadline: request.reattachDeadline,
-        title: `Approve ${request.tool}`,
-        tool: request.tool,
-        path: request.path,
-        command: request.command,
+        workspaceSessionId: safeRequest.workspaceId,
+        workSessionId: safeRequest.workSessionId,
+        ownerContextId: safeRequest.ownerContextId,
+        runId: safeRequest.runId,
+        agentId: safeRequest.agentId,
+        approvalKey: safeRequest.approvalKey,
+        operationHash: safeRequest.operationHash,
+        commandDigest: safeRequest.commandDigest,
+        mcpSessionId: safeRequest.mcpSessionId,
+        mcpRequestId: safeRequest.mcpRequestId,
+        waiterKey: safeRequest.waiterKey,
+        liveWaiterId: safeRequest.liveWaiterId,
+        principalId: safeRequest.principalId,
+        origin: safeRequest.origin,
+        conversationId: safeRequest.conversationId,
+        orphanedAt: safeRequest.orphanedAt,
+        reattachDeadline: safeRequest.reattachDeadline,
+        title: `Approve ${safeRequest.tool}`,
+        tool: safeRequest.tool,
+        path: safeRequest.path,
+        command: safeRequest.command,
         // P1.10: server-created options are authoritative. They travel in
         // the durable row so a rehydrated client (via list_pending_approvals)
         // never has to invent scopes. Approve Session only appears when
         // there is an actual work session to attach it to.
         options: request.options ?? [
           { id: "approve", label: "Approve Once", effect: "approve", scope: "once" },
-          ...(request.workSessionId ? [{ id: "approve_session", label: "Approve Session", effect: "approve" as const, scope: "work_session" as const }] : []),
+          ...(safeRequest.workSessionId ? [{ id: "approve_session", label: "Approve Session", effect: "approve" as const, scope: "work_session" as const }] : []),
           { id: "approve_workspace", label: "Approve Workspace", effect: "approve" as const, scope: "workspace" as const },
           { id: "deny", label: "Deny", effect: "deny" },
         ],

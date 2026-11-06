@@ -3,6 +3,7 @@ import type { WorkSessionId, WorkspaceId } from "./branded.js";
 import type { PolicyEngine, PolicyDecision, ApprovalScope, PolicyInputPath } from "./policy.js";
 import { CANONICAL_TOOL_ALIASES } from "./policy.js";
 import type { EventStore } from "./event-log.js";
+import { shellTelemetrySync } from "./redaction.js";
 
 /**
  * "peer" is a separately-authenticated integration identity. It carries NO
@@ -255,6 +256,7 @@ export function createPolicyEnforcer(
       ): Promise<{ allowed: boolean; decision: PolicyDecision; outcome?: PolicyWaitOutcome; approvalRequired?: boolean; approvalId?: string }> {
         const approvalKey = decision.approvalKey!;
         const operationHash = canonicalOperationHash(inv, approvalKey, path);
+        const commandDigest = shellTelemetrySync(inv.command ?? "").commandHash;
         // Explicit resume identity wins over the fingerprint: the caller
         // echoes the approvalId from its approval_required card. Content is
         // verified against the durable row before the original identity is
@@ -272,7 +274,7 @@ export function createPolicyEnforcer(
               tool: canonical,
               approvalKey,
               path: policyPathLabel(path),
-              command: inv.command,
+              commandDigest,
               operationHash,
             })
           : undefined;
@@ -309,7 +311,7 @@ export function createPolicyEnforcer(
           workSessionId: inv.workSessionId,
           tool: canonical,
           path: policyPath,
-          command: inv.command,
+          command: inv.command === undefined ? undefined : shellTelemetrySync(inv.command).commandPreview,
           mcpSessionId: inv.mcpSessionId,
           mcpRequestId: inv.mcpRequestId,
           coalesced: isCoalesced,
@@ -353,6 +355,7 @@ export function createPolicyEnforcer(
             runId: inv.runId,
             approvalKey,
             operationHash,
+            commandDigest,
             mcpSessionId: inv.mcpSessionId,
             mcpRequestId: inv.mcpRequestId,
             waiterKey: rowKey,
@@ -365,7 +368,7 @@ export function createPolicyEnforcer(
             options,
             tool: canonical,
             path: policyPath,
-            command: inv.command,
+            command: inv.command === undefined ? undefined : shellTelemetrySync(inv.command).commandPreview,
           });
 
           const payload: PolicyApprovalEventPayload = {
@@ -376,7 +379,7 @@ export function createPolicyEnforcer(
             principalId: inv.principalId,
             tool: canonical,
             path: policyPath,
-            command: inv.command,
+            command: inv.command === undefined ? undefined : shellTelemetrySync(inv.command).commandPreview,
             approvalKey,
             approvalKeyType: decision.source,
             matchedPattern: decision.matchedPattern,

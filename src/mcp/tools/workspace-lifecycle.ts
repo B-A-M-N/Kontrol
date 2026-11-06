@@ -473,22 +473,17 @@ export function registerLifecycleTools(
             .enum(["last_shown", "workspace_open"])
             .optional()
             .describe("Defaults to last_shown, which is correct for normal end-of-turn review. Use workspace_open only when the user asks to review all changes since opening the workspace."),
-          markReviewed: z
-            .boolean()
-            .optional()
-            .describe("Defaults to true. When true, advances the last shown checkpoint to the current workspace state."),
         },
       outputSchema: resultOutputSchema({
           snapshotKind: z.enum(["git", "filesystem"]).optional(),
           snapshotRef: z.string().optional(),
         }),
         ...workspaceAppRenderToolDescriptorMeta(),
-        // The default markReviewed=true advances the workspace checkpoint.
-        // Keep the existing end-of-turn acknowledgement behavior, but do not
-        // advertise this state-changing operation as read-only to MCP hosts.
-        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+        // Diff presentation is strictly read-only. A separate acknowledgement
+        // tool performs the owner-bound, snapshot-checked checkpoint update.
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
       },
-      async ({ workspaceId, since, markReviewed }) => {
+      async ({ workspaceId, since }) => {
         const startedAt = performance.now();
         const workspace = workspaces.getWorkspace(workspaceId);
       {
@@ -499,7 +494,7 @@ export function registerLifecycleTools(
           workspaceId,
           root: workspace.root,
           since: since ?? "last_shown",
-          markReviewed: markReviewed ?? true,
+          markReviewed: false,
           presentationOwnerId: processSessionOwnerId(connectionContext) ?? "default",
         });
 
@@ -510,7 +505,7 @@ export function registerLifecycleTools(
           success: true,
           durationMs: Math.round(performance.now() - startedAt),
         });
-        trackToolEvent(workspaceId, "show_changes", { since, markReviewed }, { content, isError: false }, startedAt);
+        trackToolEvent(workspaceId, "show_changes", { since }, { content, isError: false }, startedAt);
 
         return {
           content,
@@ -531,6 +526,42 @@ export function registerLifecycleTools(
             snapshotKind: review.snapshotKind,
             snapshotRef: review.snapshotRef,
           },
+        };
+      },
+    );
+
+    server.registerTool(
+      registeredTool("acknowledge_changes"),
+      {
+        title: "Acknowledge displayed changes",
+        description: "Explicitly acknowledge the exact snapshot returned by show_changes for this connection. The acknowledgement is rejected if the workspace changed after display and advances only this connection's presentation checkpoint; it does not approve or submit work.",
+        inputSchema: {
+          workspaceId: z.string(),
+          snapshotKind: z.enum(["git", "filesystem"]),
+          snapshotRef: z.string().min(1),
+        },
+        outputSchema: resultOutputSchema({ acknowledged: z.boolean() }),
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+      },
+      async ({ workspaceId, snapshotKind, snapshotRef }) => {
+        const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
+        if (bindingErr) return bindingErr;
+        if (connectionContext?.authenticatedRole === "peer" || connectionContext?.authenticatedRole === "worker") {
+          return { content: [textBlock("Only the workspace owner may acknowledge displayed changes.")], isError: true };
+        }
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const acknowledged = await reviewCheckpoints.acknowledgePresentation({
+          workspaceId,
+          root: workspace.root,
+          snapshot: { kind: snapshotKind, ref: snapshotRef },
+          presentationOwnerId: processSessionOwnerId(connectionContext) ?? "default",
+        });
+        return {
+          content: [textBlock(acknowledged
+            ? "Displayed snapshot acknowledged for this connection. This does not approve or submit the work."
+            : "Acknowledgement rejected because the workspace changed after the snapshot was displayed.")],
+          structuredContent: { acknowledged },
+          isError: !acknowledged,
         };
       },
     );

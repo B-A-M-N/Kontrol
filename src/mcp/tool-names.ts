@@ -25,6 +25,7 @@ export const toolNames = {
   pollProcess: "poll_process",
   execCommand: "exec_command",
   writeStdin: "write_stdin",
+  acknowledgeChanges: "acknowledge_changes",
   enqueuePeerJob: "enqueue_peer_job",
   cancelPeerJob: "cancel_peer_job",
 } as const;
@@ -68,7 +69,7 @@ const serverInstructionCache = new Map<string, string>();
 
 function serverInstructions(config: ServerConfig): string {
   const showChangesInstruction = config.widgets !== "off"
-    ? " If you successfully create, edit, overwrite, delete, move, or apply patches to files in a turn, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. Do not call it after every individual change; do not skip it because individual file-change tools already returned diffs. When the user asks to open or inspect the workspace UI, call show_workspace_ui with the existing workspaceId."
+    ? " If you successfully create, edit, overwrite, delete, move, or apply patches to files in a turn, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. This only displays a snapshot and does not acknowledge, approve, or submit it. Call acknowledge_changes only when the owner explicitly acknowledges that exact displayed snapshot. Do not call it after every individual change; do not skip it because individual file-change tools already returned diffs. When the user asks to open or inspect the workspace UI, call show_workspace_ui with the existing workspaceId."
     : "";
 
   if (config.toolMode === "codex") {

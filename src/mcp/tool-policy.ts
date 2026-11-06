@@ -13,6 +13,7 @@ import { authorizeWorkSessionAction } from "../work-session-action-guard.js";
 import type { WorkSessionManager } from "../work-sessions.js";
 import { mcpRequestContext } from "./request-context.js";
 import { mcpOwnerContextId } from "./owner-context.js";
+import { shellTelemetrySync } from "../redaction.js";
 
 function directPolicyPrincipal(workspaceId: string): string {
   const context = mcpRequestContext.getStore();
@@ -58,11 +59,11 @@ export function policyFailureResponse(
       summary: {
         status: "approval_required",
         approvalId: result.approvalId,
-        command: context.command,
+        command: context.command === undefined ? undefined : shellTelemetrySync(context.command).commandPreview,
       },
     };
     if (context.path !== undefined) card.path = context.path;
-    if (context.command !== undefined) card.command = context.command;
+    if (context.command !== undefined) card.command = shellTelemetrySync(context.command).commandPreview;
     return {
       content: [{ type: "text", text: message }],
       isError: false,
@@ -80,10 +81,10 @@ export function policyFailureResponse(
     tool: context.tool,
     workspaceId: context.workspaceId,
     status: "policy_denied",
-    summary: { status: "policy_denied", command: context.command },
+    summary: { status: "policy_denied", command: context.command === undefined ? undefined : shellTelemetrySync(context.command).commandPreview },
   };
   if (context.path !== undefined) card.path = context.path;
-  if (context.command !== undefined) card.command = context.command;
+  if (context.command !== undefined) card.command = shellTelemetrySync(context.command).commandPreview;
   return {
     content: [{ type: "text", text: deniedMessage }],
     isError: true,

@@ -103,8 +103,14 @@ function scheduledReadOnlyDecision(
 ): { allowed: boolean; reason?: string } {
   if (!policy || policy.workspaceAccess !== "read_only" || policy.mutate !== false) return { allowed: true };
   const actionClass = TOOL_TO_ACTION_CLASS[input.tool];
-  if (actionClass === "read_files") return { allowed: true };
-  if (policy.allowedTools?.includes(input.tool)) return { allowed: true };
+  // A grant may narrow the registered read-only tool set, but it cannot turn
+  // an unknown or mutation-capable tool into a read-only capability by naming
+  // it. Tool classification is server-owned; the signed allowlist is only an
+  // additional restriction.
+  if (actionClass === "read_files"
+    && (policy.allowedTools === undefined || policy.allowedTools.includes(input.tool))) {
+    return { allowed: true };
+  }
   return {
     allowed: false,
     reason: `Scheduled read-only audit policy denies tool "${input.tool}".`,
