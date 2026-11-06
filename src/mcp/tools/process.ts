@@ -24,6 +24,7 @@ import {
 } from "../process-tool-response.js";
 import { processSessionOwnerId } from "../connection-context.js";
 import type { ConnectionContext } from "../connection-context.js";
+import type { createReviewCheckpointManager } from "../../review-checkpoints.js";
 import { createAgentPtyReviewCredential } from "../../agent-pty-review-credential.js";
 
 /**
@@ -44,6 +45,7 @@ export function registerProcessControlTools(
   connectionContext?: ConnectionContext,
   prepareForMutation?: (workspaceId: string) => Promise<void>,
   scheduledExecutionPolicyFor?: (workSessionId: string) => import("../../work-session-action-guard.js").ScheduledExecutionPolicy | undefined,
+  reviewCheckpoints?: ReturnType<typeof createReviewCheckpointManager>,
 ): void {
   const scheduledExecutionPolicy = (workSessionId: string | undefined) =>
     workSessionId && scheduledExecutionPolicyFor ? scheduledExecutionPolicyFor(workSessionId) : undefined;
@@ -135,8 +137,16 @@ export function registerProcessControlTools(
         }
       }
 
-      const response = await (async () => {
-        const snapshot = await processSessions.start({
+      const mutationIntentId = await reviewCheckpoints?.beginMutationIntent({
+        workspaceId,
+        root: workspace.root,
+        workSessionId: connectionContext?.workSessionId,
+        paths: [],
+      });
+      let response: Awaited<ReturnType<typeof processToolResponse>>;
+      try {
+        response = await (async () => {
+          const snapshot = await processSessions.start({
           workspaceId,
           ownerId: processSessionOwnerId(connectionContext),
           workSessionId: connectionContext?.workSessionId,
@@ -165,15 +175,20 @@ export function registerProcessControlTools(
           maxOutputTokens,
           clientMutationId,
         });
-        return processToolResponse("exec_command", workspaceId, snapshot, {
-          command: cmd,
-          workingDirectory: workingDirectory ?? ".",
-          running: snapshot.running,
-          exitCode: snapshot.exitCode,
-          wallTimeMs: snapshot.wallTimeMs,
-        startedAtEpochMs: snapshot.startedAtEpochMs,
-        });
-      })();
+          return processToolResponse("exec_command", workspaceId, snapshot, {
+            command: cmd,
+            workingDirectory: workingDirectory ?? ".",
+            running: snapshot.running,
+            exitCode: snapshot.exitCode,
+            wallTimeMs: snapshot.wallTimeMs,
+            startedAtEpochMs: snapshot.startedAtEpochMs,
+          });
+        })();
+      } finally {
+        if (mutationIntentId) {
+          await reviewCheckpoints?.resolveMutationIntent({ workspaceId, operationId: mutationIntentId, outcome: "unknown" });
+        }
+      }
 
       logToolCall(config, {
         tool: "exec_command",
@@ -272,7 +287,17 @@ export function registerProcessControlTools(
         }
       }
 
-      const snapshot = await processSessions.write({
+      const mutationIntentId = hasInput
+        ? await reviewCheckpoints?.beginMutationIntent({
+          workspaceId,
+          root: workspaces.getWorkspace(workspaceId).root,
+          workSessionId: connectionContext?.workSessionId,
+          paths: [],
+        })
+        : undefined;
+      let snapshot;
+      try {
+        snapshot = await processSessions.write({
         workspaceId,
         sessionId,
         ownerId: processSessionOwnerId(connectionContext),
@@ -282,7 +307,12 @@ export function registerProcessControlTools(
         rows,
         yieldTimeMs,
         maxOutputTokens,
-      });
+        });
+      } finally {
+        if (mutationIntentId) {
+          await reviewCheckpoints?.resolveMutationIntent({ workspaceId, operationId: mutationIntentId, outcome: "unknown" });
+        }
+      }
 
       logToolCall(config, {
         tool: "write_stdin",

@@ -598,7 +598,7 @@ export function createMcpServer(
   // authorized stdin and resize; pure polls stay read-only). Enforcement is
   // the same single implementation in all modes.
   // P1-02: scheduled read-only execution policy is enforced at the tool boundary.
-  registerProcessControlTools(server, config, workspaces, processSessions, workSessions, policyEnforcer, policyEngine, connectionContext, prepareForMutation, scheduledExecutionPolicyFor);
+  registerProcessControlTools(server, config, workspaces, processSessions, workSessions, policyEnforcer, policyEngine, connectionContext, prepareForMutation, scheduledExecutionPolicyFor, reviewCheckpoints);
 
   // Policy approval tools — available whenever policy engine is configured.
   // The role is passed through from the authenticated transport: only a

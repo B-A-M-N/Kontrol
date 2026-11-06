@@ -19,6 +19,8 @@ import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { loadConfig } from "./config.js";
+import Database from "better-sqlite3";
+import { migrateDatabase } from "./db/migrations.js";
 
 // A healthy non-Git workspace: the filesystem backend must initialize.
 const healthyRoot = mkdtempSync(join(tmpdir(), "kontrol-checkpoint-healthy-"));
@@ -51,7 +53,9 @@ function baseEnv(): Record<string, string> {
 async function startClient(env: Record<string, string>, snapshotStoreRoot: string = healthyStoreRoot) {
   const config = loadConfig(env);
   const workspaces = new WorkspaceRegistry(config);
-  const checkpoints = createReviewCheckpointManager({ snapshotStoreRoot });
+  const provenanceDb = new Database(join(stateDir, `provenance-${Math.random().toString(16).slice(2)}.sqlite`));
+  migrateDatabase(provenanceDb);
+  const checkpoints = createReviewCheckpointManager({ snapshotStoreRoot, mutationProvenanceSqlite: provenanceDb });
   const processSessions = new ProcessSessionManager({ childEnvironmentAllowlist: [] });
   const server = createMcpServer(
     config,
@@ -69,7 +73,9 @@ async function startClient(env: Record<string, string>, snapshotStoreRoot: strin
       await client.close();
       await server.close();
       await checkpoints.drain();
+      provenanceDb.close();
     },
+    provenanceDb,
   };
 }
 
@@ -79,7 +85,7 @@ async function callTool(client: Client, name: string, args: Record<string, unkno
 
 // ── Healthy workspace: bash crosses the barrier and succeeds ──
 {
-  const { client, close } = await startClient(baseEnv());
+  const { client, close, provenanceDb } = await startClient(baseEnv());
   const opened = await callTool(client, "open_workspace", { path: healthyRoot, mode: "checkout" });
   const structured = (opened as { structuredContent?: Record<string, unknown> }).structuredContent ?? {};
   assert.equal(structured.checkpointBackend, "pending", "open_workspace defers filesystem baseline capture");
@@ -88,6 +94,22 @@ async function callTool(client: Client, name: string, args: Record<string, unkno
   const shell = await callTool(client, "bash", { workspaceId: structured.workspaceId, command: "echo barrier-crossed" });
   const shellStructured = (shell as { structuredContent?: Record<string, unknown>; isError?: boolean }).structuredContent ?? {};
   assert.notEqual(shell.isError, true, `bash succeeds once the baseline is ready: ${JSON.stringify(shellStructured)}`);
+
+  const shellMutation = await callTool(client, "bash", {
+    workspaceId: structured.workspaceId,
+    command: "mkdir -p node_modules && touch .env.local node_modules/hidden.js untracked.txt",
+  });
+  assert.notEqual(shellMutation.isError, true, "the authorized shell mutation executes in the disposable workspace");
+  assert.equal(existsSync(join(healthyRoot, ".env.local")), true);
+  assert.equal(existsSync(join(healthyRoot, "node_modules", "hidden.js")), true);
+  assert.equal(existsSync(join(healthyRoot, "untracked.txt")), true);
+  const opaqueIntent = provenanceDb.prepare(`
+    select state, path from review_mutation_provenance
+     where workspace_id = ? and work_session_id = ''
+     order by created_at desc limit 1
+  `).get(structured.workspaceId) as { state: string; path: string | null } | undefined;
+  assert.deepEqual(opaqueIntent, { state: "unknown", path: null },
+    "shell-created ignored, excluded, and untracked files are covered by durable unknown provenance rather than command parsing");
   await close();
 }
 

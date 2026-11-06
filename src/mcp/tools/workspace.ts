@@ -337,6 +337,14 @@ export function registerWorkspaceTools(
       // A command's child lifetime is independent from the MCP request. The
       // bounded yield returns a process handle; poll_process owns later
       // observation after a gateway or connector drops the original request.
+      const mutationIntentId = input.readOnlyInspection
+        ? undefined
+        : await reviewCheckpoints.beginMutationIntent({
+          workspaceId,
+          root: workspace.root,
+          workSessionId: connectionContext?.workSessionId,
+          paths: [],
+        });
       const response: any = await (async () => {
         try {
           const snapshot = await processSessions.start({
@@ -361,6 +369,10 @@ export function registerWorkspaceTools(
           });
         } catch (error) {
           return { content: [textBlock(error instanceof Error ? error.message : String(error))], isError: true };
+        } finally {
+          if (mutationIntentId) {
+            await reviewCheckpoints.resolveMutationIntent({ workspaceId, operationId: mutationIntentId, outcome: "unknown" });
+          }
         }
       })();
 
