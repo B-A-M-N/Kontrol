@@ -179,6 +179,7 @@ const reviewCheckpoints = {
     files: baselineCommit === currentSnapshot ? [] : [{ path: "x.txt", operation: "update", additions: 1, removals: 1 }],
     snapshotCommit: currentSnapshot,
   }),
+  checkpointCoverage: async () => ({ status: "complete", backend: "git", uncoveredPaths: [], reasons: [], assessedAt: new Date().toISOString() }),
   commitReviewed: async () => {},
 } as any;
 
@@ -249,6 +250,20 @@ const config: BridgeConfig = {
 };
 
 function createSession(): string {
+  // Fixture hygiene: this harness drives the review workflow directly and
+  // bypasses lifecycle lease release, so an abandoned prior scenario's
+  // checkout lease (workspace root is the "/tmp" stub above) would fence
+  // unrelated scenarios under lease-fenced approval. Quiesce a prior
+  // scenario's lease before creating a new session. Intentional fencing
+  // scenarios acquire their lease after creation (via submit/dispatch),
+  // so they are unaffected.
+  const prior = workSessions.getActiveWorkspaceLease("/tmp");
+  if (prior) {
+    const priorStatus = workSessions.get(prior.workSessionId)?.status;
+    if (priorStatus && ["approved", "rejected", "cancelled", "failed", "failed_protocol", "changes_requested"].includes(priorStatus)) {
+      workSessions.releaseWorkspaceLeasesForSession(prior.workSessionId);
+    }
+  }
   return workSessions.create({ workspaceSessionId: WS, submittedBy: "webui" }).id;
 }
 

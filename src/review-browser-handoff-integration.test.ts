@@ -228,6 +228,7 @@ try {
       summary: baselineCommit === currentSnapshot ? { files: 0, additions: 0, removals: 0 } : { files: 1, additions: 1, removals: 1 },
       snapshotCommit: currentSnapshot,
     }),
+    checkpointCoverage: async () => ({ status: "complete", backend: "git", uncoveredPaths: [], reasons: [], assessedAt: new Date().toISOString() }),
     commitReviewed: async () => {},
   } as any;
 

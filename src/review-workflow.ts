@@ -12,6 +12,7 @@ import type { WorkspaceRegistry } from "./workspaces.js";
 import type { ReviewCheckpointManager, ReviewFile, WorkspaceSnapshot, WorkspaceSnapshotKind } from "./review-checkpoints.js";
 import type { CheckpointCoverage } from "./checkpoint-coverage.js";
 import { reviewCoverageApprovalBlock } from "./review-coverage-policy.js";
+import { withFileMutationLock, workspaceMutationLockKey } from "./mutation-version.js";
 import type { MissionLedger } from "./mission-ledger.js";
 import type { DispatchOutbox } from "./dispatch-outbox.js";
 import { reviewThreads, reviewThreadMessages } from "./db/schema.js";
@@ -497,7 +498,43 @@ export function createReviewWorkflowService(
     };
   }
 
+  /**
+   * Approval entry point. For approve verdicts the exact-snapshot check,
+   * the fresh coverage revalidation, and the feedback commit all run inside
+   * the shared workspace-mutation boundary (the same key structured
+   * mutations serialize on), so a concurrent structured mutation cannot
+   * land between validation and commit. The boundary is in-process only:
+   * after a restart the approval simply re-runs from scratch, and the
+   * feedback commit remains a single SQLite transaction, so no
+   * half-applied approval can survive. Shell mutations cannot be keyed by
+   * path; they are fenced by the checkout lease check inside the inner
+   * implementation instead. Rejection and changes-requested never take
+   * the boundary: a reviewer must always be able to refuse work.
+   */
   async function provideFeedback(input: ProvideFeedbackInput): Promise<ProvideFeedbackResult> {
+    if (input.verdict !== "approve") return provideFeedbackInner(input);
+    const session = workSessions.get(input.sessionId);
+    if (!session || !workspaces || typeof workspaces.getWorkspace !== "function") {
+      return provideFeedbackInner(input);
+    }
+    let keys: string[] | undefined;
+    try {
+      const ws = workspaces.getWorkspace(session.workspaceSessionId);
+      if (ws?.root) {
+        keys = [workspaceMutationLockKey(ws.root)];
+        const canonical = await realpath(ws.root).catch(() => undefined);
+        if (canonical && canonical !== ws.root) keys.push(workspaceMutationLockKey(canonical));
+      }
+    } catch {
+      // The inner implementation surfaces workspace errors with the same
+      // semantics as before; run it directly so error shapes are unchanged.
+      return provideFeedbackInner(input);
+    }
+    if (!keys) return provideFeedbackInner(input);
+    return withFileMutationLock(keys, () => provideFeedbackInner(input));
+  }
+
+  async function provideFeedbackInner(input: ProvideFeedbackInput): Promise<ProvideFeedbackResult> {
     const session = workSessions.get(input.sessionId);
     if (!session) {
       throw new WorkflowError(`Session not found: ${input.sessionId}`, "not_found", 404);
@@ -709,6 +746,42 @@ export function createReviewWorkflowService(
       }
     }
 
+    // Approval-time coverage revalidation (approve only): persisted
+    // submission coverage is stale once mutations can occur after
+    // submission. Re-assess live coverage now — inside the shared
+    // workspace-mutation boundary held by the provideFeedback wrapper,
+    // and before the feedback transaction commits — and gate on the fresh
+    // result. A classifier failure is durable unknown evidence, never a
+    // complete assessment. Harnesses without a coverage classifier keep
+    // the persisted-evidence behavior.
+    let approvalCoverage = currentPending.coverage;
+    if (input.verdict === "approve" && reviewCheckpoints
+      && typeof reviewCheckpoints.checkpointCoverage === "function" && workspaces) {
+      const wsForCoverage = workspaces.getWorkspace(session.workspaceSessionId);
+      try {
+        approvalCoverage = await reviewCheckpoints.checkpointCoverage({
+          workspaceId: session.workspaceSessionId,
+          root: wsForCoverage.root,
+          workSessionId: session.id,
+        });
+      } catch (error) {
+        const code = (error as { code?: unknown } | undefined)?.code;
+        approvalCoverage = {
+          status: "unknown",
+          backend: "unknown",
+          uncoveredPaths: [],
+          reasons: ["Coverage revalidation failed at approval; the submission requires a new successful assessment."],
+          assessedAt: new Date().toISOString(),
+          errorCode: typeof code === "string" && /^[A-Za-z0-9_:-]{1,80}$/.test(code) ? code : "classification_failed",
+        };
+      }
+      const freshBlock = reviewCoverageApprovalBlock(
+        approvalCoverage,
+        input.acceptIncompleteCoverage === true,
+      );
+      if (freshBlock) throw new WorkflowError(`Submission ${input.submissionId}: ${freshBlock}`, "conflict", 409);
+    }
+
     // P1 #4: validate allowedNextActions against the known action-class
     // enum so a typo becomes an explicit error instead of a silent denial.
     if (input.allowedNextActions !== undefined) {
@@ -840,6 +913,16 @@ export function createReviewWorkflowService(
       }
 
       // 2. Emit feedback event.
+      // Audit union: an explicit acceptance covers the uncovered paths
+      // documented at submission (persisted evidence) plus any uncovered
+      // paths the fresh approval-time revalidation found. Either source
+      // alone can require the acceptance; the union is what was accepted.
+      const acceptedCoveragePaths = input.verdict === "approve" && input.acceptIncompleteCoverage === true
+        ? [...new Set([
+            ...(currentPending.coverage.status === "incomplete" ? currentPending.coverage.uncoveredPaths : []),
+            ...(approvalCoverage.status === "incomplete" ? approvalCoverage.uncoveredPaths : []),
+          ])]
+        : [];
       const feedbackEvent = appendWorkflowEvent({
         type: "review.feedback.provided",
         sessionId: input.sessionId,
@@ -854,8 +937,8 @@ export function createReviewWorkflowService(
           reviewerId: input.reviewerId,
           // P1 (audit): durable audit trail of an explicit incomplete-coverage
           // acceptance (and which paths it covered).
-          ...(input.verdict === "approve" && currentPending.coverage.status === "incomplete"
-            ? { acceptedIncompleteCoverage: true, uncoveredPaths: currentPending.coverage.uncoveredPaths }
+          ...(acceptedCoveragePaths.length > 0
+            ? { acceptedIncompleteCoverage: true, uncoveredPaths: acceptedCoveragePaths }
             : {}),
         },
       });

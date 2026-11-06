@@ -1,8 +1,22 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 
 /** Version marker used when a guarded mutation expects a path not to exist. */
 export const MISSING_FILE_VERSION = "missing";
+
+/**
+ * Shared workspace-mutation serialization key. Structured mutation tools
+ * (write/edit/apply_patch) include this key alongside their per-file keys,
+ * and approval validation (exact-snapshot check + fresh coverage) runs
+ * under this key alone, so a concurrent structured mutation cannot land
+ * between the approval checks and the feedback commit. Shell mutations
+ * cannot be attributed to paths and are fenced by the checkout lease
+ * instead; see review-workflow approval lease fencing.
+ */
+export function workspaceMutationLockKey(root: string): string {
+  return `workspace:${resolve(root)}`;
+}
 
 // All MCP transports in one Kontrol process share this coordinator. Keys are
 // canonical absolute paths, so independent tabs serialize only overlapping

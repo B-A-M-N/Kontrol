@@ -124,6 +124,7 @@ const reviewWorkflow = createReviewWorkflowService({
       files: baselineCommit === currentSnapshot ? [] : [{ path: "x.txt", operation: "update", additions: 1, removals: 1 }],
       snapshotCommit: currentSnapshot,
     }),
+    checkpointCoverage: async () => ({ status: "complete", backend: "git", uncoveredPaths: [], reasons: [], assessedAt: new Date().toISOString() }),
     commitReviewed: async () => {
       commitCalled = true;
     },
@@ -151,6 +152,7 @@ const config: BridgeConfig = {
       files: [{ path: "x.txt", operation: "update", additions: 1, removals: 1 }],
       snapshotCommit: currentSnapshot,
     }),
+    checkpointCoverage: async () => ({ status: "complete", backend: "git", uncoveredPaths: [], reasons: [], assessedAt: new Date().toISOString() }),
     commitReviewed: async () => {
       commitCalled = true;
     },

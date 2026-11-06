@@ -66,7 +66,7 @@ import { readOnlyShellInspectionError } from "../../read-only-shell.js";
 import { publishScheduledArtifact } from "../../scheduling/scheduled-artifact-publisher.js";
 import type { ToolEnvelope } from "../tool-envelope.js";
 import { processSessionOwnerId, type ConnectionContext } from "../connection-context.js";
-import { MISSING_FILE_VERSION, readFileVersion, withFileMutationLock } from "../../mutation-version.js";
+import { MISSING_FILE_VERSION, readFileVersion, withFileMutationLock, workspaceMutationLockKey } from "../../mutation-version.js";
 import { assertAllowedPath, expandHomePath } from "../../roots.js";
 import {
   countPeerWorktrees,
@@ -277,7 +277,7 @@ export function registerMutationTools(
       const blocked = await runMutationBarrier(prepareForMutation, workspaceId, toolNames.stagedWrite);
       if (blocked) return blocked;
       const resolvedPath = workspaces.resolvePath(workspace, input.path);
-      const publication = await withFileMutationLock<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>>([resolvedPath], async (): Promise<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>> => {
+      const publication = await withFileMutationLock<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>>([resolvedPath, workspaceMutationLockKey(workspace.root)], async (): Promise<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>> => {
         const receipt = await publishScheduledArtifact({
           jobId: scheduledJob.id,
           workSessionId,
@@ -444,7 +444,7 @@ export function registerMutationTools(
         const output = authorizedOutput!;
         // Bounded scheduled writes route through the publisher for atomic
         // replacement, symlink-escape rejection, and read-back verification.
-        mutation = await withFileMutationLock<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>>([resolvedPath], async (): Promise<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>> => {
+        mutation = await withFileMutationLock<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>>([resolvedPath, workspaceMutationLockKey(workspace.root)], async (): Promise<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>> => {
           const receipt = await publishScheduledArtifact({
             jobId: activeJob.id,
             workSessionId: connectionContext?.workSessionId ?? "",
@@ -479,7 +479,7 @@ export function registerMutationTools(
           };
         });
       } else {
-        mutation = await withFileMutationLock<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>>([resolvedPath], async (): Promise<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>> => {
+        mutation = await withFileMutationLock<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>>([resolvedPath, workspaceMutationLockKey(workspace.root)], async (): Promise<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>> => {
           const versionConflict = await checkFileVersion(
             writeTool,
             workspaceId,
@@ -637,7 +637,7 @@ export function registerMutationTools(
         }
       }
 
-      const mutation = await withFileMutationLock<LockedToolMutation<Awaited<ReturnType<typeof editFileTool>>>>([resolvedPath], async (): Promise<LockedToolMutation<Awaited<ReturnType<typeof editFileTool>>>> => {
+      const mutation = await withFileMutationLock<LockedToolMutation<Awaited<ReturnType<typeof editFileTool>>>>([resolvedPath, workspaceMutationLockKey(workspace.root)], async (): Promise<LockedToolMutation<Awaited<ReturnType<typeof editFileTool>>>> => {
         const versionConflict = await checkFileVersion(
           toolNames.edit,
           workspaceId,
@@ -815,7 +815,7 @@ export function registerMutationTools(
         // is changed. parsePatch is validation-only; applyPatch revalidates all
         // confined destinations immediately before staging/rename.
         const mutation = await withFileMutationLock<LockedPatchMutation>(
-          affectedPaths.map((path) => workspaces.resolvePath(workspace, path)),
+          [workspaceMutationLockKey(workspace.root), ...affectedPaths.map((path) => workspaces.resolvePath(workspace, path))],
           async (): Promise<LockedPatchMutation> => {
             if (expectedContentSha256ByPath) {
               for (const path of affectedPaths) {
