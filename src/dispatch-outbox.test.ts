@@ -523,6 +523,43 @@ try {
     db.close();
   }
 
+  // --- Peer-job reservation survives its work session's terminalization. ---
+  {
+    let releaseTermination!: () => void;
+    const terminationGate = new Promise<void>((resolve) => { releaseTermination = resolve; });
+    const db = openDatabase(join(root, "peer-lifecycle"));
+    const workSessions = createWorkSessionManager(db, { onTerminal: () => terminationGate });
+    db.sqlite
+      .prepare("insert into workspace_sessions (id, root, status, mode, managed, created_at, last_used_at) values ('ws_pl', '/tmp', 'active', 'checkout', 'false', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')")
+      .run();
+    const session = workSessions.create({ workspaceSessionId: "ws_pl", submittedBy: "tester" });
+    const peerLease = workSessions.acquireWorkspaceLease({
+      canonicalRoot: "/tmp/checkout-peer-lifecycle",
+      workspaceSessionId: "ws_pl",
+      workSessionId: session.id,
+      ownerInstanceId: "peer-job:job-lifecycle-test",
+      leaseKind: "peer_job",
+      ttlMs: 5,
+    });
+    assert.ok(peerLease.acquired);
+    const peerNonce = peerLease.lease.leaseNonce;
+
+    workSessions.updateStatus(session.id, "cancelled"); // terminal; termination pending
+    const active = workSessions.getActiveWorkspaceLease("/tmp/checkout-peer-lifecycle");
+    assert.equal(active?.leaseKind, "peer_job",
+      "terminalizing the session must not convert the peer reservation into cleanup_pending");
+    assert.equal(active?.leaseNonce, peerNonce, "the durable peer reservation survives session terminalization");
+
+    releaseTermination();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(workSessions.getActiveWorkspaceLease("/tmp/checkout-peer-lifecycle")?.leaseKind, "peer_job",
+      "post-termination release must not delete the peer reservation; the peer processor owns it");
+    assert.equal(workSessions.releaseWorkspaceLeaseForSession(session.id, peerNonce), true,
+      "the peer processor can still release its reservation by nonce");
+    assert.equal(workSessions.getActiveWorkspaceLease("/tmp/checkout-peer-lifecycle"), undefined);
+    db.close();
+  }
+
   // --- P0-A: terminal review feedback must not bypass process cleanup. ---
   for (const verdict of ["approve", "reject"] as const) {
     let releaseTermination!: () => void;

@@ -177,16 +177,26 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
     },
 
     markWorkspaceLeaseCleanupPending(workSessionId: string): number {
+      // A peer-job reservation is owned by the peer job, not by the (now
+      // terminal) worker session. Converting it to cleanup_pending would let
+      // the reconciler delete it once its owner instance looks "resolved",
+      // destroying the durable peer fence. Peer reservations stay peer_job
+      // until the peer processor releases them by nonce.
       const result = db.db.update(workspaceLeases)
         .set({ leaseKind: "cleanup_pending" })
-        .where(eq(workspaceLeases.workSessionId, workSessionId))
+        .where(and(
+          eq(workspaceLeases.workSessionId, workSessionId),
+          ne(workspaceLeases.leaseKind, "peer_job"),
+        ))
         .run();
       return result.changes;
     },
 
     releaseWorkspaceLeasesForSession(workSessionId: string): number {
+      // Never deletes a peer-job reservation: those are released only by the
+      // peer processor through the nonce-checked path.
       const result = db.sqlite
-        .prepare("delete from workspace_leases where work_session_id = ?")
+        .prepare("delete from workspace_leases where work_session_id = ? and lease_kind != 'peer_job'")
         .run(workSessionId);
       return result.changes;
     },
@@ -208,7 +218,7 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
      */
     releaseUnfencedWorkspaceLeasesForSession(workSessionId: string): number {
       const result = db.sqlite
-        .prepare("delete from workspace_leases where work_session_id = ? and lease_kind != 'cleanup_pending'")
+        .prepare("delete from workspace_leases where work_session_id = ? and lease_kind not in ('cleanup_pending', 'peer_job')")
         .run(workSessionId);
       return result.changes;
     },
