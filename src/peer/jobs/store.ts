@@ -17,6 +17,7 @@ import type {
   PeerAttempt,
   PeerJob,
   PeerJobResultReceipt,
+  PeerResultProcessingPhase,
 } from "./contracts.js";
 
 const LEGACY_SIDECAR_FILE = "peer-jobs.json";
@@ -43,8 +44,12 @@ function loggingSink(logging: LoggingConfig): StoreLogSink {
 export interface PeerJobStore {
   readonly stateDir: string;
   createJob(input: Omit<PeerJob, "jobId" | "status" | "createdAt"> & { peerId: string; jobId?: string }): PeerJob;
+  /** Atomically enforce the active-job cap and persist a new job. */
+  createJobWithinActiveCap(input: Omit<PeerJob, "jobId" | "status" | "createdAt"> & { peerId: string; jobId?: string }, maxActiveJobs: number): PeerJob;
   getJob(jobId: string): PeerJob | undefined;
   getLatestJobForWorkSession(peerId: string, workSessionId: string, excludeJobId?: string): PeerJob | undefined;
+  /** Indexed active-job count used for the per-peer cap without loading JSON rows. */
+  countActiveJobsForPeer?(peerId: string): number;
   listJobsForPeer(peerId: string, opts?: { includeTerminal?: boolean }): PeerJob[];
   listJobsForPeerPage(peerId: string, input: {
     includeTerminal?: boolean;
@@ -64,6 +69,11 @@ export interface PeerJobStore {
   renewLease(attemptId: string, claimToken: string, peerId: string, now: number, leaseMs: number): { job: PeerJob; attempt: PeerAttempt };
   completeAttempt(attemptId: string, claimToken: string, peerId: string, receipt: PeerJobResultReceipt, now: number): { job: PeerJob; attempt: PeerAttempt; idempotent: boolean };
   markStaging(jobId: string, receiptSha256: string, now: number): PeerJob;
+  advanceResultPhase(jobId: string, receiptSha256: string, phase: PeerResultProcessingPhase, now: number, snapshot?: {
+    snapshotKind: "git" | "filesystem";
+    snapshotRef: string;
+    diffSha256: string;
+  }): PeerJob;
   markAwaitingReview(jobId: string, input: {
     receiptSha256: string;
     submissionId: string;
@@ -85,6 +95,50 @@ export interface PeerJobStore {
   reapExpiredLeases(now: number, limit?: number): Array<{ job: PeerJob; attempt: PeerAttempt }>;
   restartReconciliation(): void;
   close(): void;
+}
+
+const RESULT_PHASE_ORDER: Record<PeerResultProcessingPhase, number> = {
+  validated: 1,
+  reservation_acquired: 2,
+  write_started: 3,
+  files_staged: 4,
+  snapshot_bound: 5,
+  review_linked: 6,
+};
+
+type CreatePeerJobInput = Omit<PeerJob, "jobId" | "status" | "createdAt"> & { peerId: string; jobId?: string };
+
+/** Normalize allowedOutputs at creation so every later receipt validation
+ * sees canonical relative prefixes ("out/" → "out"). */
+function createPeerJobRecord(input: CreatePeerJobInput): PeerJob {
+  const jobId = input.jobId ?? "job_" + randomUUID();
+  if (!/^job_[0-9a-f-]{36}$/i.test(jobId)) {
+    throw new PeerJobError("invalid_job_id", "Peer job id must be a generated job UUID", 422);
+  }
+  return {
+    ...input,
+    allowedOutputs: normalizeAllowedOutputs(input.allowedOutputs),
+    jobId,
+    status: "pending",
+    createdAt: new Date().toISOString(),
+  };
+}
+
+function peerJobIdentity(candidate: PeerJob): Record<string, unknown> {
+  return {
+    peerId: candidate.peerId,
+    workSessionId: candidate.workSessionId,
+    workspaceSessionId: candidate.workspaceSessionId,
+    schedulerDispatchId: candidate.schedulerDispatchId,
+    repositoryId: candidate.repositoryId,
+    baseRevision: candidate.baseRevision,
+    taskClass: candidate.taskClass,
+    instructionHash: candidate.instructionHash,
+    instructions: candidate.instructions,
+    allowedOutputs: candidate.allowedOutputs,
+    maxRuntimeMs: candidate.maxRuntimeMs,
+    maxArtifactBytes: candidate.maxArtifactBytes,
+  };
 }
 
 function isTerminalJobStatus(status: PeerJob["status"]): boolean {
@@ -327,37 +381,11 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig, share
       if (stateCorrupted) {
         throw new PeerJobError("peer_jobs_state_corrupt", "Peer-job state is corrupt; dispatch is refused.", 503);
       }
-      // Normalize allowedOutputs at creation so every later receipt
-      // validation sees canonical relative prefixes ("out/" → "out").
-      const jobId = input.jobId ?? "job_" + randomUUID();
-      if (!/^job_[0-9a-f-]{36}$/i.test(jobId)) {
-        throw new PeerJobError("invalid_job_id", "Peer job id must be a generated job UUID", 422);
-      }
-      const job: PeerJob = {
-        ...input,
-        allowedOutputs: normalizeAllowedOutputs(input.allowedOutputs),
-        jobId,
-        status: "pending",
-        createdAt: new Date().toISOString(),
-      };
-      const prior = jobById.get(jobId);
+      const job = createPeerJobRecord(input);
+      const prior = jobById.get(job.jobId);
       if (prior) {
-        const identity = (candidate: PeerJob) => ({
-          peerId: candidate.peerId,
-          workSessionId: candidate.workSessionId,
-          workspaceSessionId: candidate.workspaceSessionId,
-          schedulerDispatchId: candidate.schedulerDispatchId,
-          repositoryId: candidate.repositoryId,
-          baseRevision: candidate.baseRevision,
-          taskClass: candidate.taskClass,
-          instructionHash: candidate.instructionHash,
-          instructions: candidate.instructions,
-          allowedOutputs: candidate.allowedOutputs,
-          maxRuntimeMs: candidate.maxRuntimeMs,
-          maxArtifactBytes: candidate.maxArtifactBytes,
-        });
-        if (canonicalJson(identity(prior)) !== canonicalJson(identity(job))) {
-          throw new PeerJobError("peer_job_id_conflict", `Peer job ${jobId} already exists with different immutable request content`, 409);
+        if (canonicalJson(peerJobIdentity(prior)) !== canonicalJson(peerJobIdentity(job))) {
+          throw new PeerJobError("peer_job_id_conflict", `Peer job ${job.jobId} already exists with different immutable request content`, 409);
         }
         // A dispatch retry after response loss returns the current durable job
         // (including any claim/result state) instead of inserting a duplicate.
@@ -365,6 +393,47 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig, share
       }
       jobs.push(job);
       persist([job]);
+      return job;
+    },
+
+    createJobWithinActiveCap(input, maxActiveJobs) {
+      if (stateCorrupted) {
+        throw new PeerJobError("peer_jobs_state_corrupt", "Peer-job state is corrupt; dispatch is refused.", 503);
+      }
+      if (!Number.isInteger(maxActiveJobs) || maxActiveJobs < 1) {
+        throw new PeerJobError("invalid_peer_jobs_cap", "maxActiveJobs must be a positive integer", 500);
+      }
+      const job = createPeerJobRecord(input);
+      const prior = jobById.get(job.jobId);
+      if (prior) {
+        if (canonicalJson(peerJobIdentity(prior)) !== canonicalJson(peerJobIdentity(job))) {
+          throw new PeerJobError("peer_job_id_conflict", `Peer job ${job.jobId} already exists with different immutable request content`, 409);
+        }
+        return prior;
+      }
+      const insert = sqlite.prepare(`insert into peer_jobs
+        (job_id, peer_id, status, created_at, task_class, repository_id, workspace_session_id, work_session_id, record_json)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      const json = JSON.stringify(job);
+      try {
+        sqlite.transaction(() => {
+          const count = sqlite.prepare(`select count(*) as count from peer_jobs
+            where peer_id = ? and status in ('pending', 'claimed', 'running', 'awaiting_reconciliation')`)
+            .get(job.peerId) as { count: number };
+          if (count.count >= maxActiveJobs) {
+            throw new PeerJobError("peer_jobs_cap_exceeded",
+              `Peer ${job.peerId} already holds the maximum number of active jobs (${maxActiveJobs})`, 429);
+          }
+          insert.run(job.jobId, job.peerId, job.status, job.createdAt, job.taskClass, job.repositoryId,
+            job.workspaceSessionId ?? null, job.workSessionId ?? null, json);
+        }).immediate();
+      } catch (error) {
+        if (error instanceof PeerJobError) throw error;
+        throw new PeerJobError("peer_jobs_persistence_failed", `SQLite peer-job transaction failed: ${error instanceof Error ? error.message : String(error)}`, 503);
+      }
+      jobs.push(job);
+      persistedJobs.set(job.jobId, json);
+      jobById.set(job.jobId, job);
       return job;
     },
 
@@ -388,6 +457,13 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig, share
         ? sqlite.prepare("select record_json from peer_jobs where peer_id = ? order by created_at, job_id").all(peerId)
         : sqlite.prepare("select record_json from peer_jobs where peer_id = ? and status not in ('completed','failed','cancelled','review_changes_requested') order by created_at, job_id").all(peerId);
       return (rows as Array<{ record_json: string }>).map((row) => JSON.parse(row.record_json) as PeerJob);
+    },
+
+    countActiveJobsForPeer(peerId) {
+      const row = sqlite.prepare(`select count(*) as count from peer_jobs
+        where peer_id = ? and status in ('pending', 'claimed', 'running', 'awaiting_reconciliation')`)
+        .get(peerId) as { count: number };
+      return Number(row.count);
     },
 
     listJobsForPeerPage(peerId, input) {
@@ -630,6 +706,28 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig, share
       return { ...job, resultProcessing: { ...job.resultProcessing } };
     },
 
+    advanceResultPhase(jobId, receiptSha256, phase, now, snapshot) {
+      const job = jobOrThrow(jobId);
+      const processing = job.resultProcessing;
+      if ((job.status !== "staging" && job.status !== "awaiting_review") || processing?.receiptSha256 !== receiptSha256) {
+        throw new PeerJobError("peer_result_phase_identity_mismatch", "Result phase is not bound to the active staging receipt", 409);
+      }
+      const current = processing.phase;
+      if (current && RESULT_PHASE_ORDER[phase] < RESULT_PHASE_ORDER[current]) {
+        // Reconciliation may replay earlier idempotent work. Keep the latest
+        // durable phase instead of making recovery evidence move backwards.
+        return { ...job, resultProcessing: { ...processing } };
+      }
+      job.resultProcessing = {
+        ...processing,
+        phase,
+        ...(phase === "snapshot_bound" && snapshot ? snapshot : {}),
+        updatedAt: new Date(now).toISOString(),
+      };
+      persist([job]);
+      return { ...job, resultProcessing: { ...job.resultProcessing } };
+    },
+
     markAwaitingReview(jobId, input, now) {
       const job = jobOrThrow(jobId);
       if (job.status === "awaiting_review" && job.resultProcessing?.submissionId === input.submissionId) {
@@ -642,8 +740,12 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig, share
             ...job.resultProcessing,
             verificationStatus: input.verificationStatus,
             verificationEvidenceSha256: input.verificationEvidenceSha256,
+            phase: "review_linked",
             updatedAt: new Date(now).toISOString(),
           };
+          persist([job]);
+        } else if (job.resultProcessing.phase !== "review_linked") {
+          job.resultProcessing = { ...job.resultProcessing, phase: "review_linked", updatedAt: new Date(now).toISOString() };
           persist([job]);
         }
         return { ...job, resultProcessing: { ...job.resultProcessing } };
@@ -652,7 +754,7 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig, share
         throw new PeerJobError("invalid_result_transition", `Job ${jobId} is not staging this receipt`);
       }
       job.status = "awaiting_review";
-      job.resultProcessing = { ...input, updatedAt: new Date(now).toISOString() };
+      job.resultProcessing = { ...input, phase: "review_linked", updatedAt: new Date(now).toISOString() };
       persist([job]);
       return { ...job, resultProcessing: { ...job.resultProcessing } };
     },
@@ -683,6 +785,7 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig, share
       job.status = "awaiting_reconciliation";
       job.resultProcessing = {
         ...job.resultProcessing,
+        failurePhase: job.resultProcessing?.phase,
         failure: reason.slice(0, 1000),
         updatedAt: new Date(now).toISOString(),
       };

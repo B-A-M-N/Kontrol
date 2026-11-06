@@ -31,6 +31,15 @@ export type PeerOutcomeCertainty = "not_started" | "started" | "unknown" | "term
 
 export type PeerActorClass = "muse_vm_process" | "meta_muse_agent";
 
+/** Durable local result-reconciliation phases, ordered by possible side effect. */
+export type PeerResultProcessingPhase =
+  | "validated"
+  | "reservation_acquired"
+  | "write_started"
+  | "files_staged"
+  | "snapshot_bound"
+  | "review_linked";
+
 export interface PeerJob {
   jobId: string; // job_<uuid>
   /** TRUSTED server assignment from the credential registry id. */
@@ -65,6 +74,10 @@ export interface PeerJob {
   terminalAt?: string;
   terminalReason?: string;
   resultProcessing?: {
+    /** Last durable phase reached while converting this peer receipt to review. */
+    phase?: PeerResultProcessingPhase;
+    /** Phase in effect when the last failure was recorded. */
+    failurePhase?: PeerResultProcessingPhase;
     receiptSha256?: string;
     submissionId?: string;
     reviewEpoch?: number;

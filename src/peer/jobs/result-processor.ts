@@ -9,7 +9,7 @@ import type { WorkSessionManager } from "../../work-sessions/index.js";
 import type { WorkspaceRegistry } from "../../workspaces.js";
 import { assertNoSymlinkComponentsSync, isPathInsideRoot } from "../../roots.js";
 import { PeerJobError } from "./contracts.js";
-import type { PeerJob, PeerJobResultReceipt } from "./contracts.js";
+import type { PeerJob, PeerJobResultReceipt, PeerResultProcessingPhase } from "./contracts.js";
 import type { PeerArtifactStore } from "./artifacts.js";
 import type { PeerJobStore } from "./store.js";
 import type { MissionLedger } from "../../mission-ledger.js";
@@ -31,6 +31,10 @@ function receiptIdentity(receipt: PeerJobResultReceipt): string {
     files,
     totalBytes: receipt.totalBytes,
   })).digest("hex");
+}
+
+function phaseMayHaveWorkspaceEffects(phase: PeerResultProcessingPhase | undefined): boolean {
+  return phase === "write_started" || phase === "files_staged" || phase === "snapshot_bound" || phase === "review_linked";
 }
 
 function writeArtifact(root: string, path: string, bytes: Buffer): void {
@@ -140,6 +144,7 @@ export function createPeerJobResultProcessor(deps: PeerJobResultProcessorDeps) {
     active.add(job.jobId);
     let releaseWorkspace = () => {};
     let peerLeaseNonce: string | undefined;
+    let workspaceEffectMayHaveStarted = phaseMayHaveWorkspaceEffects(job.resultProcessing?.phase);
     try {
       if (!job.workspaceSessionId) {
         throw new PeerJobError("result_target_missing", "Peer result has no bound workspace", 409);
@@ -159,24 +164,14 @@ export function createPeerJobResultProcessor(deps: PeerJobResultProcessorDeps) {
         && currentJob.resultProcessing?.verificationStatus === undefined;
       if (!currentJob || (currentJob.status !== "result_received" && currentJob.status !== "staging" && !currentNeedsVerification)) return;
       job = currentJob;
+      workspaceEffectMayHaveStarted = job.status === "awaiting_review"
+        || (job.status === "staging" && job.resultProcessing?.phase === undefined)
+        || phaseMayHaveWorkspaceEffects(job.resultProcessing?.phase);
       if (!job.workSessionId) {
         throw new PeerJobError("result_target_missing", "Peer result has no bound work session", 409);
       }
-      const reservation = deps.workSessions.acquireWorkspaceLease({
-        canonicalRoot,
-        workspaceSessionId: job.workspaceSessionId,
-        workSessionId: job.workSessionId,
-        ownerInstanceId: `peer-job:${job.jobId}`,
-        leaseKind: "peer_job",
-        // This is a durable workflow reservation, not a worker heartbeat
-        // lease. It remains fenced through uncertain result recovery and is
-        // released only after the local snapshot is linked to reviewer state.
-        ttlMs: 100 * 365 * 24 * 60 * 60 * 1000,
-      });
-      if (!reservation.acquired) {
-        throw new PeerJobError("workspace_lease_conflict", `Workspace is reserved by work session ${reservation.conflictingWorkSessionId}`, 409);
-      }
-      peerLeaseNonce = reservation.lease.leaseNonce;
+      // The durable checkout reservation is acquired only after the receipt
+      // is validated, so an invalid receipt cannot pin a 100-year fence.
       const attempts = deps.store.listAttemptsForJob(job.jobId);
       const attempt = [...attempts].reverse().find((candidate) => candidate.receipt?.terminalState === "succeeded");
       const receipt = attempt?.receipt;
@@ -212,6 +207,24 @@ export function createPeerJobResultProcessor(deps: PeerJobResultProcessorDeps) {
       // mutation on restart. Recover only a content-addressed temp for one of
       // this receipt's declared output paths; unknown files remain untouched.
       for (const [path, bytes] of files) recoverArtifactTemporary(workspace.root, path, bytes);
+      deps.store.advanceResultPhase(job.jobId, receiptSha256, "validated", Date.now());
+
+      const reservation = deps.workSessions.acquireWorkspaceLease({
+        canonicalRoot,
+        workspaceSessionId: job.workspaceSessionId,
+        workSessionId: job.workSessionId,
+        ownerInstanceId: `peer-job:${job.jobId}`,
+        leaseKind: "peer_job",
+        // This is a durable workflow reservation, not a worker heartbeat
+        // lease. It remains fenced through uncertain result recovery and is
+        // released only after the local snapshot is linked to reviewer state.
+        ttlMs: 100 * 365 * 24 * 60 * 60 * 1000,
+      });
+      if (!reservation.acquired) {
+        throw new PeerJobError("workspace_lease_conflict", `Workspace is reserved by work session ${reservation.conflictingWorkSessionId}`, 409);
+      }
+      peerLeaseNonce = reservation.lease.leaseNonce;
+      deps.store.advanceResultPhase(job.jobId, receiptSha256, "reservation_acquired", Date.now());
 
       // A restart may find a partially staged result. Allow only changes to
       // declared paths, and only when each current file is already the exact
@@ -238,7 +251,10 @@ export function createPeerJobResultProcessor(deps: PeerJobResultProcessorDeps) {
           throw error;
         }
       }
+      deps.store.advanceResultPhase(job.jobId, receiptSha256, "write_started", Date.now());
+      workspaceEffectMayHaveStarted = true;
       for (const [path, bytes] of files) writeArtifact(workspace.root, path, bytes);
+      deps.store.advanceResultPhase(job.jobId, receiptSha256, "files_staged", Date.now());
 
       const changes = await deps.reviewCheckpoints.reviewChangesAgainstCommit({
         workspaceId: workspace.id,
@@ -251,6 +267,11 @@ export function createPeerJobResultProcessor(deps: PeerJobResultProcessorDeps) {
         }
       }
       const diffSha256 = createHash("sha256").update(changes.patch, "utf8").digest("hex");
+      deps.store.advanceResultPhase(job.jobId, receiptSha256, "snapshot_bound", Date.now(), {
+        snapshotKind: changes.snapshotKind,
+        snapshotRef: changes.snapshotRef,
+        diffSha256,
+      });
       const existingSubmission = deps.workSessions.getSubmissions(job.workSessionId).find((submission) =>
         submission.diffSha256 === diffSha256 &&
         submission.snapshotKind === changes.snapshotKind &&
@@ -336,6 +357,21 @@ export function createPeerJobResultProcessor(deps: PeerJobResultProcessorDeps) {
     } catch (error) {
       const reason = error instanceof PeerJobError ? error.code : error instanceof Error ? error.name : "unknown_result_processing_failure";
       deps.store.markAwaitingReconciliation(job.jobId, reason, Date.now());
+      // Before receipt-bound recovery/write begins, releasing the reservation
+      // is safe; retries reacquire it and revalidate the exact baseline. Once
+      // staging may have touched files, retain the fence for reconciliation.
+      if (!workspaceEffectMayHaveStarted && peerLeaseNonce && job.workSessionId) {
+        deps.workSessions.releaseWorkspaceLeaseForSession(job.workSessionId, peerLeaseNonce);
+        peerLeaseNonce = undefined;
+      } else if (!workspaceEffectMayHaveStarted && job.workSessionId) {
+        // A prior process may have crashed after acquiring the explicit
+        // peer-job reservation but before its first workspace effect. Release
+        // only that exact job-owned reservation; never touch another lease.
+        const priorLease = deps.workSessions.getWorkspaceLeaseForSession(job.workSessionId);
+        if (priorLease?.leaseKind === "peer_job" && priorLease.ownerInstanceId === `peer-job:${job.jobId}`) {
+          deps.workSessions.releaseWorkspaceLeaseForSession(job.workSessionId, priorLease.leaseNonce);
+        }
+      }
     } finally {
       releaseWorkspace();
       active.delete(job.jobId);

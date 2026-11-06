@@ -6,7 +6,7 @@
  * Harness pattern: src/peer-listener.test.ts.
  */
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes, createHash } from "node:crypto";
@@ -465,6 +465,12 @@ let claimToken: string;
   const bytesByJob = new Map([["job_lock_a", Buffer.from("a")], ["job_lock_b", Buffer.from("b")]]);
   const jobs = new Map<string, PeerJob>();
   const attempts = new Map<string, any[]>();
+  const resultLeases = new Map<string, any>();
+  const workspaceByWorkSession = new Map<string, string>([
+    ["work_lock_a", "workspace_lock"],
+    ["work_lock_b", "workspace_lock_alias"],
+    ["work_lock_missing_receipt", "workspace_lock_alias"],
+  ]);
   for (const [jobId, filePath, bytes, workspaceSessionId, workSessionId] of [
     ["job_lock_a", "a.txt", bytesByJob.get("job_lock_a")!, "workspace_lock", "work_lock_a"],
     ["job_lock_b", "b.txt", bytesByJob.get("job_lock_b")!, "workspace_lock_alias", "work_lock_b"],
@@ -515,32 +521,82 @@ let claimToken: string;
     createdAt: new Date().toISOString(),
   };
   jobs.set(missingReceiptJob.jobId, missingReceiptJob);
+  function addResultFixture(jobId: string, filePath: string, workSessionId = jobId): PeerJob {
+    const workspaceSessionId = `workspace_${jobId}`;
+    workspaceByWorkSession.set(workSessionId, workspaceSessionId);
+    const bytes = Buffer.from(jobId);
+    bytesByJob.set(jobId, bytes);
+    const receipt = {
+      jobId,
+      attemptId: `${jobId}_attempt`,
+      actorClass: "muse_vm_process" as const,
+      baseRevision: "base",
+      manifestSha256: "f".repeat(64),
+      files: [{ path: filePath, sha256: createHash("sha256").update(bytes).digest("hex"), bytes: bytes.byteLength }],
+      totalBytes: bytes.byteLength,
+      terminalState: "succeeded" as const,
+    };
+    attempts.set(jobId, [{ attemptId: receipt.attemptId, receipt }]);
+    const job: PeerJob = {
+      jobId,
+      peerId: PEER_ID,
+      workSessionId,
+      workspaceSessionId,
+      repositoryId: "repo",
+      baseRevision: "base",
+      taskClass: "propose_patch",
+      instructionHash: "0".repeat(64),
+      instructions: "",
+      allowedOutputs: ["*"],
+      maxRuntimeMs: 1000,
+      maxArtifactBytes: 100,
+      status: "result_received",
+      createdAt: new Date().toISOString(),
+    };
+    jobs.set(jobId, job);
+    return job;
+  }
+  const invalidTargetJob = addResultFixture("job_lock_invalid", "invalid-target.txt", "work_lock_invalid");
+  const preEffectFaultJob = addResultFixture("job_lock_pre_effect_fault", "pre-effect-fault.txt");
+  const postEffectFaultJob = addResultFixture("job_lock_post_effect_fault", "post-effect-fault.txt");
+  const postSubmissionFaultJob = addResultFixture("job_lock_post_submission_fault", "post-submission-fault.txt");
+  const temporaryRecoveryJob = addResultFixture("job_lock_temporary_recovery", "temporary-recovery.txt");
   const fakeStore = {
     getJob: (jobId: string) => jobs.get(jobId),
     listAttemptsForJob: (jobId: string) => attempts.get(jobId) ?? [],
     markStaging: (jobId: string, receiptSha256: string) => {
       const job = jobs.get(jobId)!;
       job.status = "staging";
-      job.resultProcessing = { receiptSha256, updatedAt: new Date().toISOString() };
+      job.resultProcessing = { ...job.resultProcessing, receiptSha256, updatedAt: new Date().toISOString() };
+      return job;
+    },
+    advanceResultPhase: (jobId: string, receiptSha256: string, phase: string, _now: number, snapshot?: any) => {
+      const job = jobs.get(jobId)!;
+      assert.equal(job.resultProcessing?.receiptSha256, receiptSha256);
+      job.resultProcessing = { ...job.resultProcessing, phase, ...snapshot, updatedAt: new Date().toISOString() };
       return job;
     },
     markAwaitingReview: (jobId: string, value: any) => {
       const job = jobs.get(jobId)!;
       job.status = "awaiting_review";
-      job.resultProcessing = { ...value, updatedAt: new Date().toISOString() };
+      job.resultProcessing = { ...value, phase: "review_linked", updatedAt: new Date().toISOString() };
       return job;
     },
     recordVerification: () => undefined,
     markAwaitingReconciliation: (jobId: string, failure: string) => {
       const job = jobs.get(jobId)!;
       job.status = "awaiting_reconciliation";
-      job.resultProcessing = { ...job.resultProcessing, failure, updatedAt: new Date().toISOString() };
+      job.resultProcessing = { ...job.resultProcessing, failurePhase: job.resultProcessing?.phase, failure, updatedAt: new Date().toISOString() };
       return job;
     },
   };
   let concurrentSnapshots = 0;
   let maxConcurrentSnapshots = 0;
   let submissionNumber = 0;
+  const submissionsByWorkSession = new Map<string, any[]>();
+  let throwAfterSubmissionForJob: string | undefined;
+  let snapshotCalls = 0;
+  let failSnapshotCall: number | undefined;
   const processor = createPeerJobResultProcessor({
     store: fakeStore as any,
     artifacts: { readReceipt: (job: PeerJob) => {
@@ -557,37 +613,71 @@ let claimToken: string;
     }) } as any,
     workSessions: {
       get: (workSessionId: string) => ({
-        workspaceSessionId: workSessionId === "work_lock_a" ? "workspace_lock" : "workspace_lock_alias",
-        status: "in_progress",
+        workspaceSessionId: workspaceByWorkSession.get(workSessionId) ?? "workspace_lock",
+        status: workSessionId === "work_lock_invalid" ? "failed" : "in_progress",
       }),
-      getSubmissions: () => [],
-      acquireWorkspaceLease: (input: any) => ({ acquired: true, lease: {
-        ...input,
-        leaseKind: "peer_job",
-        ownerInstanceId: input.ownerInstanceId,
-        leaseNonce: `nonce-${input.ownerInstanceId}`,
-        acquiredAt: new Date().toISOString(),
-        heartbeatAt: new Date().toISOString(),
-        expiresAt: new Date(Date.now() + input.ttlMs).toISOString(),
-      } }),
-      releaseWorkspaceLeaseForSession: () => true,
+      getSubmissions: (workSessionId: string) => submissionsByWorkSession.get(workSessionId) ?? [],
+      acquireWorkspaceLease: (input: any) => {
+        const existing = resultLeases.get(input.canonicalRoot);
+        if (existing && existing.ownerInstanceId !== input.ownerInstanceId) {
+          return { acquired: false, conflictingWorkSessionId: existing.workSessionId, workspaceSessionId: existing.workspaceSessionId, expiresAt: existing.expiresAt };
+        }
+        const lease = existing ?? {
+          ...input,
+          leaseKind: "peer_job",
+          ownerInstanceId: input.ownerInstanceId,
+          leaseNonce: `nonce-${input.ownerInstanceId}`,
+          acquiredAt: new Date().toISOString(),
+          heartbeatAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + input.ttlMs).toISOString(),
+          durableRecovery: true,
+        };
+        resultLeases.set(input.canonicalRoot, lease);
+        return { acquired: true, lease };
+      },
+      getWorkspaceLeaseForSession: (workSessionId: string) => [...resultLeases.values()].find((lease) => lease.workSessionId === workSessionId),
+      releaseWorkspaceLeaseForSession: (workSessionId: string, nonce: string) => {
+        for (const [root, lease] of resultLeases) {
+          if (lease.workSessionId === workSessionId && lease.leaseNonce === nonce) return resultLeases.delete(root);
+        }
+        return false;
+      },
     } as any,
     reviewCheckpoints: {
-      reviewChangesAgainstCommit: async () => {
+      reviewChangesAgainstCommit: async ({ workspaceId }: { workspaceId: string }) => {
+        snapshotCalls += 1;
+        if (snapshotCalls === failSnapshotCall) throw new Error("injected snapshot failure");
         concurrentSnapshots += 1;
         maxConcurrentSnapshots = Math.max(maxConcurrentSnapshots, concurrentSnapshots);
         await new Promise((resolve) => setTimeout(resolve, 15));
         concurrentSnapshots -= 1;
         return {
           files: [],
-          patch: "fixture patch",
+          patch: `fixture patch ${workspaceId}`,
           summary: { additions: 1, removals: 0 },
           snapshotKind: "git",
           snapshotRef: "snapshot",
         };
       },
     } as any,
-    reviewWorkflow: { submitForReview: async () => ({ submissionId: `submission_${++submissionNumber}`, reviewEpoch: submissionNumber }) } as any,
+    reviewWorkflow: { submitForReview: async (input: any) => {
+      const submission = {
+        id: `submission_${++submissionNumber}`,
+        submissionId: `submission_${submissionNumber}`,
+        reviewEpoch: submissionNumber,
+        diffSha256: input.diffSha256,
+        snapshotKind: input.snapshotKind,
+        snapshotRef: input.snapshotRef,
+        message: input.message,
+      };
+      const existing = submissionsByWorkSession.get(input.workSessionId) ?? [];
+      existing.push(submission);
+      submissionsByWorkSession.set(input.workSessionId, existing);
+      if (throwAfterSubmissionForJob && input.message.includes(throwAfterSubmissionForJob)) {
+        throw new Error("injected crash after review submission persistence");
+      }
+      return { submissionId: submission.submissionId, reviewEpoch: submission.reviewEpoch };
+    } } as any,
   });
   try {
     await Promise.all([processor.process(jobs.get("job_lock_a")!), processor.process(jobs.get("job_lock_b")!)]);
@@ -596,8 +686,73 @@ let claimToken: string;
     assert.equal(jobs.get("job_lock_b")?.status, "awaiting_review");
     await processor.process(missingReceiptJob);
     assert.equal(missingReceiptJob.status, "awaiting_reconciliation",
-      "a result without its required durable receipt becomes an explicit recovery state instead of silently keeping a workspace reservation");
+      "a result without its required durable receipt becomes an explicit recovery state rather than retaining a checkout reservation");
     assert.equal(missingReceiptJob.resultProcessing?.failure, "result_receipt_missing");
+    assert.equal(resultLeases.size, 0, "missing-receipt validation fails before acquiring a checkout reservation");
+
+    await processor.process(invalidTargetJob);
+    assert.equal(invalidTargetJob.status, "awaiting_reconciliation");
+    assert.equal(resultLeases.size, 0, "terminal target-session mismatch does not reserve the worktree");
+
+    failSnapshotCall = snapshotCalls + 1;
+    await processor.process(preEffectFaultJob);
+    failSnapshotCall = undefined;
+    assert.equal(preEffectFaultJob.resultProcessing?.failurePhase, "reservation_acquired",
+      "read-only snapshot failure records the last completed pre-effect phase");
+    assert.equal(resultLeases.size, 0, "failure before write_started releases the exact recovery reservation");
+
+    throwAfterSubmissionForJob = postSubmissionFaultJob.jobId;
+    await processor.process(postSubmissionFaultJob);
+    throwAfterSubmissionForJob = undefined;
+    assert.equal(postSubmissionFaultJob.resultProcessing?.failurePhase, "snapshot_bound",
+      "failure after review submission records the durable snapshot boundary");
+    assert.equal(resultLeases.size, 1, "submission/linkage uncertainty retains the checkout reservation");
+    assert.equal(submissionsByWorkSession.get(postSubmissionFaultJob.workSessionId!)?.filter((submission) => submission.message.includes(postSubmissionFaultJob.jobId)).length, 1,
+      "the uncertain review submission is persisted once");
+    postSubmissionFaultJob.status = "result_received";
+    postSubmissionFaultJob.resultProcessing!.failure = undefined;
+    await processor.process(postSubmissionFaultJob);
+    assert.equal(postSubmissionFaultJob.status, "awaiting_review");
+    assert.equal(postSubmissionFaultJob.resultProcessing?.phase, "review_linked",
+      "retry binds the existing submission instead of creating another review request");
+    assert.equal(resultLeases.size, 0, "successful recovery releases the exact durable reservation");
+
+    const temporaryReceipt = attempts.get(temporaryRecoveryJob.jobId)![0].receipt;
+    const temporaryHash = createHash("sha256").update(bytesByJob.get(temporaryRecoveryJob.jobId)!).digest("hex");
+    const temporaryReceiptSha = createHash("sha256").update(JSON.stringify({
+      jobId: temporaryReceipt.jobId,
+      attemptId: temporaryReceipt.attemptId,
+      baseRevision: temporaryReceipt.baseRevision,
+      manifestSha256: temporaryReceipt.manifestSha256,
+      files: temporaryReceipt.files.map((file: any) => ({ path: file.path, sha256: file.sha256, bytes: file.bytes })).sort((a: any, b: any) => a.path.localeCompare(b.path)),
+      totalBytes: temporaryReceipt.totalBytes,
+    })).digest("hex");
+    const temporaryPath = join(resultRoot, `temporary-recovery.txt.${temporaryHash}.peer.tmp`);
+    writeFileSync(temporaryPath, bytesByJob.get(temporaryRecoveryJob.jobId)!);
+    temporaryRecoveryJob.status = "staging";
+    temporaryRecoveryJob.resultProcessing = {
+      receiptSha256: temporaryReceiptSha,
+      phase: "write_started",
+      updatedAt: new Date().toISOString(),
+    };
+    await processor.process(temporaryRecoveryJob);
+    assert.equal(temporaryRecoveryJob.status, "awaiting_review");
+    assert.equal(existsSync(temporaryPath), false, "recovery renames only the exact receipt-bound temporary");
+    assert.equal(readFileSync(join(resultRoot, "temporary-recovery.txt"), "utf8"), bytesByJob.get(temporaryRecoveryJob.jobId)!.toString(),
+      "a crash after temporary-file creation recovers the exact staged bytes");
+    assert.equal(resultLeases.size, 0, "successful temporary recovery releases its reservation after review linkage");
+
+    failSnapshotCall = snapshotCalls + 2;
+    await processor.process(postEffectFaultJob);
+    failSnapshotCall = undefined;
+    assert.equal(postEffectFaultJob.resultProcessing?.phase, "files_staged");
+    assert.equal(postEffectFaultJob.resultProcessing?.failurePhase, "files_staged",
+      "failure after staging records where recovery became uncertain");
+    assert.equal(resultLeases.size, 1, "possibly applied result remains fenced for explicit reconciliation");
+    const conflictingRecoveryJob = addResultFixture("job_lock_competing_recovery", "competing.txt");
+    await processor.process(conflictingRecoveryJob);
+    assert.equal(conflictingRecoveryJob.status, "awaiting_reconciliation");
+    assert.equal(resultLeases.size, 1, "another receipt cannot replace an uncertain staged result reservation");
     console.log("enqueue-e2e: workspace aliases for one worktree stage serially");
   } finally {
     rmSync(resultRoot, { recursive: true, force: true });

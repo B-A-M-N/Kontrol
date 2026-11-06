@@ -197,7 +197,10 @@ export async function dispatchScheduledJob(
       const peerInstruction = taskClass === "read_only_audit"
         ? `${instruction}\n\nReturn findings only in these declared report files: ${allowedOutputs.join(", ")}. Do not modify other workspace files.`
         : instruction;
-      const created = options.peerJobStore.createJob({
+      // Atomic admission: the cap is enforced inside the same BEGIN IMMEDIATE
+      // transaction as the insert. The earlier enforcePeerJobsCap probe is a
+      // fast-path "blocked" signal; this call is the authoritative gate.
+      const created = options.peerJobStore.createJobWithinActiveCap({
         jobId: peerJobId,
         peerId: descriptor.id,
         workSessionId,
@@ -211,7 +214,7 @@ export async function dispatchScheduledJob(
         allowedOutputs,
         maxRuntimeMs: job.maxRuntimeMs,
         maxArtifactBytes: 64 * 1024 * 1024,
-      });
+      }, peerConfig.maxClaimedJobs);
       return {
         status: "dispatched",
         workSessionId,

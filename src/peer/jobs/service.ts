@@ -31,13 +31,16 @@ const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 export const MAX_INSTRUCTION_BYTES = 256 * 1024;
 
 function activeJobCount(store: PeerJobStore, peerId: string): number {
-  return store.listJobsForPeer(peerId).filter(
-    (job) =>
-      job.status === "pending" ||
-      job.status === "claimed" ||
-      job.status === "running" ||
-      job.status === "awaiting_reconciliation",
-  ).length;
+  // Indexed SQL count when the store provides it; the JSON list scan is a
+  // fallback for stores that only implement the list projection.
+  return store.countActiveJobsForPeer?.(peerId)
+    ?? store.listJobsForPeer(peerId).filter(
+      (job) =>
+        job.status === "pending" ||
+        job.status === "claimed" ||
+        job.status === "running" ||
+        job.status === "awaiting_reconciliation",
+    ).length;
 }
 
 /** Enforce the per-peer active-job cap before create. */

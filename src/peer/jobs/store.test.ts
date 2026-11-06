@@ -8,6 +8,10 @@
  */
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { createInterface } from "node:readline";
+import { spawn } from "node:child_process";
+import { access, writeFile } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -30,6 +34,77 @@ function openStore(stateDir: string): PeerJobStore {
 function newStore(): PeerJobStore {
   const stateDir = mkdtempSync(join(tmpdir(), "peer-jobs-store-"));
   return openStore(stateDir);
+}
+
+// The per-peer cap uses an indexed SQL count over active statuses, not a
+// materialized list of every peer job and its JSON record.
+{
+  const store = newStore();
+  const first = store.createJob(jobInput("peer-count"));
+  store.createJob(jobInput("peer-count", { jobId: "job_00000000-0000-4000-8000-000000000001" }));
+  assert.equal(store.countActiveJobsForPeer?.("peer-count"), 2);
+  assert.equal(store.countActiveJobsForPeer?.("peer-other"), 0);
+  const { attempt } = store.claimNextJob("peer-count", 1_700_000_000_000)!;
+  store.markStarted(attempt.attemptId, attempt.claimToken, "peer-count", 1_700_000_000_001);
+  assert.equal(store.countActiveJobsForPeer?.("peer-count"), 2, "claimed/running status stays within the active cap");
+  store.markAwaitingReconciliation(first.jobId, "test", 1_700_000_000_002);
+  assert.equal(store.countActiveJobsForPeer?.("peer-count"), 2, "awaiting reconciliation remains active");
+}
+
+// Independent SQLite connections race the per-peer admission cap. Exactly one
+// concurrent create may consume the final slot.
+{
+  const stateDir = mkdtempSync(join(tmpdir(), "peer-jobs-cap-race-"));
+  const parentStore = openStore(stateDir);
+  const barrierPath = join(stateDir, "start-cap-contenders");
+  const source = `
+    import { access } from "node:fs/promises";
+    import { setTimeout as delay } from "node:timers/promises";
+    import { openPeerJobStore } from "./src/peer/jobs/store.ts";
+    const [stateDir, barrierPath, peerId] = process.argv.slice(1);
+    const store = openPeerJobStore(stateDir, { level: "silent", format: "json", requests: false, assets: false, toolCalls: false, shellCommands: false });
+    process.stdout.write("ready\\n");
+    while (true) { try { await access(barrierPath); break; } catch { await delay(5); } }
+    try {
+      store.createJobWithinActiveCap({
+        peerId, workSessionId: "work-cap-race", workspaceSessionId: "workspace-cap-race",
+        repositoryId: "/tmp/cap-race", baseRevision: "0123456789abcdef0123456789abcdef01234567",
+        taskClass: "read_only_audit", instructionHash: "0".repeat(64), instructions: "race",
+        allowedOutputs: [], maxRuntimeMs: 1000, maxArtifactBytes: 100,
+      }, 1);
+      process.stdout.write("created\\n");
+    } catch (error) {
+      if (!(error instanceof Error) || (error).code !== "peer_jobs_cap_exceeded") throw error;
+      process.stdout.write("cap_rejected\\n");
+    } finally { store.close(); }
+  `;
+  const contenders = Array.from({ length: 2 }, () => {
+    const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", source, stateDir, barrierPath, "peer-cap-race"], {
+      cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"],
+    });
+    const lines = createInterface({ input: child.stdout });
+    const ready = new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("peer admission contender did not start")), 30_000);
+      lines.on("line", (line) => { if (line === "ready") { clearTimeout(timeout); resolve(); } });
+      child.once("error", (error) => { clearTimeout(timeout); reject(error); });
+    });
+    const outcome = new Promise<string>((resolve, reject) => {
+      lines.on("line", (line) => { if (line === "created" || line === "cap_rejected") resolve(line); });
+      child.once("close", (code) => { lines.close(); if (code !== 0) reject(new Error(`peer cap contender exited ${code}`)); });
+    });
+    return { child, ready, outcome };
+  });
+  try {
+    await Promise.all(contenders.map((contender) => contender.ready));
+    await writeFile(barrierPath, "go");
+    const outcomes = await Promise.all(contenders.map((contender) => contender.outcome));
+    assert.equal(outcomes.filter((outcome) => outcome === "created").length, 1);
+    assert.equal(outcomes.filter((outcome) => outcome === "cap_rejected").length, 1);
+    assert.equal(parentStore.countActiveJobsForPeer?.("peer-cap-race"), 1,
+      "BEGIN IMMEDIATE protects the cap across separate SQLite connections");
+  } finally {
+    for (const contender of contenders) contender.child.kill("SIGTERM");
+  }
 }
 
 function jobInput(peerId: string, overrides: Partial<PeerJob> = {}): Omit<PeerJob, "jobId" | "status" | "createdAt"> & { peerId: string } {
@@ -361,6 +436,20 @@ const NOW = 1_700_000_000_000;
 
   const receiptSha256 = createHash("sha256").update(JSON.stringify(receipt)).digest("hex");
   assert.equal(store.markStaging(job.jobId, receiptSha256, NOW + 6100).status, "staging");
+  assert.equal(store.advanceResultPhase(job.jobId, receiptSha256, "validated", NOW + 6101).resultProcessing?.phase, "validated");
+  assert.equal(store.advanceResultPhase(job.jobId, receiptSha256, "reservation_acquired", NOW + 6102).resultProcessing?.phase, "reservation_acquired");
+  assert.equal(store.advanceResultPhase(job.jobId, receiptSha256, "write_started", NOW + 6103).resultProcessing?.phase, "write_started");
+  assert.equal(store.advanceResultPhase(job.jobId, receiptSha256, "files_staged", NOW + 6104).resultProcessing?.phase, "files_staged");
+  const snapshotBound = store.advanceResultPhase(job.jobId, receiptSha256, "snapshot_bound", NOW + 6105, {
+    snapshotKind: "git", snapshotRef: "snapshot-ref", diffSha256: "a".repeat(64),
+  });
+  assert.equal(snapshotBound.resultProcessing?.snapshotRef, "snapshot-ref", "snapshot identity is persisted with its phase");
+  assert.equal(store.advanceResultPhase(job.jobId, receiptSha256, "validated", NOW + 6106).resultProcessing?.phase,
+    "snapshot_bound", "replay never moves the durable result phase backwards");
+  const phaseFailure = store.markAwaitingReconciliation(job.jobId, "injected_after_snapshot", NOW + 6107);
+  assert.equal(phaseFailure.resultProcessing?.failurePhase, "snapshot_bound", "reconciliation records the phase where failure occurred");
+  assert.equal(store.retryResultProcessing(job.jobId, "injected_after_snapshot", NOW + 6108).status, "result_received");
+  store.markStaging(job.jobId, receiptSha256, NOW + 6109);
   const awaitingReview = store.markAwaitingReview(job.jobId, {
     receiptSha256,
     submissionId: "submission-peer-test",
@@ -370,6 +459,7 @@ const NOW = 1_700_000_000_000;
     diffSha256: "e".repeat(64),
   }, NOW + 6200);
   assert.equal(awaitingReview.status, "awaiting_review");
+  assert.equal(awaitingReview.resultProcessing?.phase, "review_linked", "review linkage is the terminal staging phase");
   assert.equal(awaitingReview.resultProcessing?.verificationStatus, undefined);
   const verificationRecovered = store.markAwaitingReview(job.jobId, {
     receiptSha256,

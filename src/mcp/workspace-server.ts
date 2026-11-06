@@ -553,7 +553,11 @@ export function createMcpServer(
     }
     let job;
     try {
-      job = store.createJob({
+      // Atomic admission: the cap is enforced inside the same BEGIN IMMEDIATE
+      // transaction as the insert, so concurrent enqueues cannot both consume
+      // the final slot (the earlier enforcePeerJobsCap check is only a
+      // fast-path denial before workspace reservation work).
+      job = store.createJobWithinActiveCap({
         jobId,
         peerId: descriptor.id,
         workSessionId: workSession.id,
@@ -566,7 +570,7 @@ export function createMcpServer(
         allowedOutputs,
         maxRuntimeMs: args.maxRuntimeMs ?? 600_000,
         maxArtifactBytes: args.maxArtifactBytes ?? 1_048_576,
-      });
+      }, peer.maxClaimedJobs);
     } catch (error) {
       workSessions.releaseWorkspaceLeaseForSession(workSession.id, reservation.lease.leaseNonce);
       return denied(`Peer job could not be persisted; the checkout reservation was released. ${error instanceof Error ? error.message : String(error)}`);
