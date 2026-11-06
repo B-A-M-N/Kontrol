@@ -100,7 +100,10 @@ try {
     values (?, 'tool', ?, ?, ?, '{}', 'pending', ?)
   `).run("legacy-command-approval", "migration-test-workspace", "legacy tool approval", legacyApprovalCommand, new Date().toISOString());
   sqlite.prepare("update approval_requests set command_digest = null where id = ?").run("legacy-command-approval");
-  sqlite.prepare("delete from kontrol_schema_migrations where version = ?").run(LATEST_SCHEMA_VERSION);
+  // When this backfill test was written LATEST was 112; now that LATEST is
+  // 116, delete the 112+ ledger rows so migrateDatabase re-runs the redaction
+  // backfill (idempotent addColumnIfMissing) through to the current version.
+  sqlite.prepare("delete from kontrol_schema_migrations where version >= 112").run();
   migrateDatabase(sqlite);
   const migratedApproval = sqlite.prepare("select command, command_digest from approval_requests where id = ?")
     .get("legacy-command-approval") as { command: string | null; command_digest: string | null };
