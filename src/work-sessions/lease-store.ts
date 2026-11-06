@@ -79,6 +79,7 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
               conflictingWorkSessionId: existing.workSessionId,
               workspaceSessionId: existing.workspaceSessionId,
               expiresAt: existing.expiresAt,
+              durableRecovery: true,
             };
           }
         } else if (requestedLeaseKind === "peer_job" && existing) {
@@ -89,6 +90,7 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
             conflictingWorkSessionId: existing.workSessionId,
             workspaceSessionId: existing.workspaceSessionId,
             expiresAt: existing.expiresAt,
+            durableRecovery: existing.leaseKind === "peer_job" || existing.leaseKind === "cleanup_pending",
           };
         }
 
@@ -98,6 +100,7 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
             conflictingWorkSessionId: existing.workSessionId,
             workspaceSessionId: existing.workspaceSessionId,
             expiresAt: existing.expiresAt,
+            durableRecovery: existing.leaseKind === "peer_job" || existing.leaseKind === "cleanup_pending",
           };
         }
 
@@ -211,7 +214,8 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
         .where(and(
           eq(workspaceLeases.canonicalRoot, canonicalRoot),
           // Durable recovery reservations never degrade by expiry alone.
-          sql`${workspaceLeases.leaseKind} in ('peer_job', 'cleanup_pending') or ${gte(workspaceLeases.expiresAt, nowIso)}`,
+          // Parentheses are load-bearing: AND binds tighter than OR in SQL.
+          sql`(${workspaceLeases.leaseKind} in ('peer_job', 'cleanup_pending') or ${gte(workspaceLeases.expiresAt, nowIso)})`,
         ))
         .get();
       return lease ? rowToWorkspaceLease(lease) : undefined;

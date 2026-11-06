@@ -160,6 +160,8 @@ export interface WorkspaceLease {
   workspaceSessionId: string;
   workSessionId: string;
   leaseKind: "modify" | "peer_job" | "cleanup_pending";
+  /** Recovery and terminal-cleanup reservations remain fenced until explicit release. */
+  durableRecovery?: boolean;
   ownerInstanceId: string;
   /** Owner-generation fencing token. Explicit takeover rotates it; renewal preserves it. */
   leaseNonce: string;
@@ -183,4 +185,4 @@ export interface RuntimeReconciliationPage {
 
 export type WorkspaceLeaseResult =
   | { acquired: true; lease: WorkspaceLease }
-  | { acquired: false; conflictingWorkSessionId: string; workspaceSessionId: string; expiresAt: string };
+  | { acquired: false; conflictingWorkSessionId: string; workspaceSessionId: string; expiresAt: string; durableRecovery?: boolean };

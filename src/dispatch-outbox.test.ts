@@ -454,6 +454,28 @@ try {
       0,
       "an expired worker cannot renew after another session takes over",
     );
+
+    const peerRecovery = workSessions.acquireWorkspaceLease({
+      canonicalRoot: "/tmp/checkout-peer-recovery",
+      workspaceSessionId: "ws_1",
+      workSessionId: workspace.id,
+      ownerInstanceId: "peer-job:job-recovery-test",
+      leaseKind: "peer_job",
+      ttlMs: 5,
+    });
+    assert.ok(peerRecovery.acquired);
+    assert.equal(peerRecovery.lease.durableRecovery, true, "peer result reservation is explicitly identified as durable recovery state");
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    assert.equal(workSessions.getActiveWorkspaceLease("/tmp/checkout-peer-recovery")?.leaseNonce, peerRecovery.lease.leaseNonce,
+      "peer-job recovery fence survives informational expiry until explicit reconciliation");
+    assert.equal(workSessions.acquireWorkspaceLease({
+      canonicalRoot: "/tmp/checkout-peer-recovery",
+      workspaceSessionId: "ws_2",
+      workSessionId: other.id,
+    }).acquired, false, "another session cannot take an expired but unreconciled peer result reservation");
+    assert.equal(workSessions.releaseWorkspaceLeaseForSession(workspace.id, peerRecovery.lease.leaseNonce), true,
+      "reconciliation can release the exact durable reservation by nonce");
+    assert.equal(workSessions.getActiveWorkspaceLease("/tmp/checkout-peer-recovery"), undefined);
     db.close();
   }
 
