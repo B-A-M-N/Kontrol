@@ -176,8 +176,12 @@ try {
     ownerContextId: "review-context-b", claimLeaseMs: 60_000,
   });
   assert.equal(renewed.status, "claimed");
-  assert.ok(Date.parse(renewed.claimExpiresAt!) > Date.parse(h2Claim.claimExpiresAt!),
-    "renewal extends the unexpired lease");
+  // Expiry is nowMs + lease at millisecond granularity: a same-millisecond
+  // renewal legitimately yields an equal expiry, so assert never-shortened
+  // plus the revision bump that proves the renewal was applied.
+  assert.ok(Date.parse(renewed.claimExpiresAt!) >= Date.parse(h2Claim.claimExpiresAt!),
+    "renewal never shortens the unexpired lease");
+  assert.equal(renewed.revision, h2Claim.revision + 1, "renewal advances the revision");
   assert.throws(() => routes.renewHandoffClaim({
     handoffId: h2.id, expectedRevision: renewed.revision, principalId: "user-c",
     ownerContextId: "review-context-b", claimLeaseMs: 60_000,
