@@ -1,10 +1,11 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { mkdir, readFile as readFileAsync, readdir, lstat, readlink, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { join, relative, resolve, dirname, sep } from "node:path";
 import { git, getGitEligibility, safeWorkspaceRefSegment } from "./git.js";
 import { FilesystemSnapshotStore, type FilesystemSnapshotLimits } from "./filesystem-snapshot-store.js";
+import type Database from "better-sqlite3";
 import {
   classifyFilesystemCoverage,
   classifyGitCoverage,
@@ -225,6 +226,10 @@ export interface ReviewCheckpointManager {
    * `clearRecordedMutations` (called when a checkpoint advances).
    */
   recordMutations(input: { workspaceId: string; root: string; paths: string[]; workSessionId?: string }): Promise<void>;
+  /** Persist intent before a structured filesystem effect so a crash cannot erase provenance. */
+  beginMutationIntent(input: { workspaceId: string; root: string; paths: string[]; workSessionId?: string }): Promise<string>;
+  /** Applied effects are auditable; unresolved effects remain unknown and block approval. */
+  resolveMutationIntent(input: { workspaceId: string; operationId: string; outcome: "applied" | "unknown" }): Promise<void>;
   /**
    * Classify every recorded mutation path against the ACTIVE checkpoint
    * backend and return the coverage record for the submission. Empty
@@ -248,6 +253,7 @@ export function createReviewCheckpointManager(options: {
   /** P1.6: additional excluded directory names (added to the defaults). */
   excludedDirectories?: Iterable<string>;
   fsStore?: FilesystemSnapshotStore;
+  mutationProvenanceSqlite?: Database.Database;
 } = {}): ReviewCheckpointManager {
   const states = new Map<string, WorkspaceReviewStateWithInit>();
   // Created lazily on first filesystem use so tests that never capture an
@@ -580,7 +586,7 @@ export function createReviewCheckpointManager(options: {
           baselines.presentations.set("default", snapshot);
         }
         await getFsStore().saveBaselines(workspaceId, state.root, baselines);
-        clearMutationScope(state, workSessionId);
+        await this.clearRecordedMutations({ workspaceId, workSessionId });
         return;
       }
       if (!state?.gitRoot) {
@@ -589,7 +595,7 @@ export function createReviewCheckpointManager(options: {
       // Advance baseline to the EXACT captured snapshot (no recompute — the tree
       // may have changed between capture and persistence).
       await git(state.gitRoot, ["update-ref", sessionBaselineRef(workspaceId, workSessionId), snapshot.ref]);
-      clearMutationScope(state, workSessionId);
+      await this.clearRecordedMutations({ workspaceId, workSessionId });
     },
 
     async awaitWorkspaceReady({ workspaceId, root }) {
@@ -615,29 +621,63 @@ export function createReviewCheckpointManager(options: {
       await getFsStore().releaseWorkSessionBaseline(workspaceId, workSessionId);
     },
 
-    async recordMutations({ workspaceId, root, paths, workSessionId }) {
-      // The workspace may legitimately receive mutations before its first
-      // checkpoint operation (initializeWorkspace only runs lazily), so await
-      // initialization instead of silently dropping the record.
+    async beginMutationIntent({ workspaceId, root, paths, workSessionId }) {
       const state = await ensureInitialized(workspaceId, root);
       const ledger = workSessionId ? mutationLedgerForSession(state, workSessionId) : state.unscopedReviewMutations;
-      for (const path of paths) {
-        const rel = workspaceRelativePath(root, path);
-        // Undefined = path escapes the workspace root; that is a policy/
-        // confinement failure handled by the mutation tools, not a coverage
-        // entry — recording it here would make every review look incomplete.
+      const operationId = randomUUID();
+      const now = new Date().toISOString();
+      const insert = options.mutationProvenanceSqlite?.prepare(`
+        insert into review_mutation_provenance
+          (id, workspace_id, work_session_id, operation_id, path, state, created_at)
+        values (?, ?, ?, ?, ?, 'pending', ?)
+      `);
+      for (const path of (paths.length > 0 ? paths : [undefined])) {
+        const rel = path === undefined ? undefined : workspaceRelativePath(root, path);
         if (rel) ledger.set(rel, rel);
+        insert?.run(randomUUID(), workspaceId, workSessionId ?? "", operationId, rel ?? null, now);
       }
+      return operationId;
+    },
+
+    async resolveMutationIntent({ workspaceId, operationId, outcome }) {
+      options.mutationProvenanceSqlite?.prepare(`
+        update review_mutation_provenance
+           set state = ?, resolved_at = ?
+         where workspace_id = ? and operation_id = ? and state = 'pending'
+      `).run(outcome, new Date().toISOString(), workspaceId, operationId);
+    },
+
+    async recordMutations({ workspaceId, root, paths, workSessionId }) {
+      const operationId = await this.beginMutationIntent({ workspaceId, root, paths, workSessionId });
+      await this.resolveMutationIntent({ workspaceId, operationId, outcome: "applied" });
     },
 
     async checkpointCoverage({ workspaceId, root, workSessionId }): Promise<CheckpointCoverage> {
       const state = await ensureInitialized(workspaceId, root);
-      const paths = [...new Set([
+      const memoryPaths = [...new Set([
         ...state.unscopedReviewMutations.keys(),
         ...(workSessionId ? state.reviewMutationsByWorkSession.get(workSessionId)?.keys() ?? [] : []),
       ])];
+      const durableRows = options.mutationProvenanceSqlite?.prepare(`
+        select path, state from review_mutation_provenance
+         where workspace_id = ? and work_session_id in (?, '')
+      `).all(workspaceId, workSessionId ?? "") as Array<{ path: string | null; state: string }> | undefined;
+      if (durableRows?.some((row) => row.state !== "applied" || !row.path)) {
+        return {
+          status: "unknown",
+          uncoveredPaths: [],
+          reasons: ["A structured mutation outcome is unresolved; inspect the exact workspace state and submit a new assessment."],
+          backend: state.backend?.kind ?? "unknown",
+          assessedAt: new Date().toISOString(),
+          errorCode: "mutation_outcome_unknown",
+        };
+      }
+      const paths = [...new Set([
+        ...memoryPaths,
+        ...(durableRows ?? []).map((row) => row.path).filter((path): path is string => Boolean(path)),
+      ])];
       if (paths.length === 0) {
-        return { status: "complete", uncoveredPaths: [], reasons: [], backend: state.backend?.kind ?? "filesystem", assessedAt: new Date().toISOString() };
+        return { status: "complete", uncoveredPaths: [], reasons: [], backend: state.backend?.kind ?? "unknown", assessedAt: new Date().toISOString() };
       }
       if (state.backend?.kind === "git" && state.gitRoot) {
         // Cheap per-path ignore probe via git's own machinery.
@@ -668,6 +708,9 @@ export function createReviewCheckpointManager(options: {
     async clearRecordedMutations({ workspaceId, workSessionId }) {
       const state = states.get(workspaceId);
       if (state) clearMutationScope(state, workSessionId);
+      options.mutationProvenanceSqlite?.prepare(`
+        delete from review_mutation_provenance where workspace_id = ? and work_session_id = ?
+      `).run(workspaceId, workSessionId ?? "");
     },
   };
 }

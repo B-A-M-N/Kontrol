@@ -343,6 +343,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     },
     // P1.6: operator-extended exclusion list, added to the defaults.
     excludedDirectories: config.fsSnapshot.excludedDirectories,
+    mutationProvenanceSqlite: db.sqlite,
   });
   const agentPtyBindings = createAgentPtyBindingStore(db.sqlite);
   const staleAgentPtyBindings = agentPtyBindings.markUnresolvedLost();
