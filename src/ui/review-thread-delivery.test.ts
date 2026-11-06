@@ -88,6 +88,29 @@ const uncertainOutcome = await deliverPendingReviewMessages({
 assert.deepEqual(uncertainOutcome, { status: "uncertain", handoffId: "handoff-uncertain", reason: "host accepted but response lost" },
   "an ambiguous lost response is typed as uncertain rather than delivered or rejected");
 
+  // A malformed claim payload is a tool error and surfaces as uncertain,
+  // rather than silently returning an empty queue or crashing the loop.
+  const malformedCalls: string[] = [];
+  const malformedUncertain: string[] = [];
+  const malformedAdapter = {
+    capabilities: () => ({ createThread: false, sendMessage: true, observeAcknowledgement: false }),
+    sendMessage: async () => { throw new Error("malformed claims must not reach the host"); },
+  };
+  const malformedOutcome = await deliverPendingReviewMessages({
+    adapter: malformedAdapter,
+    callTool: async ({ name }: { name: string }) => {
+      malformedCalls.push(name);
+      if (name === "claim_review_thread_deliveries") return { content: [], structuredContent: { messages: "not-an-array" } };
+      return { content: [] };
+    },
+    onUncertain: (message: string) => malformedUncertain.push(message),
+  });
+  assert.deepEqual(malformedOutcome, { status: "tool_error", reason: "Review delivery queue returned a malformed structured claim." },
+    "a malformed claim payload is reported as a tool error, not an empty queue");
+  assert.deepEqual(malformedCalls, ["claim_review_thread_deliveries"], "malformed claims stop before acknowledgement or host delivery");
+  assert.equal(malformedUncertain.length, 1, "the malformed payload surfaces as an uncertain delivery");
+
+
 await appTransport.close();
 await bridgeTransport.close();
 

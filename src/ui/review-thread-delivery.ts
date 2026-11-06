@@ -41,7 +41,14 @@ export async function deliverPendingReviewMessages(input: {
     return { status: "tool_error", reason };
   }
   const claim = getStructuredContent<ClaimedDeliveries>(result);
-  if (!claim) return { status: "tool_error", reason: "Review delivery queue returned no structured claim." };
+  // A malformed claim payload is a tool error, not an empty queue: an
+  // unexpected shape must surface as uncertain rather than silently
+  // pretending there was nothing to deliver.
+  if (!claim || !Array.isArray(claim.messages)) {
+    const reason = "Review delivery queue returned a malformed structured claim.";
+    input.onUncertain(reason);
+    return { status: "tool_error", reason };
+  }
   const accepted: string[] = [];
   let rejected: string | undefined;
   let uncertain: { handoffId: string; reason: string } | undefined;
