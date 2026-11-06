@@ -18,7 +18,8 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, 
 import { createHash } from "node:crypto";
 import { runQualificationProcess } from "./lib/qualification-process.mjs";
 import { join, resolve } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
+import { assertDiskHeadroom, directoryBytes } from "./lib/release-retention.mjs";
 import { fileURLToPath } from "node:url";
 import { buildToolEnvironment } from "./lib/tool-environment.mjs";
 import { ReleaseVerificationError, verifyQualifiedRelease } from "./lib/release-verify.mjs";
@@ -175,6 +176,21 @@ if (publish) {
 
 // 3. Stage the complete package tree in a temp directory.
 const packageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+// Fail fast when the staging destination cannot hold the package plus the
+// reserve scaled to existing state/release footprint.
+const declaredFiles = Array.isArray(packageJson.files) ? packageJson.files : [];
+let packageTreeBytes = directoryBytes(candidatePath);
+for (const entry of declaredFiles) {
+  if (entry === "dist") continue;
+  if (entry.includes("*")) throw new Error(`glob entries are not supported by the staging packer: ${entry}`);
+  packageTreeBytes += directoryBytes(join(root, entry));
+}
+assertDiskHeadroom({
+  path: tmpdir(),
+  requiredBytes: packageTreeBytes * 2,
+  stateDir: process.env.KONTROL_STATE_DIR ?? join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "kontrol"),
+  releasesRoot: join(root, "releases"),
+});
 const staging = mkdtempSync(join(tmpdir(), "kontrol-package-stage-"));
 const stagedPkg = join(staging, "package");
 mkdirSync(join(stagedPkg, "dist"), { recursive: true });

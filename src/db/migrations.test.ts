@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
+import { brandBuildId, brandDeploymentId } from "../branded.js";
 import { databasePath, openDatabase } from "./client.js";
 import { inspectDatabaseSchemaContract, LATEST_SCHEMA_VERSION, migrateDatabase } from "./migrations.js";
 
@@ -226,7 +227,11 @@ try {
   downgraded.prepare("delete from kontrol_schema_migrations where version = ?").run(LATEST_SCHEMA_VERSION);
   downgraded.close();
 
-  const upgraded = openDatabase(backupRoot);
+  const upgraded = openDatabase(backupRoot, {
+    deploymentId: brandDeploymentId("deployment-test-upgrade"),
+    expectedBuildId: brandBuildId("test-upgrade"),
+    expectedSchemaVersion: LATEST_SCHEMA_VERSION,
+  });
   upgraded.close();
   const backupPath = `${path}.pre-migration-v${LATEST_SCHEMA_VERSION - 1}-to-v${LATEST_SCHEMA_VERSION}.bak`;
   assert.ok(existsSync(backupPath), "schema upgrades retain a versioned recoverable database backup");
@@ -246,3 +251,49 @@ try {
 }
 
 console.log("migrations.test.ts: all assertions passed");
+
+// --- M4: migration authority and read-only inspection ------------------------
+{
+  const { inspectDatabase: inspect } = await import("./client.js");
+  const {
+    existsSync: fsExistsSync,
+  } = await import("node:fs");
+  const root = mkdtempSync(join(tmpdir(), "kontrol-migration-authority-"));
+  try {
+    // Inspection never creates state.
+    assert.throws(() => inspect(root), /unable to open database file/, "inspectDatabase refuses a missing database");
+    assert.equal(fsExistsSync(databasePath(root)), false, "inspection does not create the database file");
+
+    const db = openDatabase(root);
+    db.close();
+    // Inspection accepts a current-schema database without mutating it.
+    const handle = inspect(root);
+    assert.equal((handle.sqlite.prepare("select max(version) as version from kontrol_schema_migrations").get() as { version: number }).version, LATEST_SCHEMA_VERSION);
+    handle.close();
+
+    // Downgrade one version row: unauthorised open must fail closed, the
+    // deployment-context upgrade must succeed, inspection must refuse.
+    const path = databasePath(root);
+    const downgraded = new Database(path);
+    downgraded.prepare("delete from kontrol_schema_migrations where version = ?").run(LATEST_SCHEMA_VERSION);
+    downgraded.close();
+    assert.throws(
+      () => openDatabase(root),
+      /requires an authorized deployment context/,
+      "unauthorised openDatabase refuses to upgrade an existing database",
+    );
+    assert.throws(() => inspect(root), /schema/, "inspectDatabase refuses a non-current schema");
+    const upgraded = openDatabase(root, {
+      deploymentId: brandDeploymentId("deployment-test-authority"),
+      expectedBuildId: brandBuildId("test-authority"),
+      expectedSchemaVersion: LATEST_SCHEMA_VERSION,
+    });
+    upgraded.close();
+    const finalHandle = inspect(root);
+    assert.equal((finalHandle.sqlite.prepare("select max(version) as version from kontrol_schema_migrations").get() as { version: number }).version, LATEST_SCHEMA_VERSION);
+    finalHandle.close();
+    console.log("migrations.test.ts: migration authority + inspection passed");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}

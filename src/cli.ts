@@ -9,7 +9,8 @@ import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { satisfies } from "semver";
 import { loadConfig } from "./config.js";
-import { databasePath, openDatabase } from "./db/client.js";
+import { databasePath, inspectDatabase, openDatabase } from "./db/client.js";
+import { inspectDeploymentReconciliation } from "./deployment-reconciliation.js";
 import { FilesystemSnapshotStore } from "./filesystem-snapshot-store.js";
 import { loadPolicyConfig, policyCanAsk } from "./policy.js";
 import { collectDurableSnapshotRoots } from "./runtime/snapshot-roots.js";
@@ -362,7 +363,11 @@ async function runReviewLoopCommand(args: string[]): Promise<void> {
   if (!workSessionId) throw new Error("review-loop requires --session <workSessionId>");
   const config = loadConfig();
   if (!existsSync(databasePath(config.stateDir))) throw new Error("Kontrol state database not found; run `kontrol init` first.");
-  const db = openDatabase(config.stateDir);
+  // Status is read-only; mutations use the deployment-context open. A CLI
+  // invocation without deployment authority cannot upgrade the database.
+  const db = sub === "status"
+    ? inspectDatabase(config.stateDir)
+    : openDatabase(config.stateDir);
   const routes = createReviewRouteStore(db);
   try {
     if (sub === "status") {
@@ -1052,13 +1057,19 @@ async function runDoctor(options: { strict?: boolean } = {}): Promise<void> {
     try {
       // Same durable-root collector as GC/maintenance so the doctor's orphan
       // ratio reflects the real reachability, not baseline-only roots.
-      const doctorDb = existsSync(databasePath(config.stateDir)) ? openDatabase(config.stateDir) : undefined;
-      const store = new FilesystemSnapshotStore({
-        storeRoot: join(config.stateDir, "workspace-snapshots"),
-        limits: config.fsSnapshot,
-        durableRoots: () => collectDurableSnapshotRoots(doctorDb),
-      });
-      const { stats, reachable } = await store.storeStatsWithReachability();
+      const doctorDb = existsSync(databasePath(config.stateDir)) ? inspectDatabase(config.stateDir) : undefined;
+      let storeStats: { stats: any; reachable: any };
+      try {
+        const store = new FilesystemSnapshotStore({
+          storeRoot: join(config.stateDir, "workspace-snapshots"),
+          limits: config.fsSnapshot,
+          durableRoots: () => collectDurableSnapshotRoots(doctorDb),
+        });
+        storeStats = await store.storeStatsWithReachability();
+      } finally {
+        doctorDb?.close();
+      }
+      const { stats, reachable } = storeStats;
       const orphan = Math.max(0, stats.blobs - reachable.blobs);
       const orphanRatio = stats.blobs > 0 ? orphan / stats.blobs : 0;
       const highWater = config.fsSnapshot.highWaterBytes;
@@ -1076,6 +1087,13 @@ async function runDoctor(options: { strict?: boolean } = {}): Promise<void> {
       );
     } catch (error) {
       doctorResult("Snapshot store", "UNAVAILABLE", error instanceof Error ? error.message : String(error));
+    }
+    {
+      const reconciliation = inspectDeploymentReconciliation(config.stateDir);
+      doctorResult("Recorded deployment generation", reconciliation.recordedGeneration.status, reconciliation.recordedGeneration.detail);
+      doctorResult("Observed runtime generation", reconciliation.observedRuntime.status, reconciliation.observedRuntime.detail);
+      doctorResult("Recorded active artifact", reconciliation.activeArtifact.status, reconciliation.activeArtifact.detail);
+      doctorResult("Artifact/database compatibility", reconciliation.databaseCompatibility.status, reconciliation.databaseCompatibility.detail);
     }
     if (config.policy.pathRules.length > 0) {
       doctorResult(
