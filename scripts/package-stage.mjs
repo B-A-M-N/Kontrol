@@ -178,9 +178,10 @@ if (publish) {
 const packageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 // Fail fast when the staging destination cannot hold the package plus the
 // reserve scaled to existing state/release footprint.
-const declaredFiles = Array.isArray(packageJson.files) ? packageJson.files : [];
+// (packageJson.files is parsed again at the staging step below; this block
+// must not redeclare `declaredFiles` — see the sole later declaration.)
 let packageTreeBytes = directoryBytes(candidatePath);
-for (const entry of declaredFiles) {
+for (const entry of Array.isArray(packageJson.files) ? packageJson.files : []) {
   if (entry === "dist") continue;
   if (entry.includes("*")) throw new Error(`glob entries are not supported by the staging packer: ${entry}`);
   packageTreeBytes += directoryBytes(join(root, entry));
