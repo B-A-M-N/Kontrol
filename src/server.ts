@@ -79,7 +79,7 @@ import { createReviewThreadStore } from "./review-thread/thread-store.js";
 import { createReviewerJobStore } from "./review-thread/reviewer-job-store.js";
 import { createReviewerBrowserController } from "./review-browser/browser-controller.js";
 import { createReviewerTurnDispatcher } from "./review-browser/turn-dispatcher.js";
-import { setDefaultAcpTimeout } from "./acp-gateway.js";
+import { probeAgent, setDefaultAcpTimeout } from "./acp-gateway.js";
 import { createSupervisorRuns } from "./supervisor-runs.js";
 import { shutdownMissionVerifiers } from "./mission-verifier.js";
 import { createReviewWorkflowService, type ReviewWorkflowService } from "./review-workflow.js";
@@ -115,7 +115,7 @@ import { brandBuildId } from "./branded.js";
  */
 import { createPolicyWaiterRegistry } from "./server/policy-waiters.js";
 import { createMcpSessionLifecycle } from "./server/mcp-session-lifecycle.js";
-import { healthz, readinessChecks, sendReadiness } from "./server/readiness.js";
+import { createCachedAgentDispatchabilityProbe, healthz, readinessChecks, sendReadiness } from "./server/readiness.js";
 import { handleDiagnostics } from "./server/diagnostics.js";
 import { handleAgentPtyCredentialRenewal, handleMcpHttpRequest } from "./server/mcp-http.js";
 import type { McpHttpDeps } from "./server/request-context.js";
@@ -422,7 +422,19 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     reviewSubsystemInitialized: () => Boolean(reviewWorkflow && workSessions && eventStore),
     acpDispatcherInitialized: () => Boolean(dispatcher),
     buildId: () => buildMeta.buildId,
-    listAliveAgents: () => agentRegistry.listAlive(),
+    listAgents: () => agentRegistry.listAll(),
+    probeAgentDispatchability: createCachedAgentDispatchabilityProbe(async (url) => {
+      const evidence = await probeAgent(url, config.acpAdapterSecret);
+      return {
+        dispatchable: evidence.healthy,
+        checkedAt: evidence.checkedAt,
+        failureCategory: evidence.failureCategory,
+        executionCapabilities: Object.entries(evidence.executionCapabilities ?? {})
+          .filter(([, capability]) => capability && typeof capability === "object" && !Array.isArray(capability)
+            && (capability as Record<string, unknown>).supported === true)
+          .map(([name]) => name),
+      };
+    }),
   };
   let revokeWorkSessionGrants: ((workSessionId: string) => void) | undefined;
   const workSessions = createWorkSessionManager(db, {
@@ -572,10 +584,10 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   app.get("/healthz", (_req, res) => healthz(res));
 
   // Core readiness is used while KONTROL is starting before adapters register.
-  app.get("/core-readyz", (_req, res) => sendReadiness(res, readinessChecks(readinessDeps, _req, false), policyCanAsk(config.policy)));
+  app.get("/core-readyz", async (_req, res) => sendReadiness(res, await readinessChecks(readinessDeps, _req, false), policyCanAsk(config.policy)));
   // Strict readiness is the operational contract used by the tunnel and the
   // persistent supervisor. It must fail when a required worker disappears.
-  app.get("/readyz", (req, res) => sendReadiness(res, readinessChecks(readinessDeps, req, true), policyCanAsk(config.policy)));
+  app.get("/readyz", async (req, res) => sendReadiness(res, await readinessChecks(readinessDeps, req, true), policyCanAsk(config.policy)));
 
   // P2: Warn about low reuse using a rolling rate, not only a raw creation
   // count. A client creating one session per tool call is operationally

@@ -10,6 +10,12 @@ import { readRuntimeIdentity } from "../runtime-identity.js";
 import type { Request, Response } from "express";
 
 export type ReadinessCheck = { ok: boolean; detail?: string; agents?: unknown[] };
+export interface AgentDispatchabilityEvidence {
+  dispatchable: boolean;
+  checkedAt: string;
+  failureCategory?: string;
+  executionCapabilities?: string[];
+}
 
 export interface ReadinessDeps {
   readonly config: ServerConfig;
@@ -21,10 +27,36 @@ export interface ReadinessDeps {
   reviewSubsystemInitialized(): boolean;
   acpDispatcherInitialized(): boolean;
   buildId(): string | undefined;
-  listAliveAgents(): Array<{ name: string; url?: string; alive?: boolean }>;
+  listAgents(): Array<{ name: string; url?: string; role?: string; alive?: boolean }>;
+  probeAgentDispatchability(url: string): Promise<AgentDispatchabilityEvidence>;
 }
 
-export function readinessChecks(deps: ReadinessDeps, req: Request, includeAgents: boolean): Record<string, ReadinessCheck> {
+/** Cache protocol probes briefly and coalesce concurrent readiness requests. */
+export function createCachedAgentDispatchabilityProbe(
+  probe: (url: string) => Promise<AgentDispatchabilityEvidence>,
+  ttlMs = 10_000,
+): (url: string) => Promise<AgentDispatchabilityEvidence> {
+  const cache = new Map<string, { cachedAt: number; evidence: AgentDispatchabilityEvidence }>();
+  const inFlight = new Map<string, Promise<AgentDispatchabilityEvidence>>();
+  return (url) => {
+    const cached = cache.get(url);
+    if (cached && Date.now() - cached.cachedAt < ttlMs) return Promise.resolve(cached.evidence);
+    const current = inFlight.get(url);
+    if (current) return current;
+    const request = probe(url).catch(() => ({
+      dispatchable: false,
+      checkedAt: new Date().toISOString(),
+      failureCategory: "probe_failed",
+    })).then((evidence) => {
+      cache.set(url, { cachedAt: Date.now(), evidence });
+      return evidence;
+    }).finally(() => inFlight.delete(url));
+    inFlight.set(url, request);
+    return request;
+  };
+}
+
+export async function readinessChecks(deps: ReadinessDeps, req: Request, includeAgents: boolean): Promise<Record<string, ReadinessCheck>> {
   const { config } = deps;
   const checks: Record<string, ReadinessCheck> = {};
   const runtime = readRuntimeIdentity(config.stateDir);
@@ -98,22 +130,46 @@ export function readinessChecks(deps: ReadinessDeps, req: Request, includeAgents
   // these agents" requests could replace the configured requirement set.
   // Diagnostics/doctor tooling covers ad-hoc agent checks instead.
   const configuredAgents = config.acpKnownAgents;
-  const aliveAgents = deps.listAliveAgents();
+  const registeredAgents = deps.listAgents();
   // P1 #12 review note: an empty configured list with zero registered
   // workers is a legitimate deployment posture ("no ACP workers wanted"),
   // not a readiness failure. Strict /readyz only fails when the operator
   // has *configured* required agents that are absent/unhealthy.
-  const agentResults = configuredAgents.map((required) => {
-    const found = aliveAgents.find((agent) => agent.name === required.name);
+  const agentResults = await Promise.all(configuredAgents.map(async (required) => {
+    const found = registeredAgents.find((agent) => agent.name === required.name);
     const urlMatches = !required.url || found?.url === required.url;
+    const probe = found?.alive && found.role === "agent" && urlMatches && found.url
+      ? await deps.probeAgentDispatchability(found.url)
+      : undefined;
+    const requiredCapabilities = required.requiredExecutionCapabilities ?? [];
+    const availableCapabilities = new Set(probe?.executionCapabilities ?? []);
+    const missingCapabilities = probe?.dispatchable
+      ? requiredCapabilities.filter((capability) => !availableCapabilities.has(capability))
+      : [];
+    const protocolReady = probe?.dispatchable === true && missingCapabilities.length === 0;
+    const dispatchable = Boolean(found?.alive && found.role === "agent" && urlMatches && protocolReady);
     return {
       name: required.name,
       expectedUrl: required.url,
       registeredUrl: found?.url,
+      registered: Boolean(found),
+      role: found?.role,
+      protocolReady,
+      dispatchable,
+      probeCheckedAt: probe?.checkedAt,
+      requiredExecutionCapabilities: requiredCapabilities,
+      missingExecutionCapabilities: missingCapabilities,
+      failureCategory: probe?.failureCategory
+        ?? (missingCapabilities.length > 0 ? "required_capability_missing"
+        : !found ? "not_registered"
+        : !found.alive ? "registration_expired"
+        : !urlMatches ? "url_mismatch"
+        : found.role !== "agent" ? "not_worker_agent" : undefined),
+      degraded: !dispatchable,
+      healthy: dispatchable,
       alive: Boolean(found?.alive),
-      healthy: Boolean(found?.alive) && urlMatches,
     };
-  });
+  }));
   checks.agents = {
     ok: agentResults.every((agent) => agent.healthy),
     detail: configuredAgents.length > 0

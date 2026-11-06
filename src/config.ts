@@ -51,7 +51,7 @@ export interface ServerConfig {
   agentDir: string;
   logging: LoggingConfig;
   acpEnabled: boolean;
-  acpKnownAgents: Array<{ name: string; url: string; description?: string }>;
+  acpKnownAgents: Array<{ name: string; url: string; description?: string; requiredExecutionCapabilities?: string[] }>;
   acpSharedSecret?: string;
   /** Shared secret used by the coding agent (worker) for ACP registration/calls. */
   acpAgentSecret?: string;
@@ -426,9 +426,28 @@ function parseWidgetMode(value: string | undefined): WidgetMode {
 }
 
 function parseAcpKnownAgents(
-  value: string | Array<{ name: string; url: string; description?: string }> | undefined,
-): Array<{ name: string; url: string; description?: string }> {
-  if (Array.isArray(value)) return value;
+  value: string | Array<{ name: string; url: string; description?: string; requiredExecutionCapabilities?: string[] }> | undefined,
+): Array<{ name: string; url: string; description?: string; requiredExecutionCapabilities?: string[] }> {
+  if (Array.isArray(value)) {
+    return value.map((entry, index) => {
+      if (!entry || typeof entry !== "object" || typeof entry.name !== "string" || !entry.name.trim()
+        || typeof entry.url !== "string" || !/^https?:\/\//i.test(entry.url)) {
+        throw new Error(`Invalid configured ACP agent at index ${index}: name and HTTP URL are required`);
+      }
+      const requiredExecutionCapabilities = entry.requiredExecutionCapabilities;
+      if (requiredExecutionCapabilities !== undefined && (!Array.isArray(requiredExecutionCapabilities)
+        || requiredExecutionCapabilities.some((capability) => typeof capability !== "string"
+          || !/^[a-z][a-z0-9_.-]{0,63}$/.test(capability)))) {
+        throw new Error(`Invalid requiredExecutionCapabilities for ACP agent ${entry.name}`);
+      }
+      return {
+        name: entry.name.trim(),
+        url: entry.url,
+        ...(typeof entry.description === "string" ? { description: entry.description } : {}),
+        ...(requiredExecutionCapabilities ? { requiredExecutionCapabilities: [...new Set(requiredExecutionCapabilities)] } : {}),
+      };
+    });
+  }
   if (!value) return [];
 
   return value.split(",").map((entry) => {
