@@ -27,7 +27,7 @@
 
 import { randomUUID } from "node:crypto";
 import { brandWorkSessionId, brandWorkspaceId, type WorkSessionId, type WorkspaceId } from "./branded.js";
-import type { ApprovalOption, ApprovalRequestManager } from "./approval-requests.js";
+import type { ApprovalOption, ApprovalRequest, ApprovalRequestManager } from "./approval-requests.js";
 import { DEFAULT_DIRECT_APPROVAL_REATTACH_GRACE_MS } from "./policy-approval-defaults.js";
 import { shellTelemetrySync } from "./redaction.js";
 
@@ -504,6 +504,55 @@ export function createPolicyEngine(
     return false;
   }
 
+  function toToolApprovalRequest(request: ApprovalRequest): ToolApprovalRequest {
+    return {
+      id: request.approvalId,
+      principalId: request.principalId ?? "",
+      workspaceId: brandWorkspaceId(request.workspaceSessionId),
+      workSessionId: request.workSessionId ? brandWorkSessionId(request.workSessionId) : undefined,
+      ownerContextId: request.ownerContextId,
+      runId: request.runId,
+      agentId: request.agentId,
+      approvalKey: request.approvalKey,
+      operationHash: request.operationHash,
+      commandDigest: request.commandDigest,
+      mcpSessionId: request.mcpSessionId,
+      mcpRequestId: request.mcpRequestId,
+      waiterKey: request.waiterKey,
+      liveWaiterId: request.liveWaiterId,
+      origin: request.origin,
+      conversationId: request.conversationId,
+      orphanedAt: request.orphanedAt,
+      reattachDeadline: request.reattachDeadline,
+      options: request.options,
+      tool: request.tool ?? "",
+      path: request.path,
+      command: request.command,
+      requestedAt: request.createdAt,
+      expiresAt: request.expiresAt,
+    };
+  }
+
+  function findDurablePending(
+    matches: (request: ToolApprovalRequest) => boolean,
+    workspaceId?: WorkspaceId,
+  ): ToolApprovalRequest | undefined {
+    // Durable status is authoritative: listPending expires elapsed approvals
+    // before returning rows. Expired approvals are never reusable, even if an
+    // in-memory copy survives.
+    if (approvalRequests) {
+      const durable = approvalRequests.listPending(workspaceId)
+        .filter((request) => request.kind === "tool")
+        .map(toToolApprovalRequest)
+        .find(matches);
+      if (durable) return pendingApprovals.get(durable.id) ?? durable;
+      // No durable match: any in-memory entry with the same identity is stale
+      // (expired/resolved) and must not authorize a retry.
+      return undefined;
+    }
+    return Array.from(pendingApprovals.values()).find(matches);
+  }
+
   function findPending(
     principalId: string,
     key: string,
@@ -513,37 +562,7 @@ export function createPolicyEngine(
       && request.workspaceId === ctx.workspaceId
       && request.workSessionId === ctx.workSessionId
       && request.approvalKey === key;
-    return Array.from(pendingApprovals.values()).find(matches)
-      ?? (approvalRequests
-        ? approvalRequests.listPending(ctx.workspaceId)
-          .filter((request) => request.kind === "tool")
-          .map((request) => ({
-            id: request.approvalId,
-            principalId: request.principalId ?? "",
-            workspaceId: brandWorkspaceId(request.workspaceSessionId),
-            workSessionId: request.workSessionId ? brandWorkSessionId(request.workSessionId) : undefined,
-            runId: request.runId,
-            agentId: request.agentId,
-            approvalKey: request.approvalKey,
-            operationHash: request.operationHash,
-            commandDigest: request.commandDigest,
-            mcpSessionId: request.mcpSessionId,
-            mcpRequestId: request.mcpRequestId,
-            waiterKey: request.waiterKey,
-            liveWaiterId: undefined,
-            origin: request.origin,
-            conversationId: request.conversationId,
-            orphanedAt: request.orphanedAt,
-            reattachDeadline: request.reattachDeadline,
-            options: request.options,
-            tool: request.tool ?? "",
-            path: request.path,
-            command: request.command,
-            requestedAt: request.createdAt,
-            expiresAt: request.expiresAt,
-          }))
-          .find(matches)
-        : undefined);
+    return findDurablePending(matches, ctx.workspaceId);
   }
 
   /**
@@ -554,35 +573,7 @@ export function createPolicyEngine(
    * looks it up in the durable approval store when one is configured.
    */
   function findPendingByKey(rowKey: string): ToolApprovalRequest | undefined {
-    return Array.from(pendingApprovals.values()).find((request) => request.waiterKey === rowKey)
-      ?? (approvalRequests
-        ? approvalRequests.listPending().filter((request) => request.kind === "tool" && request.waiterKey === rowKey)
-          .map((request) => ({
-            id: request.approvalId,
-            principalId: request.principalId ?? "",
-            workspaceId: brandWorkspaceId(request.workspaceSessionId),
-            workSessionId: request.workSessionId ? brandWorkSessionId(request.workSessionId) : undefined,
-            runId: request.runId,
-            agentId: request.agentId,
-            approvalKey: request.approvalKey,
-            operationHash: request.operationHash,
-            commandDigest: request.commandDigest,
-            mcpSessionId: request.mcpSessionId,
-            mcpRequestId: request.mcpRequestId,
-            waiterKey: request.waiterKey,
-            liveWaiterId: undefined,
-            origin: request.origin,
-            conversationId: request.conversationId,
-            orphanedAt: request.orphanedAt,
-            reattachDeadline: request.reattachDeadline,
-            options: request.options,
-            tool: request.tool ?? "",
-            path: request.path,
-            command: request.command,
-            requestedAt: request.createdAt,
-            expiresAt: request.expiresAt,
-          }))[0]
-        : undefined);
+    return findDurablePending((request) => request.waiterKey === rowKey);
   }
 
   function detachLiveWaiter(approvalId: string, liveWaiterId: string): void {

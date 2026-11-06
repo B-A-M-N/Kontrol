@@ -796,6 +796,60 @@ db.close();
   assert.equal(pendingResume.approvalRequired, true);
   assert.equal(pendingResume.approvalId, pendingFirst.approvalId, "pending resume reattaches to the SAME durable card");
 
+  // An expired durable approval is no longer a pending card, even if this
+  // PolicyEngine still has the pre-expiry request in its in-memory map.
+  const expiring = await resumeEnforcer.enforce({
+    ...base,
+    command: "printf expires-during-retry",
+    mcpSessionId: "transport-expiring-first",
+  });
+  assert.equal(expiring.approvalRequired, true);
+  const expiredAt = new Date(Date.now() - 1_000).toISOString();
+  resumeDb.sqlite.prepare("update approval_requests set expires_at = ? where id = ?")
+    .run(expiredAt, expiring.approvalId);
+  for (let index = 0; index < 100; index += 1) {
+    resumeApprovals.create({
+      kind: "tool",
+      workspaceSessionId: WS_ID,
+      principalId: "expiry-backlog",
+      title: `older-expired-${index}`,
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+    });
+  }
+  assert.equal(resumeApprovals.get(expiring.approvalId!)?.status, "expired",
+    "the human TTL expires the exact approval even when a bounded expiry batch has an older backlog");
+  const expiredRetry = await resumeEnforcer.enforce({
+    ...base,
+    command: "printf expires-during-retry",
+    mcpSessionId: "transport-expiring-retry",
+    approvalResumeId: expiring.approvalId,
+  });
+  assert.equal(expiredRetry.allowed, false, "an expired one-shot approval cannot authorize a retry");
+  assert.equal(expiredRetry.approvalRequired, true, "an expired retry requires a fresh reviewer decision");
+  assert.notEqual(expiredRetry.approvalId, expiring.approvalId, "expired authority must not be represented by the old card");
+  assert.equal(resumeApprovals.get(expiredRetry.approvalId!)?.status, "pending",
+    "the safe retry creates a new pending approval");
+  resumeDb.sqlite.prepare("update approval_requests set expires_at = ? where id = ?")
+    .run(new Date(Date.now() - 1_000).toISOString(), expiredRetry.approvalId);
+  for (let index = 0; index < 100; index += 1) {
+    resumeApprovals.create({
+      kind: "tool",
+      workspaceSessionId: WS_ID,
+      principalId: "expiry-backlog-retry",
+      title: `older-retry-expired-${index}`,
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+    });
+  }
+  const implicitExpiredRetry = await resumeEnforcer.enforce({
+    ...base,
+    command: "printf expires-during-retry",
+    mcpSessionId: "transport-expiring-implicit-retry",
+  });
+  assert.equal(implicitExpiredRetry.allowed, false, "a retry without a resume token cannot consume expired authority");
+  assert.equal(implicitExpiredRetry.approvalRequired, true, "expired retries still require human approval");
+  assert.notEqual(implicitExpiredRetry.approvalId, expiredRetry.approvalId,
+    "an expired row hidden behind a full bounded sweep cannot be reused");
+
   // Approval history retains only a redacted bounded preview; exact retry
   // identity comes from the operation and command digests, not stored text.
   const secret = `ghp_${"A".repeat(36)}`;

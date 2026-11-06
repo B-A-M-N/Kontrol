@@ -225,16 +225,29 @@ export function createApprovalRequestManager(
   }
 
   function get(id: string): ApprovalRequest | undefined {
-    expirePending();
+    const now = new Date().toISOString();
+    // A token lookup must enforce that request's own TTL even when the
+    // bounded background expiry batch is full of older rows.
+    database.db.update(approvalRequests)
+      .set({ status: "expired", resolvedAt: now, resolutionJson: JSON.stringify({ reason: "approval timed out" }) })
+      .where(and(
+        eq(approvalRequests.id, id),
+        eq(approvalRequests.status, "pending"),
+        sql`${approvalRequests.expiresAt} is not null and ${approvalRequests.expiresAt} <= ${now}`,
+      ))
+      .run();
+    expirePending(now);
     const row = database.db.select().from(approvalRequests).where(eq(approvalRequests.id, id)).get();
     return row ? rowToApproval(row) : undefined;
   }
 
   function listPending(workspaceSessionId?: string): ApprovalRequest[] {
-    expirePending(undefined, 100);
+    const now = new Date().toISOString();
+    expirePending(now, 100);
+    const unexpired = sql`(${approvalRequests.expiresAt} is null or ${approvalRequests.expiresAt} > ${now})`;
     const where = workspaceSessionId
-      ? and(eq(approvalRequests.status, "pending"), eq(approvalRequests.workspaceSessionId, workspaceSessionId))
-      : eq(approvalRequests.status, "pending");
+      ? and(eq(approvalRequests.status, "pending"), eq(approvalRequests.workspaceSessionId, workspaceSessionId), unexpired)
+      : and(eq(approvalRequests.status, "pending"), unexpired);
     return database.db
       .select()
       .from(approvalRequests)
@@ -255,7 +268,12 @@ export function createApprovalRequestManager(
     hasMore: boolean;
   } {
     const boundedLimit = Math.max(1, Math.min(500, Math.trunc(limit)));
-    const conditions = [eq(approvalRequests.status, "pending")];
+    const now = new Date().toISOString();
+    expirePending(now, 100);
+    const conditions = [
+      eq(approvalRequests.status, "pending"),
+      sql`(${approvalRequests.expiresAt} is null or ${approvalRequests.expiresAt} > ${now})`,
+    ];
     if (workspaceSessionId) conditions.push(eq(approvalRequests.workspaceSessionId, workspaceSessionId));
     if (origin) conditions.push(eq(approvalRequests.origin, origin));
     if (before) {
