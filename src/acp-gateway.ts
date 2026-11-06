@@ -54,10 +54,6 @@ export function authHeadersForAgent(url: string, sharedSecret?: string): Record<
   return { Authorization: `Bearer ${sharedSecret}` };
 }
 
-function hasOutboundCredential(url: string, sharedSecret?: string): boolean {
-  return Object.keys(authHeadersForAgent(url, sharedSecret)).length > 0;
-}
-
 export interface PeerDispatchResult {
   status: number;
   body: Record<string, unknown>;
@@ -362,65 +358,79 @@ export async function lookupPeerDispatch(params: {
 export interface AgentProbeResult {
   healthy: boolean;
   status: number;
+  checkedAt: string;
+  failureCategory?: "unsupported_transport" | "unreachable" | "unauthorized" | "not_ready" | "protocol_incompatible" | "http_error";
   error?: string;
   note?: string;
   executionCapabilities?: Record<string, unknown>;
 }
 
 export async function probeAgent(url: string, sharedSecret?: string): Promise<AgentProbeResult> {
+  const checkedAt = new Date().toISOString();
   if (!/^https?:\/\//i.test(url)) {
     return {
       healthy: false,
       status: 0,
+      checkedAt,
+      failureCategory: "unsupported_transport",
       note: "unsupported probe transport; only HTTP ACP adapters are dispatchable",
     };
   }
   const headers = authHeadersForAgent(url, sharedSecret);
   const baseUrl = url.replace(/\/+$/, "");
+  let status = 0;
+  let executionCapabilities: Record<string, unknown> | undefined;
   try {
     const health = await fetch(baseUrl + "/health", {
       method: "GET",
       headers,
       signal: AbortSignal.timeout(3000),
     });
+    status = health.status;
+    if (health.status === 401 || health.status === 403) {
+      return { healthy: false, status, checkedAt, failureCategory: "unauthorized", note: "health endpoint rejected adapter credentials" };
+    }
     if (health.ok) {
-      let executionCapabilities: Record<string, unknown> | undefined;
       try {
         const payload: unknown = await health.clone().json();
         if (payload && typeof payload === "object" && !Array.isArray(payload)) {
-          const value = (payload as Record<string, unknown>).executionCapabilities;
+          const body = payload as Record<string, unknown>;
+          if (body.ready === false || body.ok === false) {
+            return { healthy: false, status, checkedAt, failureCategory: "not_ready", note: "health endpoint reports not ready" };
+          }
+          const value = body.executionCapabilities;
           if (value && typeof value === "object" && !Array.isArray(value)) executionCapabilities = value as Record<string, unknown>;
         }
-      } catch { /* a generic ACP health body carries no mode-specific capability contract */ }
-      return { healthy: true, status: health.status, note: "/health", ...(executionCapabilities ? { executionCapabilities } : {}) };
-    }
-    if (health.status !== 404 && health.status !== 405) {
-      return { healthy: false, status: health.status };
+      } catch { /* authenticated dispatch lookup below proves the protocol */ }
+    } else if (health.status !== 404 && health.status !== 405) {
+      return { healthy: false, status, checkedAt, failureCategory: "http_error", note: "health endpoint returned an unexpected status" };
     }
 
-    // Generic ACP-style fallback: /health is a Kontrol adapter convention, not
-    // a universal ACP requirement. A peer that exposes /runs is dispatchable.
-    const runs = await fetch(baseUrl + "/runs", {
+    // A read-only attempt lookup proves the adapter exposes the dispatch
+    // protocol and accepts the configured credential without creating a run.
+    // GET /runs returning 405 only proves that a route exists; it says
+    // nothing about authentication or dispatch compatibility.
+    const probeKey = `kontrol-readiness-${randomUUID()}`;
+    const lookup = await fetch(`${baseUrl}/runs/by-dispatch-id/${encodeURIComponent(probeKey)}`, {
       method: "GET",
       headers,
       signal: AbortSignal.timeout(3000),
     });
-    if (runs.ok || runs.status === 405) {
-      return { healthy: true, status: runs.status, note: "/runs" };
+    status = lookup.status;
+    if (lookup.status === 401 || lookup.status === 403) {
+      return { healthy: false, status, checkedAt, failureCategory: "unauthorized", note: "dispatch lookup rejected adapter credentials" };
     }
-    if (runs.status === 401 || runs.status === 403) {
-      if (hasOutboundCredential(url, sharedSecret)) {
-        return { healthy: true, status: runs.status, note: "/runs requires auth" };
+    if (lookup.status === 404) {
+      const body: unknown = await lookup.json().catch(() => undefined);
+      if (body && typeof body === "object" && !Array.isArray(body)
+        && (body as { error?: { code?: unknown } }).error?.code === "not_found") {
+        return { healthy: true, status, checkedAt, note: "authenticated dispatch lookup is ready", ...(executionCapabilities ? { executionCapabilities } : {}) };
       }
-      return {
-        healthy: false,
-        status: runs.status,
-        note: "ACP endpoint requires authentication but no peer credential is configured",
-      };
     }
-    return { healthy: false, status: runs.status };
+    return { healthy: false, status, checkedAt, failureCategory: "protocol_incompatible", note: "adapter did not confirm the dispatch lookup contract" };
   } catch (error) {
-    return { healthy: false, status: 0, error: error instanceof Error ? error.message : String(error) };
+    const timedOut = error instanceof Error && error.name === "TimeoutError";
+    return { healthy: false, status, checkedAt, failureCategory: "unreachable", error: timedOut ? "probe timed out" : "probe request failed" };
   }
 }
 

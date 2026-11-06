@@ -25,6 +25,11 @@ const peer = createServer(async (req, res) => {
     res.end(JSON.stringify({ ok: true }));
     return;
   }
+  if (req.method === "GET" && req.url?.startsWith("/runs/by-dispatch-id/")) {
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: { code: "not_found" } }));
+    return;
+  }
   if (req.method === "POST" && req.url === "/runs") {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(Buffer.from(chunk));

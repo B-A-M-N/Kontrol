@@ -262,8 +262,11 @@ try {
 
   {
     const probeServer = createServer((req, res) => {
-      if (req.method === "GET" && req.url === "/health") res.writeHead(200).end("ok");
-      else res.writeHead(404).end();
+      if (req.method === "GET" && req.url === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ ok: true, ready: true }));
+      } else if (req.method === "GET" && req.url?.startsWith("/runs/by-dispatch-id/")) {
+        res.writeHead(404, { "Content-Type": "application/json" }).end(JSON.stringify({ error: { code: "not_found" } }));
+      } else res.writeHead(404).end();
     });
     servers.push(probeServer);
     const port = await listen(probeServer, "127.0.0.1");
@@ -318,7 +321,7 @@ try {
         res.writeHead(404).end();
         return;
       }
-      if (req.method === "GET" && req.url === "/runs") {
+      if (req.method === "GET" && req.url?.startsWith("/runs/by-dispatch-id/")) {
         res.writeHead(401).end();
         return;
       }
@@ -332,6 +335,56 @@ try {
   }
 
   {
+    const server = createServer((req, res) => {
+      if (req.method === "GET" && req.url === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ ok: true, ready: true }));
+        return;
+      }
+      if (req.method === "GET" && req.url?.startsWith("/runs/by-dispatch-id/")) {
+        res.writeHead(req.headers.authorization === "Bearer correct-secret" ? 404 : 401, {
+          "Content-Type": "application/json",
+        }).end(JSON.stringify({ error: { code: req.headers.authorization === "Bearer correct-secret" ? "not_found" : "unauthorized" } }));
+        return;
+      }
+      // An unauthenticated GET 405 is not evidence that the adapter accepts
+      // authenticated dispatch requests.
+      if (req.method === "GET" && req.url === "/runs") {
+        res.writeHead(405).end();
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    servers.push(server);
+    const port = await listen(server, "127.0.0.1");
+    const wrongSecret = await probeAgent(`http://127.0.0.1:${port}`, "wrong-secret");
+    assert.equal(wrongSecret.healthy, false, "a configured secret is not proof that the peer accepted it");
+    assert.equal(wrongSecret.failureCategory, "unauthorized");
+    const acceptedSecret = await probeAgent(`http://127.0.0.1:${port}`, "correct-secret");
+    assert.equal(acceptedSecret.healthy, true, "authenticated, read-only dispatch lookup proves the adapter contract");
+    assert.equal(acceptedSecret.failureCategory, undefined);
+    assert.ok(acceptedSecret.checkedAt, "probe evidence is timestamped");
+  }
+
+  {
+    const server = createServer((req, res) => {
+      if (req.method === "GET" && req.url === "/health") {
+        res.writeHead(404).end();
+        return;
+      }
+      if (req.method === "GET" && req.url === "/runs") {
+        res.writeHead(405).end();
+        return;
+      }
+      res.writeHead(404, { "Content-Type": "text/html" }).end("not found");
+    });
+    servers.push(server);
+    const port = await listen(server, "127.0.0.1");
+    const probe = await probeAgent(`http://127.0.0.1:${port}`, "secret");
+    assert.equal(probe.healthy, false, "a bare GET /runs 405 does not prove the dispatch lookup protocol");
+    assert.equal(probe.failureCategory, "protocol_incompatible");
+  }
+
+  {
     let peerAuth: string | undefined;
     let peerBody: Record<string, unknown> | undefined;
     const peer = createServer(async (req, res) => {
@@ -341,6 +394,10 @@ try {
       }
       if (req.method === "GET" && req.url === "/runs") {
         res.writeHead(405).end();
+        return;
+      }
+      if (req.method === "GET" && req.url?.startsWith("/runs/by-dispatch-id/")) {
+        res.writeHead(404, { "Content-Type": "application/json" }).end(JSON.stringify({ error: { code: "not_found" } }));
         return;
       }
       if (req.method === "POST" && req.url === "/runs") {

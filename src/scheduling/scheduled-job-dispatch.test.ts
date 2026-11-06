@@ -20,6 +20,11 @@ let modeCapability: Record<string, unknown> = {
 };
 
 const server = createServer((request, response) => {
+  if (request.method === "GET" && request.url?.startsWith("/runs/by-dispatch-id/")) {
+    response.writeHead(404, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ error: { code: "not_found" } }));
+    return;
+  }
   if (request.url !== "/health") {
     response.writeHead(404).end();
     return;

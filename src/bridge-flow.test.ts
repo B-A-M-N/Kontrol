@@ -291,7 +291,7 @@ try {
     if (req.method === "GET" && dispatchLookup) {
       const remoteRunId = acceptedDispatches.get(decodeURIComponent(dispatchLookup[1]!));
       if (!remoteRunId) {
-        res.writeHead(404).end();
+        res.writeHead(404, { "Content-Type": "application/json" }).end(JSON.stringify({ error: { code: "not_found" } }));
         return;
       }
       res.writeHead(200, { "Content-Type": "application/json" });

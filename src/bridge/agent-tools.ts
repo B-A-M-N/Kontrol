@@ -7,7 +7,7 @@
  */
 import type { McpServer } from "@modelcontextprotocol/server";
 import type { BridgeConfig } from "./context.js";
-import { probeAgent } from "../acp-gateway.js";
+import { probeAgent, type AgentProbeResult } from "../acp-gateway.js";
 import { dispatchToRegisteredAgent } from "./dispatch-service.js";
 import { loadSkillIndex } from "../skills.js";
 import { registerMutationAppTool } from "./app-tool.js";
@@ -183,6 +183,7 @@ export function registerAgentTools(server: McpServer, config: BridgeConfig): voi
           dispatchable: z.boolean(),
           probeStatus: z.number().int(),
           probeNote: z.string().optional(),
+          probeFailureCategory: z.string().optional(),
           capabilities: z.array(z.string()),
           checkedAt: z.string(),
         })),
@@ -200,10 +201,10 @@ export function registerAgentTools(server: McpServer, config: BridgeConfig): voi
       // Probe every entry so the result is an auditable all-agent inventory.
       const health = await Promise.all(
         all.map(async (a) => {
-          const probe = a.alive
+          const probe: AgentProbeResult = a.alive
             ? await probeAgent(a.url, config.adapterSecret)
-            : { healthy: false, status: 0, note: "agent heartbeat is not alive" };
-          return { a, probe, checkedAt: new Date().toISOString() };
+            : { healthy: false, status: 0, checkedAt: new Date().toISOString(), failureCategory: "unreachable", note: "agent heartbeat is not alive" };
+          return { a, probe, checkedAt: probe.checkedAt };
         }),
       );
       const available = health.filter(({ a, probe }) => a.alive && a.role === "agent" && probe.healthy).map(({ a }) => a.name);
@@ -224,6 +225,7 @@ export function registerAgentTools(server: McpServer, config: BridgeConfig): voi
             dispatchable: a.alive && a.role === "agent" && probe.healthy,
             probeStatus: probe.status,
             probeNote: probe.note ?? probe.error,
+            probeFailureCategory: probe.failureCategory,
             capabilities: a.capabilities,
             checkedAt,
           })),
