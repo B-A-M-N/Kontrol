@@ -479,7 +479,80 @@ try {
     db.close();
   }
 
-  // --- WebUI rehydration: listActiveWorkSessions returns only live worker
+  // --- P0-B: a cleanup-pending fence rejects every ordinary mutation. ---
+  {
+    let releaseTermination!: () => void;
+    const terminationGate = new Promise<void>((resolve) => { releaseTermination = resolve; });
+    const db = openDatabase(join(root, "fence"));
+    // The server wires onTerminal to process termination; a never-resolving
+    // barrier simulates processes that have not stopped yet.
+    const workSessions = createWorkSessionManager(db, { onTerminal: () => terminationGate });
+    db.sqlite
+      .prepare("insert into workspace_sessions (id, root, status, mode, managed, created_at, last_used_at) values ('ws_f', '/tmp', 'active', 'checkout', 'false', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')")
+      .run();
+    const session = workSessions.create({ workspaceSessionId: "ws_f", submittedBy: "tester" });
+    const acquired = workSessions.acquireWorkspaceLease({
+      canonicalRoot: "/tmp/checkout-fence", workspaceSessionId: "ws_f", workSessionId: session.id,
+    });
+    assert.ok(acquired.acquired);
+    const nonce = acquired.lease.leaseNonce;
+
+    workSessions.updateStatus(session.id, "cancelled"); // fences; termination still pending
+    const fenced = workSessions.getActiveWorkspaceLease("/tmp/checkout-fence");
+    assert.equal(fenced?.leaseKind, "cleanup_pending", "terminal update fences the checkout until termination is confirmed");
+
+    assert.equal(workSessions.acquireWorkspaceLease({
+      canonicalRoot: "/tmp/checkout-fence", workspaceSessionId: "ws_f", workSessionId: session.id,
+    }).acquired, false, "same-session ordinary acquisition is rejected while cleanup is pending");
+    assert.equal(workSessions.acquireWorkspaceLease({
+      canonicalRoot: "/tmp/checkout-fence", workspaceSessionId: "ws_f", workSessionId: session.id, takeover: true,
+    }).acquired, false, "same-session takeover is rejected while cleanup is pending");
+    assert.equal(workSessions.renewWorkspaceLeaseForSession(session.id, 60_000, nonce), 0,
+      "nonce renewal is rejected while cleanup is pending, even with a matching nonce");
+    assert.equal(workSessions.releaseWorkspaceLeaseForSession(session.id, nonce), false,
+      "nonce release is rejected while cleanup is pending; only verified recovery clears it");
+    assert.equal(workSessions.restoreWorkspaceLeaseForSession(acquired.lease, nonce), false,
+      "restore is rejected while cleanup is pending");
+    assert.equal(workSessions.getActiveWorkspaceLease("/tmp/checkout-fence")?.leaseKind, "cleanup_pending",
+      "every rejected mutation leaves the fence intact");
+
+    releaseTermination(); // termination confirmed
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(workSessions.getActiveWorkspaceLease("/tmp/checkout-fence"), undefined,
+      "verified termination releases the fenced checkout");
+    db.close();
+  }
+
+  // --- P0-A: terminal review feedback must not bypass process cleanup. ---
+  for (const verdict of ["approve", "reject"] as const) {
+    let releaseTermination!: () => void;
+    const terminationGate = new Promise<void>((resolve) => { releaseTermination = resolve; });
+    const db = openDatabase(join(root, `feedback-fence-${verdict}`));
+    const workSessions = createWorkSessionManager(db, { onTerminal: () => terminationGate });
+    db.sqlite
+      .prepare("insert into workspace_sessions (id, root, status, mode, managed, created_at, last_used_at) values ('ws_fb', '/tmp', 'active', 'checkout', 'false', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')")
+      .run();
+    const session = workSessions.create({ workspaceSessionId: "ws_fb", submittedBy: "tester" });
+    const checkout = `/tmp/checkout-feedback-${verdict}`;
+    const acquired = workSessions.acquireWorkspaceLease({
+      canonicalRoot: checkout, workspaceSessionId: "ws_fb", workSessionId: session.id,
+    });
+    assert.ok(acquired.acquired);
+    const submission = workSessions.submitForReview({ workSessionId: session.id, snapshotKind: "git", snapshotRef: `ref-${verdict}` });
+    const feedback = workSessions.submitFeedback({ workSessionId: session.id, submissionId: submission.id, verdict });
+    assert.ok(feedback.id, "terminal feedback transaction still commits");
+    assert.equal(workSessions.getActiveWorkspaceLease(checkout)?.leaseKind, "cleanup_pending",
+      `${verdict} must fence the checkout, not release it, while termination is pending`);
+    assert.equal(workSessions.get(session.id)?.status, verdict === "approve" ? "approved" : "rejected",
+      "terminal feedback still persists the terminal session status atomically");
+    releaseTermination(); // termination confirmed
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(workSessions.getActiveWorkspaceLease(checkout), undefined,
+      `confirmed termination after ${verdict} releases the fenced checkout`);
+    db.close();
+  }
+
+    // --- WebUI rehydration: listActiveWorkSessions returns only live worker
   //     states. Awaiting-review and detached work use dedicated recovery lists. ---
   {
     const db = openDatabase(join(root, "active"));

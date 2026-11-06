@@ -211,7 +211,8 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
         // supervisor with a checkout fence left behind. Keep the mission and
         // work order for diagnosis, then release every ownership record.
         config.workSessions.updateStatus(created.id, "failed");
-        config.workSessions.releaseWorkspaceLeasesForSession(created.id);
+        // updateStatus fences the checkout and releases it only after the
+        // termination barrier confirms; no immediate release here.
         if (supervisorRun) {
           const current = config.supervisorRuns?.getByWorkSession(created.id);
           if (current && !["failed", "cancelled", "completed"].includes(current.status)) {

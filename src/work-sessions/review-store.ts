@@ -53,8 +53,13 @@ export function getLatestFeedback(db: DatabaseHandle, workSessionId: string): Wo
 export function createReviewSubmissionStore(db: DatabaseHandle, deps: {
   /** Release this session's workspace leases (lease-store callback). */
   releaseWorkspaceLeasesForSession(workSessionId: string): number;
+  /** Fence leases until owned child processes are confirmed stopped. */
+  markWorkspaceLeaseCleanupPending(workSessionId: string): number;
+  /** Optional terminal observer (process termination in server.ts). */
+  onTerminal?: (workSessionId: string) => void | Promise<void>;
+  onTerminalFailure?: (workSessionId: string, error: unknown) => void;
 }) {
-  const { releaseWorkspaceLeasesForSession } = deps;
+  const { releaseWorkspaceLeasesForSession, markWorkspaceLeaseCleanupPending, onTerminal, onTerminalFailure } = deps;
 
   return {
     submitForReview(input: {
@@ -220,9 +225,31 @@ export function createReviewSubmissionStore(db: DatabaseHandle, deps: {
           .where(eq(workSessions.id, input.workSessionId))
           .run();
         if (isTerminalStatus(nextStatus)) {
-          releaseWorkspaceLeasesForSession(input.workSessionId);
+          // Atomic with the terminal status write: fence the checkout so no
+          // ordinary mutation can slip in between the verdict and the
+          // verified process termination that follows the commit.
+          markWorkspaceLeaseCleanupPending(input.workSessionId);
         }
       });
+
+      if (isTerminalStatus(nextStatus)) {
+        // Common cleanup/fencing authority: terminate and confirm associated
+        // processes before releasing the checkout lease. Without an
+        // onTerminal observer there is nothing to confirm against, so release
+        // immediately (bare stores and tests). The fence persists if
+        // termination is uncertain or fails.
+        if (!onTerminal) {
+          releaseWorkspaceLeasesForSession(input.workSessionId);
+        } else {
+          try {
+            void Promise.resolve(onTerminal(input.workSessionId))
+              .then(() => releaseWorkspaceLeasesForSession(input.workSessionId))
+              .catch((error) => onTerminalFailure?.(input.workSessionId, error));
+          } catch (error) {
+            onTerminalFailure?.(input.workSessionId, error);
+          }
+        }
+      }
 
       return feedback;
     },

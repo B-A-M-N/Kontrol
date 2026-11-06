@@ -57,6 +57,8 @@ export interface WorkSessionManager {
   }): WorkspaceLeaseResult;
   restoreWorkspaceLeaseForSession(previous: WorkspaceLease, expectedLeaseNonce: string): boolean;
   releaseWorkspaceLeasesForSession(workSessionId: string): number;
+  /** Rollback release that never deletes a cleanup-pending fence. */
+  releaseUnfencedWorkspaceLeasesForSession(workSessionId: string): number;
   releaseWorkspaceLeaseForSession(workSessionId: string, leaseNonce: string): boolean;
   renewWorkspaceLeaseForSession(workSessionId: string, ttlMs: number | undefined, leaseNonce: string): number;
   getActiveWorkspaceLease(canonicalRoot: string): WorkspaceLease | undefined;
@@ -170,6 +172,9 @@ export function createWorkSessionManager(
   });
   const reviews = createReviewSubmissionStore(database, {
     releaseWorkspaceLeasesForSession: (workSessionId) => leases.releaseWorkspaceLeasesForSession(workSessionId),
+    markWorkspaceLeaseCleanupPending: (workSessionId) => leases.markWorkspaceLeaseCleanupPending(workSessionId),
+    onTerminal: options.onTerminal,
+    onTerminalFailure: options.onTerminalFailure,
   });
   const toolEvents = createWorkSessionToolEventStore(database);
   const queries = createWorkSessionQueries(database, {
@@ -185,6 +190,7 @@ export function createWorkSessionManager(
     acquireWorkspaceLease: (input) => leases.acquireWorkspaceLease(input),
     restoreWorkspaceLeaseForSession: (previous, expectedLeaseNonce) => leases.restoreWorkspaceLeaseForSession(previous, expectedLeaseNonce),
     releaseWorkspaceLeasesForSession: (workSessionId) => leases.releaseWorkspaceLeasesForSession(workSessionId),
+    releaseUnfencedWorkspaceLeasesForSession: (workSessionId) => leases.releaseUnfencedWorkspaceLeasesForSession(workSessionId),
     releaseWorkspaceLeaseForSession: (workSessionId, leaseNonce) => leases.releaseWorkspaceLeaseForSession(workSessionId, leaseNonce),
     renewWorkspaceLeaseForSession: (workSessionId, ttlMs, leaseNonce) =>
       leases.renewWorkspaceLeaseForSession(workSessionId, ttlMs, leaseNonce),

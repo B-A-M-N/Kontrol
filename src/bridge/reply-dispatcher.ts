@@ -355,7 +355,7 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
     if (leaseConflict) return { status: "failed" };
     const takeoverLease = config.workSessions.getWorkspaceLeaseForSession(reply.workSessionId);
     if (!takeoverLease || Date.parse(takeoverLease.expiresAt) <= Date.now()) {
-      if (takeoverLease) config.workSessions.releaseWorkspaceLeasesForSession(reply.workSessionId);
+      if (takeoverLease) config.workSessions.releaseUnfencedWorkspaceLeasesForSession(reply.workSessionId);
       return { status: "failed" };
     }
     let result;
@@ -391,7 +391,7 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
     }
     if (["failed", "cancelled"].includes(result.status)) {
       if (activePreviousLease) config.workSessions.restoreWorkspaceLeaseForSession(activePreviousLease, takeoverLease.leaseNonce);
-      else config.workSessions.releaseWorkspaceLeasesForSession(reply.workSessionId);
+      else config.workSessions.releaseUnfencedWorkspaceLeasesForSession(reply.workSessionId);
     }
     if (result.status === "uncertain" || result.status === "dispatch_uncertain") return { status: "uncertain" };
     if (!["running", "completed"].includes(result.status) || result.attemptNumber !== attemptNumber) return { status: "failed" };

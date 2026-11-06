@@ -234,7 +234,7 @@ export async function dispatchToRegisteredAgent(
     } else if (activePreviousLease && dispatchLease) {
       config.workSessions.restoreWorkspaceLeaseForSession(activePreviousLease, dispatchLease.leaseNonce);
     } else {
-      config.workSessions.releaseWorkspaceLeasesForSession(wsId);
+      config.workSessions.releaseUnfencedWorkspaceLeasesForSession(wsId);
     }
     if (supervisorRun && config.supervisorRuns) {
       try {

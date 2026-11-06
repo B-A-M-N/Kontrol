@@ -7,7 +7,7 @@
  * the caller's DatabaseHandle.
  */
 import { randomUUID } from "node:crypto";
-import { eq, and, gte, sql } from "drizzle-orm";
+import { eq, and, gte, ne, sql } from "drizzle-orm";
 import type { DatabaseHandle } from "../db/client.js";
 import { workspaceLeases } from "../db/schema.js";
 import type { WorkspaceLease, WorkspaceLeaseResult } from "./types.js";
@@ -64,6 +64,19 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
           .get();
 
         const requestedLeaseKind = input.leaseKind ?? "modify";
+        if (existing?.leaseKind === "cleanup_pending") {
+          // A cleanup-pending fence is non-acquirable for ordinary mutations by
+          // ANY work-session identity, including the fenced session itself.
+          // The reconciler above is the only path that clears it, and only
+          // after verified process termination.
+          return {
+            acquired: false as const,
+            conflictingWorkSessionId: existing.workSessionId,
+            workspaceSessionId: existing.workspaceSessionId,
+            expiresAt: existing.expiresAt,
+            durableRecovery: true,
+          };
+        }
         if (existing?.leaseKind === "peer_job") {
           // A peer result reservation is a checkout-wide fence. Same-session
           // ACP workers cannot renew through it; only the matching durable
@@ -157,6 +170,7 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
           eq(workspaceLeases.canonicalRoot, previous.canonicalRoot),
           eq(workspaceLeases.workSessionId, previous.workSessionId),
           eq(workspaceLeases.leaseNonce, expectedLeaseNonce),
+          ne(workspaceLeases.leaseKind, "cleanup_pending"),
         ))
         .run();
       return result.changes > 0;
@@ -179,10 +193,24 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
 
     releaseWorkspaceLeaseForSession(workSessionId: string, leaseNonce: string): boolean {
       if (!leaseNonce) return false;
+      // Verified-recovery-only: a cleanup-pending fence cannot be cleared by
+      // an ordinary nonce-checked release either.
       const result = db.sqlite
-        .prepare("delete from workspace_leases where work_session_id = ? and lease_nonce = ?")
+        .prepare("delete from workspace_leases where work_session_id = ? and lease_nonce = ? and lease_kind != 'cleanup_pending'")
         .run(workSessionId, leaseNonce);
       return result.changes > 0;
+    },
+
+    /**
+     * Best-effort rollback release for unverified call sites (dispatch
+     * rollback, continuation failure). Never deletes a cleanup-pending fence —
+     * the fence outlives the rollback until verified termination clears it.
+     */
+    releaseUnfencedWorkspaceLeasesForSession(workSessionId: string): number {
+      const result = db.sqlite
+        .prepare("delete from workspace_leases where work_session_id = ? and lease_kind != 'cleanup_pending'")
+        .run(workSessionId);
+      return result.changes;
     },
 
     renewWorkspaceLeaseForSession(workSessionId: string, ttlMs: number | undefined, leaseNonce: string): number {
@@ -200,6 +228,9 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
           eq(workspaceLeases.workSessionId, workSessionId),
           gte(workspaceLeases.expiresAt, nowIso),
           eq(workspaceLeases.leaseNonce, leaseNonce),
+          // A cleanup-pending fence is never renewable; only verified
+          // recovery clears it.
+          ne(workspaceLeases.leaseKind, "cleanup_pending"),
         ))
         .run();
       return result.changes;

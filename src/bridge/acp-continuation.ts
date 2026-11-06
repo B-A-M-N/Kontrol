@@ -68,12 +68,12 @@ export async function defaultResume(
     );
     if (result.status === "failed") {
       if (activePreviousLease && takeoverLease) config.workSessions.restoreWorkspaceLeaseForSession(activePreviousLease, takeoverLease.leaseNonce);
-      else config.workSessions.releaseWorkspaceLeasesForSession(continuation.sessionId);
+      else config.workSessions.releaseUnfencedWorkspaceLeasesForSession(continuation.sessionId);
     }
     return result;
   } catch (error) {
     if (activePreviousLease && takeoverLease) config.workSessions.restoreWorkspaceLeaseForSession(activePreviousLease, takeoverLease.leaseNonce);
-    else config.workSessions.releaseWorkspaceLeasesForSession(continuation.sessionId);
+    else config.workSessions.releaseUnfencedWorkspaceLeasesForSession(continuation.sessionId);
     throw error;
   }
 }
