@@ -316,11 +316,21 @@ const defaultInteractive = await manager.start({
 assert.equal(defaultInteractive.running, true);
 assert.ok(defaultInteractive.sessionId);
 
-const defaultInputResult = await manager.write({
+let defaultInputResult = await manager.write({
   workspaceId: "workspace-a",
   sessionId: defaultInteractive.sessionId,
   chars: "hello\n",
 });
+// Same scheduling slack as the first interactive case: poll for the terminal
+// state instead of asserting on the first snapshot.
+const defaultInputDeadline = Date.now() + 15_000;
+while (defaultInputResult.running && Date.now() < defaultInputDeadline) {
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  defaultInputResult = await manager.write({
+    workspaceId: "workspace-a",
+    sessionId: defaultInteractive.sessionId,
+  });
+}
 assert.equal(defaultInputResult.running, false);
 assert.match(defaultInputResult.output, /default-input:hello/);
 
