@@ -94,7 +94,7 @@ function makeCheckout(name) {
   }
   // package-stage.mjs runs under the shared qualification executor; its lib
   // dependency must travel with the fixture just like the other lib modules.
-  for (const script of ["release-verify.mjs", "tool-environment.mjs", "validate-release.mjs", "qualification-process.mjs"]) {
+  for (const script of ["release-verify.mjs", "tool-environment.mjs", "validate-release.mjs", "qualification-process.mjs", "release-retention.mjs"]) {
     copyFileSync(join(repoRoot, "scripts", "lib", script), join(root, "scripts", "lib", script));
   }
   const packageJson = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
