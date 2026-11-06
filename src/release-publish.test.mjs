@@ -61,10 +61,14 @@ function writeCandidate(root, buildId, gitSha) {
   }
   const workspaceAppHtml = "<!doctype html>\n";
   writeFileSync(join(candidate, "ui", "workspace-app.html"), workspaceAppHtml);
-  const declared = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")).dependencies ?? {};
-  const dependencies = Object.fromEntries(
-    Object.entries(declared).map(([name, range]) => [name, range.replace(/^[~^>=\s]+/, "")]),
-  );
+  const manifest = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
+  const lock = JSON.parse(readFileSync(join(repoRoot, "package-lock.json"), "utf8"));
+  const declared = { ...(manifest.dependencies ?? {}), ...(manifest.optionalDependencies ?? {}) };
+  const dependencies = Object.fromEntries(Object.keys(declared).sort().map((name) => {
+    const version = lock.packages?.[`node_modules/${name}`]?.version;
+    assert.ok(version, `package lock is missing the resolved runtime version for ${name}`);
+    return [name, version];
+  }));
   writeFileSync(join(candidate, "build-meta.json"), `${JSON.stringify({
     buildId,
     gitSha,
@@ -99,6 +103,9 @@ function makeCheckout(name) {
   }
   const packageJson = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
   writeFileSync(join(root, "package.json"), JSON.stringify(packageJson));
+  // The stage reads the lockfile at the checkout root; mirror it the way the
+  // real repo carries it.
+  copyFileSync(join(repoRoot, "package-lock.json"), join(root, "package-lock.json"));
   // Stub any declared non-dist package file not already present (the copied
   // scripts must not be overwritten) so the staging step (which copies them
   // into the tarball tree) succeeds inside the fixture.

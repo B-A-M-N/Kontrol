@@ -17,7 +17,7 @@
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { runQualificationProcess } from "./lib/qualification-process.mjs";
-import { join, resolve } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { assertDiskHeadroom, directoryBytes } from "./lib/release-retention.mjs";
 import { fileURLToPath } from "node:url";
@@ -256,17 +256,19 @@ delete stagedPackageJson.scripts.prepublishOnly;
 const buildIdentity = JSON.parse(readFileSync(join(candidatePath, "build-meta.json"), "utf8"));
 if (buildIdentity.dependencies && typeof buildIdentity.dependencies === "object") {
   const declared = stagedPackageJson.dependencies ?? {};
+  const optionalDeclared = stagedPackageJson.optionalDependencies ?? {};
   const unpinned = [];
   for (const [name, exact] of Object.entries(buildIdentity.dependencies)) {
     if (typeof exact !== "string" || !exact) {
       throw new Error(`candidate dependency fingerprint has no usable version for ${name}`);
     }
-    if (!(name in declared)) {
+    if (!(name in declared) && !(name in optionalDeclared)) {
       throw new Error(`candidate was qualified against ${name}@${exact}, which the package manifest no longer declares`);
     }
-    declared[name] = exact;
+    if (name in declared) declared[name] = exact;
+    else optionalDeclared[name] = exact;
   }
-  for (const name of Object.keys(declared)) {
+  for (const name of [...Object.keys(declared), ...Object.keys(optionalDeclared)]) {
     if (!(name in buildIdentity.dependencies)) {
       unpinned.push(name);
     }
@@ -278,12 +280,65 @@ if (buildIdentity.dependencies && typeof buildIdentity.dependencies === "object"
     );
   }
   stagedPackageJson.dependencies = Object.fromEntries(Object.entries(declared).sort(([a], [b]) => a.localeCompare(b)));
+  if (Object.keys(optionalDeclared).length > 0) {
+    stagedPackageJson.optionalDependencies = Object.fromEntries(Object.entries(optionalDeclared).sort(([a], [b]) => a.localeCompare(b)));
+  }
 } else {
   throw new Error(
     "candidate build identity has no dependency fingerprint (rebuild with the current scripts/generate-build-meta.mjs). "
     + "Publishing without an exact dependency closure would let installers resolve an unqualified dependency set.",
   );
 }
+// npm package consumers do not use the repository's package-lock.json, and
+// npm no longer honors shrinkwrap files embedded in dependency tarballs. Ship
+// the exact lockfile-resolved production tree as bundled dependencies instead
+// of allowing a later install to resolve new transitive versions.
+const runtimeDependencyNames = [
+  ...Object.keys(stagedPackageJson.dependencies ?? {}),
+  ...Object.keys(stagedPackageJson.optionalDependencies ?? {}),
+].sort();
+if (runtimeDependencyNames.length === 0) throw new Error("release package has no declared runtime dependencies to bundle");
+// Source of the lockfile: an installed release checkout (npm consumers) does
+// not ship package-lock.json in "files", so a synthetic checkout may only
+// have what was copied from the real repo (see release-publish fixtures).
+const lockfilePath = existsSync(join(root, "package-lock.json"))
+  ? join(root, "package-lock.json")
+  : join(fileURLToPath(new URL("..", import.meta.url)), "package-lock.json");
+const packageLock = JSON.parse(readFileSync(lockfilePath, "utf8"));
+const lockPackages = packageLock.packages;
+if (!lockPackages?.[""]) throw new Error("package-lock.json has no root package entry for dependency bundling");
+let bundledPackageCount = 0;
+for (const [location, metadata] of Object.entries(lockPackages)) {
+  if (!location.startsWith("node_modules/") || typeof metadata?.version !== "string" || metadata.dev === true) continue;
+  let source = join(root, location);
+  if (!existsSync(source)) {
+    if (metadata.optional === true) continue;
+    // Platform-specific packages and nested locations absent from this
+    // checkout do not exist in the qualified install either; skip them
+    // rather than failing the stage.
+    continue;
+  }
+  const installed = JSON.parse(readFileSync(join(source, "package.json"), "utf8"));
+  if (installed.version !== metadata.version) {
+    throw new Error(`qualified install mismatch for ${location}: lockfile has ${metadata.version}, node_modules has ${installed.version}`);
+  }
+  const target = join(stagedPkg, location);
+  mkdirSync(resolve(target, ".."), { recursive: true });
+  const nestedNodeModules = `${source}${sep}node_modules${sep}`;
+  cpSync(source, target, {
+    recursive: true,
+    dereference: true,
+    filter: (entry) => entry === source || !entry.startsWith(nestedNodeModules),
+  });
+  bundledPackageCount += 1;
+}
+// A synthetic checkout without node_modules (release-publish fixtures) has
+// nothing to bundle; the dependency-closure gate above already pins versions.
+if (bundledPackageCount === 0 && existsSync(join(root, "node_modules"))) {
+  throw new Error("lockfile has no installed production packages to bundle");
+}
+stagedPackageJson.bundleDependencies = runtimeDependencyNames;
+console.log(`[package-stage] bundled ${bundledPackageCount} lockfile-resolved production packages`);
 writeFileSync(join(stagedPkg, "package.json"), `${JSON.stringify(stagedPackageJson, null, 2)}\n`);
 
 if (verifyOnly) {
@@ -300,7 +355,7 @@ if (!publish) {
   mkdirSync(packDestination, { recursive: true });
   packArgs.push("--pack-destination", packDestination);
 }
-await run("npm", packArgs, { cwd: stagedPkg });
+await run("npm", packArgs, { cwd: stagedPkg, env: { npm_config_cache: join(staging, "npm-cache") } });
 
 if (publish) {
   console.log(`[package-stage] published ${stagedPackageJson.name}@${stagedPackageJson.version} from staged tree ${stagedPkg} (candidate ${buildResult.buildId})`);

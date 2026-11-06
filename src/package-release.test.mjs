@@ -90,22 +90,36 @@ try {
   console.log("[package-release] installing clean artifact (using the configured npm cache)...");
   const npmExecPath = process.env.npm_execpath;
   assert.ok(npmExecPath, "package-release.test.mjs must be invoked through npm to install a release");
-  execFileSync(process.execPath, [
-    npmExecPath,
-    "install",
-    "--prefix",
-    installPrefix,
-    "--prefer-offline",
-    "--no-audit",
-    "--no-fund",
-    "--package-lock=false",
-    tarball,
-  ], {
-    cwd: tmp,
-    env: testHarnessEnvironment(process.env, { overrides: { npm_config_update_notifier: "false" } }),
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  try {
+    execFileSync(process.execPath, [
+      npmExecPath,
+      "install",
+      "--prefix",
+      installPrefix,
+      "--prefer-offline",
+      "--no-audit",
+      "--no-fund",
+      tarball,
+    ], {
+      cwd: tmp,
+      env: testHarnessEnvironment(process.env, { overrides: {
+        npm_config_update_notifier: "false",
+        npm_config_cache: join(tmp, "npm-cache"),
+      } }),
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    const logsDirectory = join(tmp, "npm-cache", "_logs");
+    const latestLog = readdirSync(logsDirectory, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".log"))
+      .map((entry) => join(logsDirectory, entry.name))
+      .sort()
+      .at(-1);
+    if (latestLog) console.error(`[package-release] npm install log:\n${readFileSync(latestLog, "utf8").slice(-12_000)}`);
+    throw error;
+  }
   const installedPkg = join(installPrefix, "node_modules", "@b-a-m-n", "kontrol");
   const installedCli = join(installedPkg, "dist", "cli.js");
   assert.ok(existsSync(installedCli), "clean install is missing dist/cli.js");
@@ -122,20 +136,29 @@ try {
   const candidateMeta = JSON.parse(readFileSync(join(pkg, "dist", "build-meta.json"), "utf8"));
   assert.ok(candidateMeta.dependencies && typeof candidateMeta.dependencies === "object",
     "candidate build identity carries a dependency fingerprint");
+  assert.equal(existsSync(join(pkg, "npm-shrinkwrap.json")), false,
+    "release must not rely on npm-shrinkwrap in a dependency tarball");
+  const packageDependencies = [
+    ...Object.keys(packedPackageJson.dependencies ?? {}),
+    ...Object.keys(packedPackageJson.optionalDependencies ?? {}),
+  ].sort();
+  assert.deepEqual([...packedPackageJson.bundleDependencies].sort(), packageDependencies,
+    "the packed dependency tree must bundle every declared runtime dependency");
   for (const [name, exact] of Object.entries(candidateMeta.dependencies)) {
+    const declaredExact = packedPackageJson.dependencies?.[name] ?? packedPackageJson.optionalDependencies?.[name];
     assert.equal(
-      packedPackageJson.dependencies?.[name],
+      declaredExact,
       exact,
       `staged manifest must pin ${name} to the qualified exact version ${exact}`,
     );
-    assert.doesNotMatch(String(packedPackageJson.dependencies?.[name]), /^[\^~]/, `no range specifiers in the published closure (${name})`);
+    assert.doesNotMatch(String(declaredExact), /^[\^~]/, `no range specifiers in the published closure (${name})`);
   }
   {
     const lock = JSON.parse(readFileSync(join(installPrefix, "node_modules", "@b-a-m-n", "kontrol", "package.json"), "utf8"));
     for (const [name, exact] of Object.entries(candidateMeta.dependencies)) {
       const installedVersionForDep = (() => {
         try {
-          return JSON.parse(readFileSync(join(installPrefix, "node_modules", name, "package.json"), "utf8")).version;
+          return JSON.parse(readFileSync(join(installedPkg, "node_modules", name, "package.json"), "utf8")).version;
         } catch {
           return undefined; // optional/native dep not installed in this env
         }
@@ -145,6 +168,17 @@ try {
       }
     }
     void lock;
+  }
+  const sourceLock = JSON.parse(readFileSync(join(root, "package-lock.json"), "utf8"));
+  for (const [location, expected] of Object.entries(sourceLock.packages ?? {})) {
+    if (!location.startsWith("node_modules/") || typeof expected?.version !== "string" || expected.dev) continue;
+    const installedManifest = join(installedPkg, location, "package.json");
+    if (!existsSync(installedManifest)) continue; // platform-specific or optional package omitted by npm
+    assert.equal(
+      JSON.parse(readFileSync(installedManifest, "utf8")).version,
+      expected.version,
+      `installed ${location} must match the shipped shrinkwrap version`,
+    );
   }
 
   const servicePreview = JSON.parse(execFileSync("node", [installedCli, "service", "unit", "--json"], {

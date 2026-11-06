@@ -114,7 +114,11 @@ function resolvedRuntimeDependencies() {
   } catch {
     return undefined; // no lockfile (never true for a real build)
   }
-  const declared = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).dependencies ?? {};
+  const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+  const declared = {
+    ...(manifest.dependencies ?? {}),
+    ...(manifest.optionalDependencies ?? {}),
+  };
   const resolved = {};
   const missing = [];
   for (const name of Object.keys(declared).sort()) {

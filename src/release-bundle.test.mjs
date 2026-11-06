@@ -47,7 +47,10 @@ function sha256(path) {
 const releasesDir = join(root, "releases");
 const packageManifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 const packageLock = JSON.parse(readFileSync(join(root, "package-lock.json"), "utf8"));
-const expectedDependencies = Object.fromEntries(Object.keys(packageManifest.dependencies ?? {}).sort().map((name) => {
+const expectedDependencies = Object.fromEntries([
+  ...Object.keys(packageManifest.dependencies ?? {}),
+  ...Object.keys(packageManifest.optionalDependencies ?? {}),
+].sort().map((name) => {
   const version = packageLock.packages?.[`node_modules/${name}`]?.version;
   assert.ok(version, `package lock is missing the resolved runtime version for ${name}`);
   return [name, version];
