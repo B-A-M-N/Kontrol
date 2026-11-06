@@ -227,6 +227,7 @@ export function createToolEnvelope(deps: ToolEnvelopeDeps): ToolEnvelope {
         !lease ||
         lease.workSessionId !== connectionContext.workSessionId ||
         lease.workspaceSessionId !== workspaceId ||
+        lease.leaseKind !== "modify" ||
         lease.leaseNonce !== connectionContext.workspaceLeaseNonce
       ) {
         throw new WorkspaceMutationAuthorityError(

@@ -465,6 +465,23 @@ try {
     "a worker with a stale nonce is rejected even when its work-session binding is valid");
   assert.equal(existsSync(join(leaseWorkspaceRoot, "stale.txt")), false, "stale worker mutation leaves the file unchanged");
 
+  // Terminalize the session and keep its lease as a cleanup fence. A worker with
+  // the formerly valid nonce must not be able to mutate while cleanup is still
+  // pending; the lease-kind check is load-bearing even when identity matches.
+  leaseDb.sqlite.prepare("update work_sessions set status = 'approved', runtime_state = 'archived' where id = ?").run(workSession.id);
+  leaseDb.sqlite.prepare("update workspace_leases set lease_kind = 'cleanup_pending' where work_session_id = ? and canonical_root = ?")
+    .run(workSession.id, canonicalLeaseWorkspaceRoot);
+  assert.equal(leaseSessions.getActiveWorkspaceLease(canonicalLeaseWorkspaceRoot)?.leaseKind, "cleanup_pending");
+  const fencedWrite = await worker.client.callTool({
+    name: "write",
+    arguments: { workspaceId, path: "fenced.txt", content: "cleanup pending" },
+  });
+  assert.equal((fencedWrite.structuredContent as { status?: string }).status, "workspace_lease_lost",
+    "a cleanup-pending lease is not worker mutation authority even with a matching nonce");
+  assert.equal(existsSync(join(leaseWorkspaceRoot, "fenced.txt")), false, "fenced worker mutation leaves the file unchanged");
+  leaseDb.sqlite.prepare("update work_sessions set status = 'in_progress', runtime_state = 'pending' where id = ?").run(workSession.id);
+  leaseDb.sqlite.prepare("update workspace_leases set lease_kind = 'modify' where work_session_id = ? and canonical_root = ?").run(workSession.id, canonicalLeaseWorkspaceRoot);
+
   const nestedRoot = join(canonicalLeaseWorkspaceRoot, "nested");
   mkdirSync(nestedRoot, { recursive: true });
   writeFileSync(join(nestedRoot, "AGENTS.md"), "Nested access instruction marker.\n");
