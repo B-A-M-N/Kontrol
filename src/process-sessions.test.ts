@@ -578,11 +578,19 @@ if (process.platform === "linux") {
         // Reconcile runs on every lease read; a lease that survives a second
         // consecutive read while its runner is gone would be a real fence
         // leak. Two reads close the scan race between reconcile and the
-        // runner-presence check below.
+        // runner-presence check below. The runner scan itself is a separate
+        // /proc walk: the drain can legitimately complete between the
+        // confirmed lease read and the scan (the fence is then released on
+        // the next read), so a miss is only a failure if the lease survives
+        // a further read with the runner still absent.
         const confirmedLease = restartedWorkSessions.getActiveWorkspaceLease(crashRoot);
         if (!confirmedLease) { activeLease = undefined; break; }
-        assert.ok(findLinuxProcessSessionRunnerOwners([owner]).has(`${owner.pid}:${owner.identity}`),
-          "checkout remains fenced while the old detached runner is still draining");
+        if (!findLinuxProcessSessionRunnerOwners([owner]).has(`${owner.pid}:${owner.identity}`)) {
+          const survivingLease = restartedWorkSessions.getActiveWorkspaceLease(crashRoot);
+          if (!survivingLease) { activeLease = undefined; break; }
+          assert.ok(findLinuxProcessSessionRunnerOwners([owner]).has(`${owner.pid}:${owner.identity}`),
+            "checkout remains fenced while the old detached runner is still draining");
+        }
         await new Promise((resolve) => setTimeout(resolve, 50));
         activeLease = restartedWorkSessions.getActiveWorkspaceLease(crashRoot);
       }
