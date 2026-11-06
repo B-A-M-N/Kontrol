@@ -161,6 +161,9 @@ export interface ReviewWorkflowDeps {
   /** Optional durable dispatch outbox for continuation redrive. */
   dispatchOutbox?: DispatchOutbox;
   reviewRoutes?: import("./review-handoff/route-store.js").ReviewRouteStore;
+  /** Stop processes from the reviewed attempt before a correction continuation
+   * becomes dispatchable. The callback must reject if shutdown is unconfirmed. */
+  interruptWorkSessionForCorrection?: (workSessionId: string) => Promise<void>;
   reviewBrowserJobs?: import("./review-thread/reviewer-job-store.js").ReviewerJobStore;
 }
 
@@ -627,6 +630,28 @@ export function createReviewWorkflowService(
           ? "rejected"
           : "changes_requested";
 
+    // A command from the reviewed attempt may still be running. Stop and
+    // confirm its process tree before committing any continuation. Until the
+    // transaction below changes the session state, the action guard continues
+    // to block new edits and commands. Failure leaves review state untouched.
+    if (input.verdict === "changes_requested" && deps.interruptWorkSessionForCorrection) {
+      try {
+        await deps.interruptWorkSessionForCorrection(input.sessionId);
+      } catch (error) {
+        throw new WorkflowError(
+          `Cannot request changes until the prior work-session processes are confirmed stopped: ${error instanceof Error ? error.message : String(error)}`,
+          "conflict",
+          409,
+        );
+      }
+    }
+
+    const allowedNextActionsSource = input.verdict !== "changes_requested"
+      ? "not_applicable"
+      : input.allowedNextActions !== undefined
+        ? "reviewer_explicit"
+        : "server_default";
+
     // ALL writes happen inside a single transaction so a crash cannot leave a
     // session with feedback but no continuation (which would strand the agent).
     // Mirrors submitForReview()'s transactional shape (line 135).
@@ -744,6 +769,7 @@ export function createReviewWorkflowService(
           verdict: input.verdict,
           requiredActions: input.requiredActions,
           allowedNextActions: resolvedAllowed,
+          allowedNextActionsSource: input.allowedNextActions !== undefined ? "reviewer_explicit" : "server_default",
           reviewedDiffHash: currentPending.diffSha256,
           feedbackSummary: input.comments,
         });

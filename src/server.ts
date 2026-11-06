@@ -527,6 +527,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     dispatchOutbox,
     reviewRoutes,
     reviewBrowserJobs,
+    interruptWorkSessionForCorrection: (workSessionId) => processSessions.interruptWorkSessionForCorrection(workSessionId),
   });
   // Shared live-waiter registry: the singleton dispatcher and every MCP client
   // consult the SAME instance, so a parked agent suppresses duplicate dispatch

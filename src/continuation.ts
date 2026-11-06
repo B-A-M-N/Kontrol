@@ -10,6 +10,7 @@ import { continuations, type ContinuationRow } from "./db/schema.js";
  */
 
 export type ContinuationStatus = "pending" | "claimed" | "reconciliation_required" | "dispatched" | "completed" | "superseded";
+export type AllowedNextActionsSource = "reviewer_explicit" | "server_default" | "legacy_unspecified";
 
 export interface Continuation {
   id: string;
@@ -20,6 +21,7 @@ export interface Continuation {
   verdict: string;
   requiredActions: string[];
   allowedNextActions: string[];
+  allowedNextActionsSource: AllowedNextActionsSource;
   reviewedDiffHash?: string;
   feedbackSummary?: string;
   resumeInstructions?: string;
@@ -40,6 +42,7 @@ export interface CreateContinuationInput {
   verdict: string;
   requiredActions?: string[];
   allowedNextActions?: string[];
+  allowedNextActionsSource?: Exclude<AllowedNextActionsSource, "legacy_unspecified">;
   reviewedDiffHash?: string;
   feedbackSummary?: string;
   resumeInstructions?: string;
@@ -92,6 +95,7 @@ export function createContinuationManager(
       verdict: input.verdict,
       requiredActions: input.requiredActions ?? [],
       allowedNextActions: input.allowedNextActions ?? [],
+      allowedNextActionsSource: input.allowedNextActionsSource ?? "legacy_unspecified",
       feedbackSummary: input.feedbackSummary,
       resumeInstructions: input.resumeInstructions,
       submissionMessage: input.submissionMessage,
@@ -108,6 +112,7 @@ export function createContinuationManager(
         verdict: input.verdict,
         requiredActionsJson: JSON.stringify(input.requiredActions ?? []),
         allowedNextActionsJson: JSON.stringify(input.allowedNextActions ?? []),
+        allowedNextActionsSource: input.allowedNextActionsSource ?? "legacy_unspecified",
         reviewedDiffHash: input.reviewedDiffHash ?? null,
         feedbackSummary: input.feedbackSummary ?? null,
         resumeInstructions: input.resumeInstructions ?? null,
@@ -127,6 +132,7 @@ export function createContinuationManager(
       verdict: input.verdict,
       requiredActions: input.requiredActions ?? [],
       allowedNextActions: input.allowedNextActions ?? [],
+      allowedNextActionsSource: input.allowedNextActionsSource ?? "legacy_unspecified",
       reviewedDiffHash: input.reviewedDiffHash,
       feedbackSummary: input.feedbackSummary,
       resumeInstructions: input.resumeInstructions,
@@ -413,6 +419,7 @@ function rowToContinuation(row: ContinuationRow): Continuation {
     verdict: row.verdict,
     requiredActions: JSON.parse(row.requiredActionsJson) as string[],
     allowedNextActions: JSON.parse(row.allowedNextActionsJson) as string[],
+    allowedNextActionsSource: row.allowedNextActionsSource as AllowedNextActionsSource,
     reviewedDiffHash: row.reviewedDiffHash ?? undefined,
     feedbackSummary: row.feedbackSummary ?? undefined,
     resumeInstructions: row.resumeInstructions ?? undefined,
@@ -434,6 +441,7 @@ function renderPrompt(input: {
   verdict: string;
   requiredActions: string[];
   allowedNextActions: string[];
+  allowedNextActionsSource: AllowedNextActionsSource;
   feedbackSummary?: string;
   resumeInstructions?: string;
   submissionMessage?: string;
@@ -466,6 +474,13 @@ function renderPrompt(input: {
     input.allowedNextActions.forEach((action) => {
       lines.push(`- ${action}`);
     });
+    lines.push("");
+  } else if (input.allowedNextActionsSource === "reviewer_explicit") {
+    lines.push("Allowed next actions: none (the reviewer explicitly granted no worker actions).");
+    lines.push("Request reviewer clarification; do not infer permission from the required actions.");
+    lines.push("");
+  } else if (input.allowedNextActionsSource === "legacy_unspecified") {
+    lines.push("Allowed next action provenance is unavailable for this legacy continuation.");
     lines.push("");
   }
 

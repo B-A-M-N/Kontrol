@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +12,7 @@ import { registerBridgeTools, type BridgeConfig } from "./acp-bridge.js";
 import { openDatabase, databasePath } from "./db/client.js";
 import { createReviewWorkflowService } from "./review-workflow.js";
 import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
+import { ProcessSessionManager } from "./process-sessions.js";
 
 // P1-02: scheduled read-only audit policy must be enforced at the tool boundary,
 // not by prompt instructions.
@@ -92,6 +94,8 @@ const workSessions = createWorkSessionManager(db);
 const eventStore = createEventStore(db);
 const continuationManager = createContinuationManager(db);
 const agentRegistry = createAgentRegistryManager(db);
+const correctionProcesses = new ProcessSessionManager({ maxRuntimeMs: 10_000, reaperIntervalMs: 25 });
+let failCorrectionInterruption = false;
 const reviewWorkflow = createReviewWorkflowService({
   workSessions,
   eventStore,
@@ -124,6 +128,10 @@ const reviewWorkflow = createReviewWorkflowService({
       commitCalled = true;
     },
   } as any,
+  interruptWorkSessionForCorrection: async (workSessionId) => {
+    if (failCorrectionInterruption) throw new Error("simulated process survivor");
+    await correctionProcesses.interruptWorkSessionForCorrection(workSessionId);
+  },
 });
 const config: BridgeConfig = {
   workspaces: {
@@ -440,7 +448,90 @@ try {
     assert.equal(events.filter((e) => e.type === "agent.run.cancelled").length, 1, "exactly one canonical cancel event");
   }
 
-  console.log("enforcement-layer.test.ts: all 12 regression scenarios passed");
+  // ── Test 13: correction feedback fences reviewed processes (b546d6b4) ──
+  {
+    const sessionId = createGatedSession();
+    await callWorker("submit_for_review", { sessionId });
+    const delayedWrite = join(root, "correction-attempt-late-write.txt");
+    if (process.platform !== "win32") {
+      const pendingCommand = await correctionProcesses.start({
+        workspaceId: WS,
+        workSessionId: sessionId,
+        cwd: root,
+        command: `sleep 1; printf late > ${JSON.stringify(delayedWrite)}`,
+        yieldTimeMs: 20,
+      });
+      assert.equal(pendingCommand.running, true, "reviewed attempt has a live command before correction feedback");
+    }
+    const fb = await callReviewer("provide_review_feedback", {
+      sessionId,
+      submissionId: workSessions.getSubmissions(sessionId).at(-1)!.id,
+      diffSha256: workSessions.getSubmissions(sessionId).at(-1)!.diffSha256,
+      reviewEpoch: workSessions.getSubmissions(sessionId).at(-1)!.reviewEpoch,
+      verdict: "changes_requested",
+      comments: "Fix the reviewed issue before resubmitting.",
+    });
+    assert.ok(!fb.isError, "changes_requested commits after interruption");
+    const continuation = continuationManager.listForSession(sessionId).at(-1)!;
+    assert.equal(continuation.allowedNextActionsSource, "server_default", "continuation records that permissions came from the server default");
+    assert.match(continuation.promptText, /Allowed next actions:/, "worker receives the effective correction permissions");
+    if (process.platform !== "win32") {
+      assert.equal(correctionProcesses.getMetrics().running, 0, "correction feedback waits for the prior shell to stop");
+      const correctedAttempt = await correctionProcesses.start({
+        workspaceId: WS,
+        workSessionId: sessionId,
+        cwd: root,
+        command: `${JSON.stringify(process.execPath)} -e "console.log('corrected attempt')"`,
+        yieldTimeMs: 2_000,
+      });
+      assert.match(correctedAttempt.output, /corrected attempt/, "the nonterminal correction attempt can launch after feedback commits");
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      assert.equal(existsSync(delayedWrite), false, "the reviewed attempt cannot mutate the checkout after correction feedback");
+    }
+  }
+
+  // ── Test 14: explicit empty correction permissions (reviewer decision) ──
+  {
+    const sessionId = createGatedSession();
+    const sub = await callWorker("submit_for_review", { sessionId });
+    const fb = await callReviewer("provide_review_feedback", {
+      sessionId,
+      submissionId: sub.structuredContent.submissionId,
+      diffSha256: sub.structuredContent.diffSha256,
+      reviewEpoch: sub.structuredContent.reviewEpoch,
+      verdict: "changes_requested",
+      allowedNextActions: [],
+      comments: "No worker actions are authorized until I clarify.",
+    });
+    assert.ok(!fb.isError, "explicit empty correction permissions are accepted as a reviewer decision");
+    const continuation = continuationManager.listForSession(sessionId).at(-1)!;
+    assert.equal(continuation.allowedNextActionsSource, "reviewer_explicit");
+    assert.match(continuation.promptText, /reviewer explicitly granted no worker actions/);
+    assert.equal(authorizeWorkSessionAction(workSessions, { workSessionId: sessionId, tool: "exec_command" }).allowed, false,
+      "explicit empty permission set remains restrictive");
+  }
+
+  // ── Test 15: unconfirmed process shutdown blocks correction feedback ──
+  {
+    const sessionId = createGatedSession();
+    const sub = await callWorker("submit_for_review", { sessionId });
+    failCorrectionInterruption = true;
+    const unconfirmedFeedback = await callReviewer("provide_review_feedback", {
+      sessionId,
+      submissionId: sub.structuredContent.submissionId,
+      diffSha256: sub.structuredContent.diffSha256,
+      reviewEpoch: sub.structuredContent.reviewEpoch,
+      verdict: "changes_requested",
+    });
+    failCorrectionInterruption = false;
+    assert.equal(unconfirmedFeedback.isError, true, "correction cannot commit while the prior process tree may survive");
+    assert.equal(workSessions.get(sessionId)!.status, "awaiting_review", "failed process cleanup leaves review state unchanged");
+    assert.equal(continuationManager.listForSession(sessionId).length, 0, "failed process cleanup creates no dispatchable continuation");
+  }
+
+  await correctionProcesses.shutdown();
+
+  console.log("enforcement-layer.test.ts: all 15 regression scenarios passed");
 } finally {
   if (httpServer) await new Promise<void>((resolve) => httpServer.close(() => resolve()));
   workSessions.close();

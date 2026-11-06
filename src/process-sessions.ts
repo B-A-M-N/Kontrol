@@ -439,6 +439,18 @@ export class ProcessSessionManager {
    * lease may be released. A survivor is a hard failure and keeps the lease. */
   async terminateByWorkSession(workSessionId: string, timeoutMs = 2_000): Promise<void> {
     this.fencedWorkSessions.add(workSessionId);
+    await this.stopWorkSessionProcesses(workSessionId, timeoutMs);
+  }
+
+  /** Stop commands from the reviewed attempt before a correction continuation
+   * is committed. Unlike terminal cancellation, this does not permanently
+   * fence the work session: the corrected attempt may launch new commands once
+   * its changes_requested transition is durable. */
+  async interruptWorkSessionForCorrection(workSessionId: string, timeoutMs = 2_000): Promise<void> {
+    await this.stopWorkSessionProcesses(workSessionId, timeoutMs);
+  }
+
+  private async stopWorkSessionProcesses(workSessionId: string, timeoutMs: number): Promise<void> {
     const running = [...this.sessions.values()].filter((session) =>
       session.running && session.workSessionId === workSessionId);
     for (const session of running) {
@@ -451,8 +463,8 @@ export class ProcessSessionManager {
     for (const session of running) {
       if (session.running) session.process?.kill("SIGKILL");
     }
-    await this.waitForSessions(running, Math.min(timeoutMs, 1_000));
-    const survivors = running.filter((session) => session.running);
+    await this.waitForSessions(running, Math.min(timeoutMs, 500));
+    const survivors = [...running.filter((session) => session.running)];
     if (survivors.length > 0) {
       throw new Error(`Work session process shutdown is unconfirmed for ${survivors.length} child process(es).`);
     }
