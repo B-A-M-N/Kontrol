@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { realpath } from "node:fs/promises";
 import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
 import type { DatabaseHandle } from "./db/client.js";
@@ -220,6 +221,74 @@ export function createReviewWorkflowService(
 ): ReviewWorkflowService {
   const { workSessions, eventStore, continuationManager, agentRegistry, db, workspaces, reviewCheckpoints, missionLedger, dispatchOutbox, reviewBrowserJobs } = deps;
   const reviewRoutes = deps.reviewRoutes;
+
+  interface ApprovalLeaseView {
+    workSessionId: string;
+    workspaceSessionId: string;
+    leaseKind: string;
+    ownerInstanceId?: string;
+  }
+
+  /**
+   * Lease-fenced approval. Approval is the moment the reviewed tree becomes
+   * authoritative, so it must not proceed while the checkout lease says a
+   * *different* authority owns the workspace:
+   *  - a `modify` lease held by the reviewed session itself is legitimate
+   *    ownership and remains supported;
+   *  - a `modify` lease held by any other work session blocks approval;
+   *  - a `cleanup_pending` fence blocks approval even for its own session
+   *    (terminal cleanup is not mutation authority and the tree may still
+   *    be draining);
+   *  - a `peer_job` reservation blocks approval (owned by the peer
+   *    processor, never by the reviewed worker);
+   *  - no active lease is the ordinary post-worker state and is allowed.
+   * The check is read-only: approval neither acquires nor releases the lease
+   * (acquisition belongs to dispatch, release to verified termination /
+   * peer processing), and the same predicate is re-evaluated inside the
+   * feedback transaction so the commit itself is fenced.
+   */
+  function approvalLeaseBlock(
+    lease: ApprovalLeaseView | undefined,
+    sessionId: string,
+    workspaceSessionId: string,
+  ): string | undefined {
+    if (!lease) return undefined;
+    if (lease.leaseKind === "cleanup_pending") {
+      return `Approval blocked: the checkout lease for this workspace is cleanup-pending (work session ${lease.workSessionId}); terminal cleanup must finish before approval.`;
+    }
+    if (lease.leaseKind === "peer_job") {
+      return `Approval blocked: the checkout lease is a peer-job reservation (${lease.ownerInstanceId ?? lease.workSessionId}); the peer processor must release it before approval.`;
+    }
+    if (lease.leaseKind !== "modify") {
+      return `Approval blocked: the checkout lease has an unrecognized kind (${lease.leaseKind}).`;
+    }
+    if (lease.workspaceSessionId !== workspaceSessionId) {
+      return `Approval blocked: the checkout lease belongs to workspace ${lease.workspaceSessionId}, not ${workspaceSessionId}.`;
+    }
+    if (lease.workSessionId !== sessionId) {
+      return `Approval blocked: the checkout lease is held by work session ${lease.workSessionId}, not the reviewed session ${sessionId}.`;
+    }
+    return undefined;
+  }
+
+  /** Canonical checkout root for lease fencing, or undefined when the
+   * workspace/lease services are not wired (legacy harnesses). Production
+   * always wires both, so fencing always applies there. */
+  async function resolveApprovalLeaseRoot(session: { id: string; workspaceSessionId: string }): Promise<string | undefined> {
+    if (!workspaces || typeof workspaces.getWorkspace !== "function"
+      || typeof workSessions.getActiveWorkspaceLease !== "function") return undefined;
+    const ws = workspaces.getWorkspace(session.workspaceSessionId);
+    if (!ws?.root) return undefined;
+    try {
+      return await realpath(ws.root);
+    } catch {
+      throw new WorkflowError(
+        `Cannot resolve the checkout root for session ${session.id}; approval is blocked until the workspace is available.`,
+        "server_error",
+        500,
+      );
+    }
+  }
 
   async function submitForReview(input: SubmitForReviewInput): Promise<SubmitForReviewResult> {
     const session = workSessions.get(input.workSessionId);
@@ -550,6 +619,24 @@ export function createReviewWorkflowService(
       if (coverageBlock) throw new WorkflowError(`Submission ${input.submissionId}: ${coverageBlock}`, "conflict", 409);
     }
 
+    // Lease fence (approve only): a conflicting checkout lease blocks
+    // approval before any snapshot work, and is re-checked inside the
+    // feedback transaction below so the commit cannot slip past a lease
+    // that changed during validation. Rejection and changes-requested are
+    // never lease-gated: a reviewer must always be able to refuse work.
+    let approvalLeaseRoot: string | undefined;
+    if (input.verdict === "approve") {
+      approvalLeaseRoot = await resolveApprovalLeaseRoot(session);
+      if (approvalLeaseRoot) {
+        const leaseBlock = approvalLeaseBlock(
+          workSessions.getActiveWorkspaceLease(approvalLeaseRoot),
+          input.sessionId,
+          session.workspaceSessionId,
+        );
+        if (leaseBlock) throw new WorkflowError(leaseBlock, "conflict", 409);
+      }
+    }
+
     // P0 #4 / P0 #5 / P1 #1: approval must require the workspace to
     // still equal the EXACT snapshot the submission was captured against.
     // Centralized here so BOTH the MCP and ACP transports enforce
@@ -676,6 +763,18 @@ export function createReviewWorkflowService(
       return appended;
     };
     const result = db.sqlite.transaction(() => {
+      // Lease fence re-check inside the atomic commit: the preflight above
+      // ran before asynchronous snapshot/coverage validation, so a lease
+      // acquired in that window must abort this commit, not be approved
+      // past. Throwing here rolls back the whole feedback write.
+      if (input.verdict === "approve" && approvalLeaseRoot) {
+        const leaseBlock = approvalLeaseBlock(
+          workSessions.getActiveWorkspaceLease(approvalLeaseRoot),
+          input.sessionId,
+          session.workspaceSessionId,
+        );
+        if (leaseBlock) throw new WorkflowError(leaseBlock, "conflict", 409);
+      }
       // Revalidate route binding immediately before writing. The earlier
       // preflight is outside the transaction and cannot protect this interval.
       if (reviewRoutes && input.invocationOrigin !== "internal_supervisor") {
