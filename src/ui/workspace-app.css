@@ -429,6 +429,32 @@ body {
   background: var(--color-background-primary, #18191d);
 }
 
+
+.review-checkpoint {
+  display: grid;
+  gap: 2px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--color-border-primary, #3a3a40);
+}
+
+.review-checkpoint-status,
+.review-checkpoint-note {
+  color: var(--color-text-secondary, #b7b7bf);
+  font-size: var(--font-text-sm-size, 13px);
+}
+
+.review-checkpoint-status {
+  color: var(--color-text-primary, #f2f2f5);
+  font-weight: 600;
+}
+
+.review-checkpoint-status.success {
+  color: var(--color-text-success, #54c98a);
+}
+
+.review-checkpoint-status.error {
+  color: var(--color-text-danger, #ed7474);
+}
 .review-actions,
 .review-diff-file-stats {
   display: flex;

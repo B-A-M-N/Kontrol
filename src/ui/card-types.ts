@@ -4,6 +4,7 @@ export type ToolName =
   | "open_workspace"
   | "show_workspace_ui"
   | "show_changes"
+  | "acknowledge_changes"
   | "apply_patch"
   | "exec_command"
   | "write_stdin"
@@ -91,6 +92,7 @@ export function isToolName(value: unknown): value is ToolName {
     value === "open_workspace" ||
     value === "show_workspace_ui" ||
     value === "show_changes" ||
+    value === "acknowledge_changes" ||
     value === "apply_patch" ||
     value === "exec_command" ||
     value === "write_stdin" ||
@@ -137,7 +139,7 @@ export function isShellTool(tool: ToolName): boolean {
 }
 
 export function isReviewTool(tool: ToolName): boolean {
-  return tool === "show_changes" || tool === "submit_for_review";
+  return tool === "show_changes" || tool === "acknowledge_changes" || tool === "submit_for_review";
 }
 
 export function isToolResultCard(value: unknown): value is Omit<ToolResultCard, "tool"> {

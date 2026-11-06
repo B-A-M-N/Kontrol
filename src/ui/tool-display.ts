@@ -140,6 +140,8 @@ export function getToolDisplay(card: ToolResultCard): ToolDisplay {
       return { icon: terminalIcon(), title: "Process Session", label, tone: "shell" };
     case "show_changes":
       return { icon: reviewIcon(), title: "Show Changes", label, tone: "review" };
+    case "acknowledge_changes":
+      return { icon: reviewIcon(), title: "Acknowledge Changes", label, tone: "review" };
     case "submit_for_review":
       return { icon: reviewIcon(), title: "Review Submission", label, tone: "review" };
     case "activate_review_thread":
@@ -158,6 +160,9 @@ export function getToolDisplay(card: ToolResultCard): ToolDisplay {
 }
 
 export function getToolLabel(card: ToolResultCard): string {
+  if (card.tool === "acknowledge_changes") {
+    return card.summary?.acknowledged === true ? "Acknowledged displayed snapshot" : "Acknowledgement rejected";
+  }
   if (isShellTool(card.tool)) {
     return String(card.summary?.command ?? card.summary?.sessionId ?? card.path ?? card.tool);
   }

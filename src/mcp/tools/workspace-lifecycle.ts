@@ -540,7 +540,12 @@ export function registerLifecycleTools(
           snapshotKind: z.enum(["git", "filesystem"]),
           snapshotRef: z.string().min(1),
         },
-        outputSchema: resultOutputSchema({ acknowledged: z.boolean() }),
+        outputSchema: resultOutputSchema({
+          workspaceId: z.string(),
+          acknowledged: z.boolean(),
+          snapshotKind: z.enum(["git", "filesystem"]),
+          snapshotRef: z.string().min(1),
+        }),
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
       },
       async ({ workspaceId, snapshotKind, snapshotRef }) => {
@@ -560,7 +565,23 @@ export function registerLifecycleTools(
           content: [textBlock(acknowledged
             ? "Displayed snapshot acknowledged for this connection. This does not approve or submit the work."
             : "Acknowledgement rejected because the workspace changed after the snapshot was displayed.")],
-          structuredContent: { acknowledged },
+          _meta: {
+            tool: "acknowledge_changes",
+            card: {
+              workspaceId,
+              summary: { acknowledged, snapshotKind, snapshotRef },
+            },
+          },
+          structuredContent: {
+            tool: "acknowledge_changes",
+            workspaceId,
+            result: acknowledged
+              ? "Displayed snapshot acknowledged for this connection. This does not approve or submit the work."
+              : "Acknowledgement rejected because the workspace changed after the snapshot was displayed.",
+            acknowledged,
+            snapshotKind,
+            snapshotRef,
+          },
           isError: !acknowledged,
         };
       },

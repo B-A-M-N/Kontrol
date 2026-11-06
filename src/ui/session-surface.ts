@@ -990,9 +990,25 @@ export function renderReviewCard(card: ToolResultCard, display: ToolDisplay): vo
     );
     header.append(icon, titleGroup, renderSummaryBadge(card));
     const body = element("div", { className: "review-summary" });
+    const checkpointStatus = element("div", { className: "review-checkpoint" });
+    if (card.tool === "show_changes") {
+      checkpointStatus.append(element("div", { className: "review-checkpoint-status", text: "Displayed · awaiting owner acknowledgement" }));
+      checkpointStatus.append(element("div", { className: "review-checkpoint-note", text: "Displaying changes does not acknowledge, approve, or integrate them." }));
+    } else if (card.tool === "acknowledge_changes") {
+      const acknowledged = card.summary?.acknowledged === true;
+      checkpointStatus.append(element("div", {
+        className: `review-checkpoint-status ${acknowledged ? "success" : "error"}`,
+        text: acknowledged ? "Acknowledged · this snapshot only" : "Acknowledgement rejected · workspace changed",
+      }));
+      checkpointStatus.append(element("div", { className: "review-checkpoint-note", text: "Acknowledgement does not approve, submit, or integrate the work." }));
+      checkpointStatus.append(element("div", { className: "review-checkpoint-note", text: "Integration status is not recorded by this review card." }));
+    } else if (card.tool === "submit_for_review") {
+      checkpointStatus.append(element("div", { className: "review-checkpoint-status", text: "Submitted for review" }));
+      checkpointStatus.append(element("div", { className: "review-checkpoint-note", text: "Approval and integration are separate workflow states." }));
+    }
     const actions = element("div", { className: "review-actions" });
     const feedback = element("div", { className: "review-feedback" });
-    section.append(header, body, actions, feedback);
+    section.append(header, checkpointStatus, body, actions, feedback);
     main.append(section);
     dom = { key: surfaceKey, main, body, actions, feedback };
     host.setCurrentLegacyReviewDom(dom);

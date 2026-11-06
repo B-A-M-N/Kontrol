@@ -627,6 +627,26 @@ fakeApp.emit("toolresult", {
 await settle();
 assert.match(document.querySelector(".tool-title")?.textContent ?? "", /Workspace/,
   "show_workspace_ui renders the workspace surface card");
+fakeApp.emit("toolresult", {
+  _meta: { tool: "show_changes", card: { tool: "show_changes", workspaceId: "workspace-ui-open", summary: { files: 1 } } },
+  structuredContent: { tool: "show_changes", workspaceId: "workspace-ui-open", snapshotKind: "git", snapshotRef: "snapshot-displayed" },
+  content: [{ type: "text", text: "diff --git a/file b/file" }],
+});
+await settle();
+assert.match(document.querySelector(".review-checkpoint-status")?.textContent ?? "", /Displayed · awaiting owner acknowledgement/,
+  "show_changes is presented as displayed, not acknowledged");
+assert.match(document.querySelector(".review-checkpoint-note")?.textContent ?? "", /does not acknowledge, approve, or integrate/,
+  "displayed changes are distinct from later workflow states");
+fakeApp.emit("toolresult", {
+  _meta: { tool: "acknowledge_changes", card: { tool: "acknowledge_changes", workspaceId: "workspace-ui-open", summary: { acknowledged: true, snapshotRef: "snapshot-displayed" } } },
+  structuredContent: { tool: "acknowledge_changes", workspaceId: "workspace-ui-open", acknowledged: true, snapshotKind: "git", snapshotRef: "snapshot-displayed" },
+  content: [{ type: "text", text: "Displayed snapshot acknowledged." }],
+});
+await settle();
+assert.match(document.querySelector(".review-checkpoint-status")?.textContent ?? "", /Acknowledged · this snapshot only/,
+  "acknowledge_changes renders a separate acknowledgement state");
+assert.match(document.querySelector(".review-checkpoint-note")?.textContent ?? "", /does not approve, submit, or integrate/,
+  "acknowledgement does not imply approval or integration");
 assert.ok(__workspaceAppTest.getLastSuccessfulHydrationAt(), "workspace state is hydrated after open_workspace");
 const workspaceDomSurfaceCalls = fakeToolArguments.filter((entry) => entry.name === "get_workspace_session_surface"
   && entry.arguments?.workspaceId === "workspace-dom");
