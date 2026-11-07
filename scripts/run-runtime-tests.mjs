@@ -166,6 +166,7 @@ try {
     "build:app",
     "test:review-browser",
     "test:review-loop-integration",
+    "test:release",
     "test:unit",
     "test:find-compat",
     "test:adapters",

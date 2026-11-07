@@ -119,7 +119,8 @@
     "release:publish": "node scripts/package-stage.mjs --publish --skip-build --candidate \"$KONTROL_QUALIFIED_CANDIDATE\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "package:stage": "node scripts/package-stage.mjs",
-    "prepublishOnly": "node scripts/refuse-publish.mjs"
+    "prepublishOnly": "node scripts/refuse-publish.mjs",
+    "test:release": "node --import tsx scripts/failure-injection-qualification.test.mjs"
   },
   "keywords": [
     "mcp",
