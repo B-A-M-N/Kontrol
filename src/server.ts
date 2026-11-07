@@ -118,6 +118,7 @@ import { createPolicyWaiterRegistry } from "./server/policy-waiters.js";
 import { createMcpSessionLifecycle } from "./server/mcp-session-lifecycle.js";
 import { createCachedAgentDispatchabilityProbe, healthz, readinessChecks, sendReadiness } from "./server/readiness.js";
 import { handleDiagnostics } from "./server/diagnostics.js";
+import { handleActivityData, handleActivityPage } from "./server/activity.js";
 import { handleAgentPtyCredentialRenewal, handleMcpHttpRequest } from "./server/mcp-http.js";
 import type { McpHttpDeps } from "./server/request-context.js";
 import { ExpiredMcpOperationTracker } from "./server/mcp-expired-operations.js";
@@ -926,6 +927,22 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
 
   app.get("/diagnostics", (req, res) => {
     void handleDiagnostics(diagnosticsDeps, req, res);
+  });
+
+  // Kontrol-native activity surface (Finding 9): the page is static; the
+  // data endpoint carries the same loopback + diagnostics-credential gate
+  // as /diagnostics and returns only scoped operation metadata (never
+  // arguments, commands, credentials, or raw outputs).
+  const activityDeps = {
+    config,
+    mcpSessions,
+    operationDiagnostics,
+  };
+  app.get("/activity", (req, res) => {
+    handleActivityPage(activityDeps, req, res);
+  });
+  app.get("/activity/data", (req, res) => {
+    handleActivityData(activityDeps, req, res);
   });
 
   if (config.acpEnabled) {
