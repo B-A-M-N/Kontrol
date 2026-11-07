@@ -9,7 +9,6 @@
  */
 import { timingSafeEqual } from "node:crypto";
 import type { ServerConfig } from "../config.js";
-import { requestIp } from "../logger.js";
 import { constantTimeStringEqual } from "../mcp/tool-logging.js";
 import type { McpSessionState } from "./mcp-session-state.js";
 import { projectActivity } from "./activity-projection.js";
@@ -27,10 +26,21 @@ import type { Request, Response } from "express";
  *   Peer sessions (other installations) are never projected in either
  *   mode.
  */
-function viewerPrincipalId(config: ServerConfig, req: Request): string | undefined {
-  if (constantTimeStringEqual(req.header("x-kontrol-reviewer-token"), config.acpReviewerSecret)) return "reviewer-token";
-  if (config.authMode === "tunnel" && constantTimeStringEqual(req.header("x-kontrol-tunnel-reviewer"), config.tunnelReviewerSecret)) return "tunnel-reviewer";
-  return undefined;
+type ReviewerCredentialState = { state: "none" } | { state: "valid"; principalId: string } | { state: "invalid" };
+
+function viewerPrincipalFrom(c: ReviewerCredentialState): string | undefined {
+  return c.state === "valid" ? c.principalId : undefined;
+}
+
+function reviewerCredential(config: ServerConfig, req: Request): ReviewerCredentialState {
+  const reviewerToken = req.header("x-kontrol-reviewer-token");
+  const tunnelReviewer = req.header("x-kontrol-tunnel-reviewer");
+  if (reviewerToken === undefined && tunnelReviewer === undefined) return { state: "none" };
+  if (constantTimeStringEqual(reviewerToken, config.acpReviewerSecret)) return { state: "valid", principalId: "reviewer-token" };
+  if (config.authMode === "tunnel" && constantTimeStringEqual(tunnelReviewer, config.tunnelReviewerSecret)) return { state: "valid", principalId: "tunnel-reviewer" };
+  // A credential was supplied but does not verify: fail closed instead
+  // of silently falling back to operator-wide viewing.
+  return { state: "invalid" };
 }
 
 export interface ActivityDeps {
@@ -42,9 +52,15 @@ export interface ActivityDeps {
 }
 
 function gated(deps: ActivityDeps, req: Request, res: Response): boolean {
-  const ip = requestIp(req, deps.config.logging.trustProxy) || "";
-  if (ip && !ip.startsWith("127.") && !ip.startsWith("::1") && ip !== "::ffff:127.0.0.1") {
+  // The socket peer address only — never a forwarded client IP
+  // (X-Forwarded-For etc.), which a remote caller could spoof.
+  const addr = req.socket.remoteAddress || "";
+  if (!(addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1" || addr === "::ffff:7f00:1")) {
     res.status(403).json({ ok: false, error: "Forbidden: activity is loopback-only" });
+    return false;
+  }
+  if (reviewerCredential(deps.config, req).state === "invalid") {
+    res.status(401).json({ ok: false, error: "Unauthorized: invalid reviewer credential" });
     return false;
   }
   if (!deps.config.diagnosticsSecret) {
@@ -72,7 +88,7 @@ export function handleActivityData(deps: ActivityDeps, req: Request, res: Respon
     { active: snapshot.active as Array<Record<string, unknown>>, recent: snapshot.recent as unknown as Array<Record<string, unknown>> },
     deps.mcpSessions,
     workspaces,
-    { viewerPrincipalId: viewerPrincipalId(deps.config, req) },
+    { viewerPrincipalId: viewerPrincipalFrom(reviewerCredential(deps.config, req)) },
   ));
 }
 

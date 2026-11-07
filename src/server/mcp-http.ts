@@ -249,6 +249,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
       admissionClass,
       ...(operationSessionState?.authenticatedPrincipalId ? { authenticatedPrincipalId: operationSessionState.authenticatedPrincipalId } : {}),
       ...(operationSessionState?.workSessionId ? { workSessionId: operationSessionState.workSessionId } : {}),
+      ...(operationSessionState?.listenerKind ? { listenerKind: operationSessionState.listenerKind } : {}),
     });
     deps.recordMcpConnectionEvent?.({
       kind: requestRpcMethod === "initialize" ? "initialize_started" : requestRpcMethod === "tools/call" ? "tool_call_started" : "request_started",

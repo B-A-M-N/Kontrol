@@ -69,9 +69,14 @@ function projectRow(
   viewerPrincipalId?: string,
 ): { row?: ProjectedActivityRow; excluded: boolean } {
   // Prefer the immutable attribution captured at operation begin; fall
-  // back to the live session join only for older records. Peer sessions
-  // (other installations' traffic) are never projected.
+  // back to the live session join only for older records.
   const capturedOwner = stringField(record, "authenticatedPrincipalId");
+  const capturedKind = stringField(record, "listenerKind");
+  // Fail closed: peer operations are never projected, whether or not
+  // their session still exists, and records that cannot establish
+  // `authenticated` attribution (neither captured nor resolvable from a
+  // live session) are excluded.
+  if (capturedKind === "peer") return { excluded: true };
   const sha = stringField(record, "sessionIdSha256");
   const session = sha ? sessions.get(sha) : undefined;
   if (session?.listenerKind === "peer") return { excluded: true };

@@ -42,6 +42,7 @@ mcpSessions.set(sessionId, {
   identitySource: "oauth",
   authenticatedRole: "reviewer",
   authenticatedPrincipalId: "reviewer-token",
+  listenerKind: "owner",
   authSource: "reviewer_token",
   listenerKind: "owner",
   createdAt: Date.now(),
@@ -68,6 +69,7 @@ operationDiagnostics.begin({
   startedAtMs: Date.now() - 42,
   admissionClass: "execution",
   authenticatedPrincipalId: "reviewer-token",
+  listenerKind: "owner",
 });
 operationDiagnostics.finish("op-direct-1", {
   finishedAtMs: Date.now(),
@@ -120,6 +122,7 @@ mcpSessions.set(otherSessionId, {
   ...mcpSessions.get(sessionId)!,
   sessionId: otherSessionId,
   authenticatedPrincipalId: "owner:other-2",
+  listenerKind: "owner",
 } as unknown as McpSessionState);
 operationDiagnostics.begin({
   operationId: "op-other-1",
@@ -129,6 +132,7 @@ operationDiagnostics.begin({
   startedAtMs: Date.now() - 7,
   admissionClass: "execution",
   authenticatedPrincipalId: "owner:other-2",
+  listenerKind: "owner",
 });
 operationDiagnostics.finish("op-other-1", {
   finishedAtMs: Date.now(),
@@ -150,6 +154,7 @@ mcpSessions.set(peerSessionId, {
   sessionId: peerSessionId,
   listenerKind: "peer",
   authenticatedPrincipalId: "peer-installation-9",
+  listenerKind: "peer",
 } as unknown as McpSessionState);
 operationDiagnostics.begin({
   operationId: "op-peer-1",
@@ -159,6 +164,7 @@ operationDiagnostics.begin({
   startedAtMs: Date.now() - 3,
   admissionClass: "execution",
   authenticatedPrincipalId: "peer-installation-9",
+  listenerKind: "peer",
 });
 operationDiagnostics.finish("op-peer-1", {
   finishedAtMs: Date.now(),
@@ -252,6 +258,27 @@ try {
   })).json() as { recent: Array<Record<string, unknown>> };
   const survivor = retired.recent.find((row) => row.operationId === "op-direct-1");
   assert.ok(survivor, "retired-session operation remains projected via captured attribution");
+  assert.ok(!retired.recent.some((row) => row.operationId === "op-peer-1"),
+    "retired peer operation remains excluded via captured listener kind");
+
+  // Operator mode must also keep the retired peer excluded.
+  const operatorAfter = await (await fetch(`${base}/activity/data`, {
+    headers: { "x-kontrol-diagnostics": "test-diagnostics-secret-that-is-long" },
+  })).json() as { recent: Array<Record<string, unknown>> };
+  assert.ok(!operatorAfter.recent.some((row) => row.operationId === "op-peer-1"),
+    "operator mode excludes retired peer operations");
+  assert.ok(!operatorAfter.recent.some((row) => row.owner === "peer-installation-9"),
+    "peer principal never projected after retirement");
+
+  // An explicitly supplied invalid reviewer credential must be
+  // rejected, not silently treated as operator-wide viewing.
+  const invalid = await fetch(`${base}/activity/data`, {
+    headers: {
+      "x-kontrol-diagnostics": "test-diagnostics-secret-that-is-long",
+      "x-kontrol-reviewer-token": "definitely-wrong-token",
+    },
+  });
+  assert.equal(invalid.status, 401, "invalid reviewer credential rejected, never falls back to operator mode");
 } finally {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 }

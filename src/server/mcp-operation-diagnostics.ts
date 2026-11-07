@@ -20,6 +20,12 @@ export interface McpOperationStart {
    */
   authenticatedPrincipalId?: string;
   workSessionId?: string;
+  /**
+   * Authenticated listener kind captured at begin (Finding 9 follow-up):
+   * peer sessions must stay excluded from the activity feed even after
+   * their MCP session retires, so the kind is preserved on the record.
+   */
+  listenerKind?: string;
 }
 
 export interface McpOperationFinish {
