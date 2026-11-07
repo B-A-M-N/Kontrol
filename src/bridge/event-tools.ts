@@ -137,7 +137,7 @@ export function registerEventTools(server: McpServer, config: BridgeConfig): voi
       inputSchema: {
         workspaceId: z.string().describe("Workspace or project identifier from open_workspace."),
         afterSeq: z.number().int().min(0).default(0).describe("Return events strictly after this global event sequence."),
-        timeoutMs: z.number().int().min(1000).max(120_000).default(DEFAULT_WORKSPACE_EVENT_WAIT_MS).describe("Max wait in ms before returning."),
+        timeoutMs: z.number().int().min(0).max(120_000).default(DEFAULT_WORKSPACE_EVENT_WAIT_MS).describe("Max wait in ms before returning. 0 is a genuine immediate read: return the current backlog after the cursor without waiting (the Workspace App reconnect replay uses this)."),
       },
       outputSchema: {
         events: z.array(z.object({

@@ -16,8 +16,13 @@ try {
   serviceDb.close();
   const serviceArtifact = join(stateDir, "releases", "build-current");
   mkdirSync(serviceArtifact, { recursive: true });
+  writeFileSync(join(serviceArtifact, "cli.js"), "#!/usr/bin/env node\n");
+  writeFileSync(join(serviceArtifact, "fake-release.js"), "release bytes\n");
+  const { treeContentSha256 } = await import("./release-integrity.js");
   writeFileSync(join(serviceArtifact, "build-meta.json"), JSON.stringify({
     buildId: "build-current",
+    releaseFormatVersion: 5,
+    contentSha256: treeContentSha256(serviceArtifact),
     schemaVersion: LATEST_SCHEMA_VERSION,
     minReadableSchemaVersion: 1,
     maxReadableSchemaVersion: LATEST_SCHEMA_VERSION,
@@ -130,10 +135,27 @@ try {
   assert.match(foreignRecord.evidence.runtime.detail, /another artifact root/,
     "the runtime evidence reports the other-track record instead of comparing it");
 
+  // Artifact byte integrity is recomputed, not inferred from metadata:
+  // tampering with a file under intact build-meta.json must FAIL even
+  // though every metadata field still matches service.json.
+  const artifactBytesFixture = serviceArtifact;
+  const tamperedFile = join(artifactBytesFixture, "fake-release.js");
+  writeFileSync(tamperedFile, "tampered bytes\n");
+  const tampered = inspectUnifiedDeploymentReconciliation(servicePaths, { observeSystemd });
+  assert.equal(tampered.status, "DRIFT", "modified artifact bytes fail reconciliation (FAIL evidence aggregates to DRIFT)");
+  assert.equal(tampered.evidence.artifact.status, "FAIL");
+  assert.match(tampered.evidence.artifact.detail, /byte integrity/);
+  writeFileSync(tamperedFile, "release bytes\n");
+  assert.equal(inspectUnifiedDeploymentReconciliation(servicePaths, { observeSystemd }).status, "PASS",
+    "restored artifact bytes pass reconciliation again");
+
   const rollbackArtifact = join(stateDir, "releases", "build-previous");
   mkdirSync(rollbackArtifact, { recursive: true });
+  writeFileSync(join(rollbackArtifact, "cli.js"), "x\n");
   writeFileSync(join(rollbackArtifact, "build-meta.json"), JSON.stringify({
     buildId: "build-previous",
+    releaseFormatVersion: 5,
+    contentSha256: treeContentSha256(rollbackArtifact),
     schemaVersion: LATEST_SCHEMA_VERSION,
     minReadableSchemaVersion: 1,
     maxReadableSchemaVersion: LATEST_SCHEMA_VERSION,

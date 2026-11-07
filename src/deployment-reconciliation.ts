@@ -5,6 +5,7 @@ import Database from "better-sqlite3";
 import { isRuntimeIdentityLive, readRuntimeIdentity } from "./runtime-identity.js";
 import { databasePath } from "./db/client.js";
 import { migrationChain } from "./db/migrations.js";
+import { verifyArtifactContent } from "./release-integrity.js";
 
 export type ReconciliationStatus = "PASS" | "WARN" | "FAIL" | "UNAVAILABLE";
 
@@ -251,12 +252,19 @@ export function inspectUnifiedDeploymentReconciliation(
   }
   const normalizedArtifactPath = resolve(artifactPath);
   const artifactMeta = readJsonFile<ArtifactMetadata>(join(normalizedArtifactPath, "build-meta.json"));
+  // Byte integrity is recomputed from the installed tree (format-aware
+  // release verifier): a PASS requires metadata identity AND matching
+  // bytes. Missing metadata is UNKNOWN (never inferred); a missing or
+  // mismatching hash is FAIL; tampering under intact metadata is FAIL.
+  const artifactBytes = artifactMeta ? verifyArtifactContent(normalizedArtifactPath) : undefined;
   evidence.artifact = artifactMeta
     ? artifactMeta.buildId === buildId
       && artifactMeta.schemaVersion === schemaVersion
       && (artifactMeta.minReadableSchemaVersion ?? 0) === minReadable
       && (artifactMeta.maxReadableSchemaVersion ?? artifactMeta.schemaVersion) === maxReadable
-      ? { status: "PASS", detail: `service.json=${buildId}; artifact=${artifactMeta.buildId}; path=${normalizedArtifactPath}` }
+      ? artifactBytes && artifactBytes.ok
+        ? { status: "PASS", detail: `service.json=${buildId}; artifact=${artifactMeta.buildId}; content=${artifactBytes.contentSha256 ?? "unknown"}; path=${normalizedArtifactPath}` }
+        : { status: "FAIL", detail: `artifact byte integrity failed for ${normalizedArtifactPath}: ${artifactBytes?.reason ?? "unverified"}` }
       : { status: "FAIL", detail: `service.json=${buildId} schema=${schemaVersion} readable=${minReadable}..${maxReadable}; artifact=${artifactMeta.buildId ?? "unknown"} schema=${artifactMeta.schemaVersion ?? "unknown"} readable=${artifactMeta.minReadableSchemaVersion ?? "unknown"}..${artifactMeta.maxReadableSchemaVersion ?? "unknown"}; path=${normalizedArtifactPath}` }
     : { status: "UNKNOWN", detail: `build metadata unavailable at ${normalizedArtifactPath}` };
 

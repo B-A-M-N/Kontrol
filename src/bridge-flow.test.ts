@@ -1637,6 +1637,13 @@ try {
     assert.ok(transportASurface.structuredContent.sessions.some((entry: { sessionId: string }) => entry.sessionId === transportOwnedSession.id), "transport A sees its own workspace session");
     assert.ok(!transportBSurface.structuredContent.sessions.some((entry: { sessionId: string }) => entry.sessionId === transportOwnedSession.id), "transport B cannot see transport A's workspace session");
 
+    // Contract: the Workspace App reconnect replay sends timeoutMs: 0
+    // (immediate read). The registered schema must accept the exact
+    // request shape the UI sends, not reject it at validation.
+    const immediateRead = await callOwnerB("await_workspace_events", { workspaceId: WS, afterSeq: 0, timeoutMs: 0 });
+    assert.ok(immediateRead.structuredContent && Array.isArray(immediateRead.structuredContent.events),
+      "timeoutMs: 0 immediate read returns a valid event page");
+    assert.equal(typeof immediateRead.structuredContent.nextSeq, "number", "immediate read preserves the replay cursor");
     const ownerBEvents = await callOwnerB("await_workspace_events", { workspaceId: WS, afterSeq: beforeOwnerAEvent, timeoutMs: 1000 });
     assert.equal(ownerBEvents.structuredContent.events.length, 0, "owner B receives no owner A event");
     assert.ok(ownerBEvents.structuredContent.nextSeq > 0, "owner B cursor advances past filtered owner A events");
