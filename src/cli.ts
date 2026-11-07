@@ -5,6 +5,7 @@ import { existsSync, lstatSync, readFileSync, realpathSync, rmSync, statSync, st
 import { stdin as input, stderr as errorOutput, stdout as output } from "node:process";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { claimStateDirectory } from "./state-directory.js";
 import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { satisfies } from "semver";
@@ -396,10 +397,17 @@ async function runReviewLoopCommand(args: string[]): Promise<void> {
   if (!existsSync(databasePath(config.stateDir))) throw new Error("Kontrol state database not found; run `kontrol init` first.");
   // Status is read-only; mutations use the deployment-context open. A CLI
   // invocation without deployment authority cannot upgrade the database.
+  // Mutations must also bind the verified state owner BEFORE the writable
+  // open, and pass the server-issued installation ID to the route store —
+  // otherwise CLI-created routes silently carry a legacy NULL installation
+  // ID and escape the cross-installation claim comparison.
+  const installationId = sub === "status"
+    ? undefined
+    : claimStateDirectory(config.stateDir, config.stateAccess).stateId;
   const db = sub === "status"
     ? inspectDatabase(config.stateDir)
     : openDatabase(config.stateDir);
-  const routes = createReviewRouteStore(db);
+  const routes = createReviewRouteStore(db, installationId ? { installationId } : undefined);
   try {
     if (sub === "status") {
       const route = routes.getRouteBySession(workSessionId);

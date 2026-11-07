@@ -395,6 +395,17 @@ for (const flag of ["-v", "--version"]) {
     db.sqlite.prepare("insert into workspace_sessions (id, root, status, mode, managed, created_at, last_used_at) values (?, '/tmp', 'active', 'checkout', 'false', ?, ?)").run("wss_cli_rl", now, now);
     db.sqlite.prepare("insert into work_sessions (id, workspace_session_id, submitted_by, status, created_at, updated_at) values ('ws_cli_rl', 'wss_cli_rl', 'test', 'in_progress', ?, ?)").run(now, now);
     db.close();
+    // Simulate the ownership record a prior server claim would have
+    // established for this state directory.
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(${JSON.stringify(stateDir)} + "/state-owner.json", JSON.stringify({
+      formatVersion: 1,
+      stateId: "11111111-1111-4111-8111-111111111111",
+      profile: "development",
+      projectRoot: ${JSON.stringify(process.cwd())},
+      permittedLauncherContext: "development",
+      createdAt: now,
+    }));
   `;
   const seed = spawnSync(process.execPath, ["--import", "tsx", "--eval", dbScript, "dbseed"], { cwd: repositoryRoot, encoding: "utf8" });
   assert.equal(seed.status, 0, `review-loop db seed must succeed; stderr: ${seed.stderr}`);
@@ -410,6 +421,22 @@ for (const flag of ["-v", "--version"]) {
   const on = runCli("review-loop", "on", "--session", "ws_cli_rl", "--max-rounds", "3", "--mode", "isolated_review");
   assert.equal(on.status, 0, `review-loop on must exit 0; stderr: ${on.stderr}`);
   assert.match(on.stdout, /Review loop active; round 0\/3/);
+
+  // The CLI-created route must carry the server-issued installation ID
+  // (state owner), never a legacy NULL: unbound records would escape the
+  // cross-installation claim comparison.
+  const owner = JSON.parse(await import("node:fs").then((m) => m.readFileSync(join(stateDir, "state-owner.json"), "utf8"))) as { stateId: string };
+  const checkScript = `
+    const { openDatabase } = await import("./src/db/client.js");
+    const db = openDatabase(${JSON.stringify(stateDir)});
+    const row = db.sqlite.prepare("select installation_id from review_routes where work_session_id = 'ws_cli_rl'").get();
+    console.log(JSON.stringify(row ?? null));
+    db.close();
+  `;
+  const check = spawnSync(process.execPath, ["--import", "tsx", "--eval", checkScript, "dbcheck"], { cwd: repositoryRoot, encoding: "utf8" });
+  assert.equal(check.status, 0, `review-loop installation binding check must succeed; stderr: ${check.stderr}`);
+  const routeRow = JSON.parse(check.stdout.trim()) as { installation_id: string | null } | null;
+  assert.equal(routeRow?.installation_id, owner.stateId, "CLI-created route carries the state-owner installation ID");
 
   const pause = runCli("review-loop", "pause", "--session", "ws_cli_rl");
   assert.equal(pause.status, 0, `review-loop pause must exit 0; stderr: ${pause.stderr}`);
