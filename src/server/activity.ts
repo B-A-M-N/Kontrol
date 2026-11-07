@@ -10,10 +10,28 @@
 import { timingSafeEqual } from "node:crypto";
 import type { ServerConfig } from "../config.js";
 import { requestIp } from "../logger.js";
+import { constantTimeStringEqual } from "../mcp/tool-logging.js";
 import type { McpSessionState } from "./mcp-session-state.js";
 import { projectActivity } from "./activity-projection.js";
 import type { McpOperationDiagnostics } from "./mcp-operation-diagnostics.js";
 import type { Request, Response } from "express";
+
+/**
+ * Authority model (Finding 9 follow-up). Two modes:
+ * - Viewer mode: the request also carries a verified reviewer credential
+ *   (x-kontrol-reviewer-token or x-kontrol-tunnel-reviewer, validated
+ *   exactly as session-authority does). The feed is then scoped to that
+ *   reviewer's principal only.
+ * - Operator mode: the diagnostics credential alone grants a machine-wide
+ *   operator view (this is a loopback-only, single-operator surface).
+ *   Peer sessions (other installations) are never projected in either
+ *   mode.
+ */
+function viewerPrincipalId(config: ServerConfig, req: Request): string | undefined {
+  if (constantTimeStringEqual(req.header("x-kontrol-reviewer-token"), config.acpReviewerSecret)) return "reviewer-token";
+  if (config.authMode === "tunnel" && constantTimeStringEqual(req.header("x-kontrol-tunnel-reviewer"), config.tunnelReviewerSecret)) return "tunnel-reviewer";
+  return undefined;
+}
 
 export interface ActivityDeps {
   readonly config: ServerConfig;
@@ -54,6 +72,7 @@ export function handleActivityData(deps: ActivityDeps, req: Request, res: Respon
     { active: snapshot.active as Array<Record<string, unknown>>, recent: snapshot.recent as unknown as Array<Record<string, unknown>> },
     deps.mcpSessions,
     workspaces,
+    { viewerPrincipalId: viewerPrincipalId(deps.config, req) },
   ));
 }
 
@@ -73,9 +92,26 @@ async function load(){
   const data = await r.json();
   status.textContent = "Updated " + data.generatedAt + " — " + data.counts.active + " active, " + data.counts.recent + " recent (" + data.counts.excludedUnattributed + " unattributed excluded)";
   const render = (rows, el) => {
-    el.innerHTML = "<tr><th>Status</th><th>Tool</th><th>Owner</th><th>Work session</th><th>Workspace</th><th>Elapsed</th><th>Started</th></tr>" + rows.map(row =>
-      "<tr" + (row.stale ? ' class="stale"' : "") + "><td>" + row.status + (row.errorClass ? " (" + row.errorClass + ")" : "") + "</td><td>" + (row.toolName || row.method) + "</td><td>" + row.owner + "</td><td>" + (row.workSessionId || "—") + "</td><td>" + (row.workspaceSessionId || "—") + "</td><td>" + row.elapsedMs + " ms</td><td>" + row.startedAt + "</td></tr>"
-    ).join("");
+    el.replaceChildren();
+    const header = document.createElement("tr");
+    for (const label of ["Status","Tool","Owner","Work session","Workspace","Elapsed","Started"]) {
+      const th = document.createElement("th");
+      th.textContent = label;
+      header.appendChild(th);
+    }
+    el.appendChild(header);
+    for (const row of rows) {
+      const tr = document.createElement("tr");
+      if (row.stale) tr.className = "stale";
+      for (const value of [row.status + (row.errorClass ? " (" + row.errorClass + ")" : ""),
+        row.toolName || row.method, row.owner, row.workSessionId || "—",
+        row.workspaceSessionId || "—", row.elapsedMs + " ms", row.startedAt]) {
+        const td = document.createElement("td");
+        td.textContent = String(value);
+        tr.appendChild(td);
+      }
+      el.appendChild(tr);
+    }
   };
   render(data.active, document.getElementById("active"));
   render(data.recent, document.getElementById("recent"));

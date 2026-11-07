@@ -12,6 +12,14 @@ export interface McpOperationStart {
   toolName?: string;
   startedAtMs: number;
   admissionClass: "execution" | "waiter" | "stream";
+  /**
+   * Immutable authenticated attribution captured at operation begin
+   * (Finding 9 follow-up). Attribution survives session retirement: a
+   * completed operation still reports its verified owner/work session
+   * even after the originating MCP session is gone.
+   */
+  authenticatedPrincipalId?: string;
+  workSessionId?: string;
 }
 
 export interface McpOperationFinish {

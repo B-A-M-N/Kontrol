@@ -66,11 +66,19 @@ function projectRow(
   sessions: Map<string, McpSessionState>,
   now: number,
   isActive: boolean,
+  viewerPrincipalId?: string,
 ): { row?: ProjectedActivityRow; excluded: boolean } {
+  // Prefer the immutable attribution captured at operation begin; fall
+  // back to the live session join only for older records. Peer sessions
+  // (other installations' traffic) are never projected.
+  const capturedOwner = stringField(record, "authenticatedPrincipalId");
   const sha = stringField(record, "sessionIdSha256");
   const session = sha ? sessions.get(sha) : undefined;
-  const owner = session?.authenticatedPrincipalId;
-  if (!session || !owner) return { excluded: true };
+  if (session?.listenerKind === "peer") return { excluded: true };
+  const owner = capturedOwner ?? session?.authenticatedPrincipalId;
+  if (!owner) return { excluded: true };
+  if (viewerPrincipalId && owner !== viewerPrincipalId) return { excluded: true };
+  const workSessionId = stringField(record, "workSessionId") ?? session?.workSessionId;
   const startedAtMs = typeof record.startedAtMs === "number" ? record.startedAtMs : Date.parse(stringField(record, "startedAt") ?? "");
   const elapsedMs = isActive
     ? Math.max(0, now - startedAtMs)
@@ -86,27 +94,36 @@ function projectRow(
     ...(!isActive && stringField(record, "finishedAt") ? { finishedAt: stringField(record, "finishedAt") } : {}),
     elapsedMs,
     owner,
-    ...(session.authenticatedRole ? { role: session.authenticatedRole } : {}),
-    ...(session.workSessionId ? { workSessionId: session.workSessionId } : {}),
+    ...(session?.authenticatedRole ? { role: session.authenticatedRole } : {}),
+    ...(workSessionId ? { workSessionId } : {}),
     ...(errorClass ? { errorClass } : {}),
     stale: isActive && now - startedAtMs > STALE_ACTIVE_MS,
   };
   return { row, excluded: false };
 }
 
+export interface ActivityProjectionOptions {
+  now?: number;
+  limit?: number;
+  /** Viewer mode: only rows owned by this principal are projected. */
+  viewerPrincipalId?: string;
+}
+
 export function projectActivity(
   operations: ActivityOperationInput,
   mcpSessions: Map<string, McpSessionState>,
   workSessionWorkspace: ReadonlyMap<string, string>,
-  now = Date.now(),
-  limit = 100,
+  options: ActivityProjectionOptions = {},
 ): ActivityProjection {
+  const now = options.now ?? Date.now();
+  const limit = options.limit ?? 100;
+  const viewerPrincipalId = options.viewerPrincipalId;
   const sessions = sessionIndex(mcpSessions);
   let excluded = 0;
   const project = (records: Array<Record<string, unknown>>, isActive: boolean): ProjectedActivityRow[] => {
     const rows: ProjectedActivityRow[] = [];
     for (const record of records) {
-      const { row, excluded: isExcluded } = projectRow(record, sessions, now, isActive);
+      const { row, excluded: isExcluded } = projectRow(record, sessions, now, isActive, viewerPrincipalId);
       if (isExcluded || !row) {
         excluded++;
         continue;
