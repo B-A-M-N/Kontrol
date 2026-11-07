@@ -12,6 +12,7 @@ import { DEFAULT_DIRECT_APPROVAL_REATTACH_GRACE_MS } from "./policy-approval-def
 import { parseIngressProfilesEnv, validateIngressProfiles } from "./ingress/validate.js";
 import { isUnspecifiedAddress } from "./ingress/host-policy.js";
 import type { IngressConfig } from "./ingress/types.js";
+import { projectRootForModule, resolveStateDirectory, type StateOwnershipContext } from "./state-directory.js";
 
 export type ToolMode = "minimal" | "full" | "codex";
 export type WidgetMode = "off" | "changes" | "full";
@@ -40,6 +41,8 @@ export interface ServerConfig {
   /** Expose a tiny App SDK diagnostic resource/tool for host troubleshooting. */
   workspaceAppSmokeEnabled: boolean;
   stateDir: string;
+  /** State-directory ownership context (profile/launcher/checkout binding). */
+  stateAccess: StateOwnershipContext;
   worktreeRoot: string;
   managedWorktreeProjectLimit: number;
   managedWorktreeGlobalLimit: number;
@@ -756,6 +759,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     ...(files.config.allowedHosts ?? []),
   ];
 
+  // State-directory ownership (historical 2686c25d): profile/launcher
+  // validation, non-production refusal of the legacy production dir, and
+  // per-project hashed defaults for development/qualification. An explicit
+  // KONTROL_STATE_DIR (or config file) keeps its exact location.
+  const explicitStateDir = env.KONTROL_STATE_DIR ?? files.config.stateDir;
+  const stateResolution = resolveStateDirectory({
+    env,
+    projectRoot: projectRootForModule(import.meta.url),
+    configuredStateDir: explicitStateDir ? resolve(expandHomePath(explicitStateDir)) : undefined,
+  });
+  const stateAccess: StateOwnershipContext = {
+    profile: stateResolution.profile,
+    projectRoot: stateResolution.projectRoot,
+    launcherContext: stateResolution.launcherContext,
+  };
+
   const config: ServerConfig = {
     host,
     port,
@@ -774,7 +793,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     toolMode: parseToolMode(env),
     widgets: parseWidgetMode(env.KONTROL_WIDGETS),
     workspaceAppSmokeEnabled: env.KONTROL_DEV_WORKSPACE_APP_SMOKE === "1",
-    stateDir: resolve(expandHomePath(env.KONTROL_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),
+    stateDir: stateResolution.stateDir,
+    stateAccess,
     worktreeRoot: resolve(expandHomePath(env.KONTROL_WORKTREE_ROOT ?? files.config.worktreeRoot ?? defaultWorktreeRoot())),
     managedWorktreeProjectLimit: parsePositiveInteger(env.KONTROL_MANAGED_WORKTREE_PROJECT_LIMIT, 8, "KONTROL_MANAGED_WORKTREE_PROJECT_LIMIT"),
     managedWorktreeGlobalLimit: parsePositiveInteger(env.KONTROL_MANAGED_WORKTREE_GLOBAL_LIMIT, 32, "KONTROL_MANAGED_WORKTREE_GLOBAL_LIMIT"),

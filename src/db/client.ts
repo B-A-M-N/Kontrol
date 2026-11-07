@@ -6,6 +6,14 @@ import * as schema from "./schema.js";
 import { LATEST_SCHEMA_VERSION, assertDatabaseSchemaContract, migrateDatabase } from "./migrations.js";
 import { captureMigrationBackup, markMigrationCompleted, markMigrationFailed } from "./deployment-backup.js";
 import type { DeploymentContext } from "../runtime-context.js";
+import { claimStateDirectory, type StateOwnershipContext } from "../state-directory.js";
+
+export interface OpenDatabaseOptions extends DeploymentContext {
+  /** When present, the state-directory ownership fence runs before the
+   * writable open (verify-or-establish state-owner.json). Callers without
+   * a deployment context (tests, CLI utilities) omit it. */
+  stateAccess?: StateOwnershipContext;
+}
 
 export type SqliteDatabase = Database.Database;
 export type AppDatabase = ReturnType<typeof createDrizzleDatabase>;
@@ -48,7 +56,12 @@ export function inspectDatabase(stateDir: string): DatabaseHandle {
  * read from process.env deep inside the DB layer. Callers that predate the
  * context (tests, CLI utilities without a deployment) may omit it.
  */
-export function openDatabase(stateDir: string, deploymentContext: DeploymentContext = {}): DatabaseHandle {
+export function openDatabase(stateDir: string, deploymentContext: OpenDatabaseOptions = {}): DatabaseHandle {
+  // Ownership fence first: verify-or-establish state-owner.json before any
+  // writable SQLite open, so mixed profiles can never share a state dir.
+  if (deploymentContext.stateAccess) {
+    claimStateDirectory(stateDir, deploymentContext.stateAccess);
+  }
   const path = databasePath(stateDir);
   const existedBeforeOpen = existsSync(path);
   if (!existedBeforeOpen) mkdirSync(stateDir, { recursive: true, mode: 0o700 });

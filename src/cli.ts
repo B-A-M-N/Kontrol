@@ -1419,7 +1419,7 @@ function printHelp(): void {
       "  kontrol config get      Print persisted config",
       "  kontrol config set publicBaseUrl <url|null>",
       "  kontrol config effective-policy --json",
-      "  kontrol service install|start|stop|restart|upgrade|status|logs|uninstall|wait-core-ready|recover-tunnel",
+      "  kontrol service install|start|stop|restart|upgrade|status|logs|uninstall|wait-core-ready|recover-tunnel|adopt-state",
       "  kontrol snapshots stats|gc",
       "  kontrol review-loop status|on|off|pause|resume --session <workSessionId>",
       "  kontrol review submit [--message <text>] [--client-mutation-id <stable-id>] [--no-wait]   Submit from an agent PTY and await feedback",

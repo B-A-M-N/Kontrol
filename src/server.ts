@@ -325,6 +325,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     deploymentId: deploymentContext.deploymentId,
     expectedSchemaVersion: deploymentContext.expectedSchemaVersion,
     expectedBuildId: deploymentContext.expectedBuildId ?? (buildMeta.buildId ? brandBuildId(buildMeta.buildId) : undefined),
+    stateAccess: config.stateAccess,
   });
   const goalStore = createGoalStore(db);
   if (config.peer) restorePeerWorktreeOwners(config.stateDir);

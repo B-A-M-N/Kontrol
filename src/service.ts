@@ -1760,6 +1760,32 @@ async function runStatus(paths: ServicePaths, dependencies: ServiceCommandDepend
 export async function runServiceCommand(args: string[], env: NodeJS.ProcessEnv = process.env, dependencies: ServiceCommandDependencies = {}): Promise<void> {
   const [command] = args;
   const paths = servicePaths(env);
+  if (command === "adopt-state") {
+    // Explicit legacy-state adoption (historical 2686c25d): binds
+    // state-owner.json to the canonical production directory with a
+    // verified backup + migration ledger. Required before the ownership
+    // fence will open a pre-existing production database.
+    const { adoptLegacyProductionState } = await import("./state-adoption.js");
+    const { canonicalProductionDirectory } = await import("./state-directory.js");
+    const flagValue = (name: string): string | undefined => {
+      const index = args.indexOf(name);
+      return index === -1 ? undefined : args[index + 1];
+    };
+    const confirmedStateDir = flagValue("--confirm-state-dir");
+    const confirmedSchemaVersion = Number(flagValue("--confirm-schema-version"));
+    const canonicalDir = canonicalProductionDirectory(env);
+    if (!confirmedStateDir || !Number.isInteger(confirmedSchemaVersion)) {
+      throw new Error("Usage: kontrol service adopt-state --confirm-state-dir <canonical production dir> --confirm-schema-version <N>");
+    }
+    const result = await adoptLegacyProductionState({
+      stateDir: canonicalDir,
+      confirmedStateDir,
+      confirmedSchemaVersion,
+      canonicalProductionStateDir: canonicalDir,
+    });
+    console.log(JSON.stringify(result));
+    return;
+  }
   if (command === "unit" || command === "--print-unit") {
     const build = readServiceBuild(dependencies.currentArtifactPath?.() ?? compiledArtifactPath());
     const state = readInstalledState(paths) ?? {
