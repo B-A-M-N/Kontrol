@@ -473,12 +473,13 @@ function readInstalledState(paths: ServicePaths): InstalledServiceState | undefi
   return state;
 }
 
-function copyRelease(paths: ServicePaths, build: ServiceBuild): InstalledServiceState {
+function copyRelease(paths: ServicePaths, build: ServiceBuild): InstalledServiceState & { createdByThisTransaction: boolean } {
   // Verify the source artifact tree before copying: metadata alone is
   // never trusted for installation.
   assertArtifactContent(build.artifactPath);
   mkdirSync(paths.releasesRoot, { recursive: true, mode: 0o700 });
   const destination = join(paths.releasesRoot, build.buildId);
+  let createdByThisTransaction = false;
   if (!existsSync(destination)) {
     const temporary = join(paths.releasesRoot, `.install-${build.buildId}-${process.pid}-${randomUUID()}`);
     mkdirSync(temporary, { recursive: true, mode: 0o700 });
@@ -489,6 +490,7 @@ function copyRelease(paths: ServicePaths, build: ServiceBuild): InstalledService
       assertArtifactContent(temporary);
       readServiceBuild(temporary);
       renameSync(temporary, destination);
+      createdByThisTransaction = true;
     } finally {
       rmSync(temporary, { recursive: true, force: true });
     }
@@ -505,6 +507,7 @@ function copyRelease(paths: ServicePaths, build: ServiceBuild): InstalledService
     serviceName: paths.serviceName,
     deploymentId: `systemd-${build.buildId}-${randomUUID()}`,
     installedAt: new Date().toISOString(),
+    createdByThisTransaction,
   };
 }
 
@@ -1026,12 +1029,16 @@ async function install(paths: ServicePaths, dependencies: ServiceCommandDependen
         disableRemovedMembers(paths, removedMembers, dependencies);
         updateDeploymentRecord(paths, record, { stage: "commit" });
       } catch (error) {
-        // Best-effort cleanup of this install's own artifacts: the release
-        // copy is removed and units this install added are deleted, while
-        // pre-existing units are restored. The deployment journal keeps the
-        // failure for audit.
+        // Best-effort cleanup of this install's own artifacts: only a
+        // release directory THIS transaction created is deleted; a
+        // pre-existing installed release (even for the same build) is
+        // never removed, and units this install added are deleted,
+        // while pre-existing units are restored. The deployment journal
+        // keeps the failure for audit.
         try {
-          rmSync(state.artifactPath, { recursive: true, force: true });
+          if (state.createdByThisTransaction) {
+            rmSync(state.artifactPath, { recursive: true, force: true });
+          }
         } catch {
           // Leave the orphaned copy rather than masking the original error.
         }

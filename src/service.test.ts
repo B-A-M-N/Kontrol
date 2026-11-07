@@ -158,6 +158,28 @@ try {
     /Candidate build-b failed readiness; previous build build-a and database were restored/,
   );
 
+  // A failed reinstall of an already-installed build must never delete
+  // the pre-existing installed release: cleanup may only remove
+  // directories the failing transaction itself created.
+  const pathsBeforeReinstall = servicePaths(env);
+  const restoredStateEarly = JSON.parse(readFileSync(pathsBeforeReinstall.statePath, "utf8")) as { buildId: string; artifactPath: string };
+  const preExistingRelease = restoredStateEarly.artifactPath;
+  const priorBuildMeta = readFileSync(join(preExistingRelease, "build-meta.json"));
+  await assert.rejects(
+    () => runServiceCommand(["install"], env, {
+      ...dependencies,
+      currentArtifactPath: () => artifactA,
+      systemctl: (paths: ReturnType<typeof servicePaths>, args: string[]) => {
+        if (args[0] === "daemon-reload") throw new Error("fixture post-copy systemd failure");
+        return dependencies.systemctl(paths, args);
+      },
+    }),
+    /fixture post-copy systemd failure/,
+  );
+  assert.ok(existsSync(preExistingRelease), "pre-existing installed release survives a failed reinstall");
+  assert.deepEqual(readFileSync(join(preExistingRelease, "build-meta.json")), priorBuildMeta,
+    "pre-existing release bytes are untouched by the failed reinstall");
+
   const pathsAfterRollback = servicePaths(env);
   const restoredState = JSON.parse(readFileSync(pathsAfterRollback.statePath, "utf8")) as { buildId: string; artifactPath: string };
   assert.equal(restoredState.buildId, "build-a");
