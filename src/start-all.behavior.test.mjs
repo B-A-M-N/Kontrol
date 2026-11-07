@@ -254,6 +254,41 @@ writeExecutable(join(fakeBin, "tmux"), [
   "",
 ].join("\n"));
 
+// Hermetic systemctl: the launcher probes real systemd units through
+// lifecycle-cli (list-units) and may stop them during a fenced takeover.
+// A fixture must never observe or mutate the host's actual units, so this
+// shim serves list-units from a state file (empty unless the test seeds
+// FAKE_SYSTEMD_STATE), models stop by removing the named unit line, and
+// fails closed on any other operation instead of reaching the host binary.
+writeExecutable(join(fakeBin, "systemctl"), [
+  "#!/bin/sh",
+  "set -eu",
+  "state=\"${FAKE_SYSTEMD_STATE:-}\"",
+  "if [ \"$1\" = \"--user\" ]; then shift; fi",
+  "command=\"${1:-}\"",
+  "case \"$command\" in",
+  "  list-units)",
+  "    if [ -n \"$state\" ] && [ -f \"$state\" ]; then",
+  "      while IFS= read -r line; do",
+  "        [ -n \"$line\" ] && printf '%s\\n' \"$line\"",
+  "      done < \"$state\"",
+  "    fi",
+  "    exit 0",
+  "    ;;",
+  "  stop)",
+  "    unit=\"${2:-}\"",
+  "    if [ -n \"$state\" ] && [ -f \"$state\" ] && [ -n \"$unit\" ]; then",
+  "      grep -v -x -F \"$unit\" \"$state\" > \"$state.tmp\" || true",
+  "      mv \"$state.tmp\" \"$state\"",
+  "    fi",
+  "    exit 0",
+  "    ;;",
+  "esac",
+  "echo 'fixture systemctl: unexpected operation (host systemctl is never reached)' >&2",
+  "exit 1",
+  "",
+].join("\n"));
+
 writeExecutable(join(fakeBin, "npm"), [
   "#!/bin/sh",
   "set -eu",
@@ -792,6 +827,23 @@ try {
   assert.equal(readFileSync(join(successfulState, "generation.json"), "utf8"), JSON.stringify(activeGeneration, null, 2) + "\n");
   assert.equal(readFileSync(join(harnessRoot, "npm.log"), "utf8"), npmLogBeforeConflict, "rejected launch must not invoke the build gate");
   process.kill(activeLock.launcherPid, "SIGTERM");
+  stopFakeSessions();
+
+  // Fixture-modeled systemd ownership: with the hermetic systemctl shim
+  // reporting an active core, a tmux start must be fenced — and it must
+  // fence against the FIXTURE's units, never the host's real ones.
+  const systemdState = join(harnessRoot, "fake-systemd-units.txt");
+  writeFileSync(systemdState, "kontrol-core.service loaded active running\n");
+  const fencedEnv = writeEnvironment(join(harnessRoot, "state-fenced"), 17677, { useExistingDist: true });
+  const fenced = runLauncher(fencedEnv, { FAKE_SYSTEMD_STATE: systemdState });
+  assert.notEqual(fenced.status, 0, "tmux start against fixture-modeled active systemd must be refused");
+  assert.match(fenced.stdout + "\n" + fenced.stderr, /already owns|fenced|refus/i, `fenced launch output (status=${fenced.status}):\n${fenced.stdout}\n${fenced.stderr}`);
+  writeFileSync(systemdState, "");
+  const unfencedEnv = writeEnvironment(join(harnessRoot, "state-unfenced"), 17678, { useExistingDist: true });
+  const unfenced = runLauncher(unfencedEnv, { FAKE_SYSTEMD_STATE: systemdState });
+  assert.equal(unfenced.status, 0, "with the fixture systemctl reporting no units, the launch proceeds hermetically:\n" + unfenced.stdout + "\n" + unfenced.stderr);
+  const unfencedLock = JSON.parse(readFileSync(join(join(harnessRoot, "state-unfenced"), "runtime.lock"), "utf8"));
+  process.kill(unfencedLock.launcherPid, "SIGTERM");
   stopFakeSessions();
 
   // A clean restart after the process/supervisor disappeared may legitimately
