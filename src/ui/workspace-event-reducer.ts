@@ -260,6 +260,24 @@ export function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEv
       });
       view.unresolvedMessageCount = [...view.openMessages.values()].filter((message) => message.status === "open").length;
     }
+  } else if (event.type === "reviewer.browser_turn.leased"
+    || event.type === "reviewer.browser_turn.transition"
+    || event.type === "reviewer.browser_turn.terminal"
+    || event.type === "reviewer.browser_turn.settled") {
+    const attemptId = String(event.payload?.attemptId ?? "");
+    if (attemptId) {
+      const status = event.type === "reviewer.browser_turn.leased" ? "leased"
+        : event.type === "reviewer.browser_turn.transition" ? String(event.payload?.to ?? "transition")
+        : event.type === "reviewer.browser_turn.terminal" ? "terminal"
+        : "settled";
+      view.browserTurnStatus.set(attemptId, { status, updatedAt: event.createdAt });
+      host.render();
+    }
+  } else if (event.type === "review.handoff.superseded") {
+    void deliverQueuedReviewMessages().catch((error) => {
+      host.setErrorMessage(`Could not resync queued review submissions after supersede: ${error instanceof Error ? error.message : String(error)}`);
+      host.render();
+    });
   } else if (event.type === "review.handoff.created") {
     void deliverQueuedReviewMessages().catch((error) => {
       host.setErrorMessage(`Could not deliver the review submission to this WebUI context: ${error instanceof Error ? error.message : String(error)}`);

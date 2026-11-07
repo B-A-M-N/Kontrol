@@ -236,6 +236,8 @@ export interface WorkSessionViewState {
   policyGrantsError?: string;
   /** Open agent→WebUI questions/blockers awaiting a reviewer reply. */
   openMessages: Map<string, AgentMessageView>;
+  /** Latest durable browser-turn status per attempt (human-visible continuity). */
+  browserTurnStatus: Map<string, { status: string; updatedAt: string }>;
   activeSubmissionId?: string;
   feedbackStateBySubmission: Map<string, FeedbackState>;
   feedbackErrorBySubmission: Map<string, string>;

@@ -43,6 +43,7 @@ export function ensureWorkSessionView(workSessionId: string, workspaceSessionId:
       policyGrants: new Map(),
       policyGrantsLoaded: false,
       openMessages: new Map(),
+      browserTurnStatus: new Map(),
       feedbackStateBySubmission: new Map(),
       feedbackErrorBySubmission: new Map(),
     };

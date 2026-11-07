@@ -114,7 +114,14 @@ const TERMINAL_ELIGIBLE_STATES = [
   "uncertain", "blocked_auth", "blocked_browser",
 ] as const;
 
-export function createReviewerJobStore(database: DatabaseHandle): ReviewerJobStore {
+export type BrowserTurnEventSink = (type: string, sessionId: string, payload: Record<string, unknown>) => void;
+
+export function createReviewerJobStore(database: DatabaseHandle, options: { onEvent?: BrowserTurnEventSink } = {}): ReviewerJobStore {
+  const emit = options.onEvent;
+  const sessionForThread = (threadId: string): string | undefined =>
+    database.db.select({ workSessionId: reviewThreads.workSessionId }).from(reviewThreads).where(eq(reviewThreads.id, threadId)).get()?.workSessionId;
+  const sessionForHandoff = (handoffId: string): string | undefined =>
+    database.db.select({ workSessionId: reviewHandoffs.workSessionId }).from(reviewHandoffs).where(eq(reviewHandoffs.id, handoffId)).get()?.workSessionId;
   return {
     recordTerminalOutcome(input) {
       if (input.classification !== "reviewer_unrecoverable") {
@@ -130,7 +137,7 @@ export function createReviewerJobStore(database: DatabaseHandle): ReviewerJobSto
       }
       const now = new Date().toISOString();
       const evidenceSha256 = sha256(inspectionEvidence);
-      return database.sqlite.transaction(() => {
+      const outcome = database.sqlite.transaction(() => {
         const attempt = database.db.select().from(reviewBrowserTurns).where(eq(reviewBrowserTurns.id, input.attemptId)).get();
         if (!attempt || attempt.reviewThreadId !== input.reviewThreadId || attempt.routeEpoch !== input.routeEpoch) {
           throw new Error("The browser attempt is already terminal or was never dispatched; it cannot be declared terminal.");
@@ -186,6 +193,15 @@ export function createReviewerJobStore(database: DatabaseHandle): ReviewerJobSto
           lastProgressAt: attempt.lastProgressAt ?? undefined,
         };
       })();
+      const terminalSession = sessionForThread(input.reviewThreadId);
+      if (emit && terminalSession) {
+        emit("reviewer.browser_turn.terminal", terminalSession, {
+          attemptId: outcome.attemptId, classification: outcome.classification,
+          reasonCode: outcome.reasonCode, evidenceSha256: outcome.evidenceSha256,
+          routeEpoch: input.routeEpoch,
+        });
+      }
+      return outcome;
     },
     getTerminalOutcome(input) {
       const row = database.sqlite.prepare(`select r.attempt_id as attemptId, r.review_thread_id as reviewThreadId,
@@ -219,7 +235,7 @@ export function createReviewerJobStore(database: DatabaseHandle): ReviewerJobSto
       const leaseMs = Math.max(30_000, Math.min(input.leaseMs ?? 5 * 60_000, 30 * 60_000));
       const now = new Date();
       const nowIso = now.toISOString();
-      return database.sqlite.transaction(() => {
+      const claimed = database.sqlite.transaction(() => {
         const message = database.db.select().from(reviewThreadMessages).where(eq(reviewThreadMessages.id, input.messageId)).get();
         if (!message || message.status !== "queued") return undefined;
         const thread = database.db.select().from(reviewThreads).where(eq(reviewThreads.id, message.threadId)).get();
@@ -313,11 +329,24 @@ export function createReviewerJobStore(database: DatabaseHandle): ReviewerJobSto
           promptPayloadSha256: sha256(prompt), prompt,
         };
       })();
+      if (claimed && emit) {
+        const claimSession = sessionForThread(claimed.reviewThreadId);
+        if (claimSession) {
+          emit("reviewer.browser_turn.leased", claimSession, {
+            attemptId: claimed.attemptId, reviewThreadId: claimed.reviewThreadId,
+            routeEpoch: claimed.routeEpoch, attemptNumber: claimed.attemptNumber,
+            profileId: claimed.profileId, handoffId: claimed.handoffId,
+          });
+        }
+      }
+      return claimed;
     },
     transition(input) {
       const now = new Date().toISOString();
-      return database.sqlite.transaction(() => {
+      let fromState: string | undefined;
+      const attempted = database.sqlite.transaction(() => {
         const row = database.db.select().from(reviewBrowserTurns).where(eq(reviewBrowserTurns.id, input.attemptId)).get();
+        fromState = row?.state;
         if (!row || row.profileId !== input.profileId || row.browserGeneration !== input.browserGeneration
           || !row.leaseTokenSha256 || sha256(input.leaseToken) !== row.leaseTokenSha256
           || !row.leaseExpiresAt || Date.parse(row.leaseExpiresAt) <= Date.now() || !ACTIVE.includes(row.state as typeof ACTIVE[number])) {
@@ -363,6 +392,16 @@ export function createReviewerJobStore(database: DatabaseHandle): ReviewerJobSto
           .where(and(eq(reviewThreadMessages.id, row.reviewMessageId), eq(reviewThreadMessages.status, "presenting"))).run();
         return asAttempt(database.db.select().from(reviewBrowserTurns).where(eq(reviewBrowserTurns.id, row.id)).get()!);
       })();
+      if (emit) {
+        const transitionSession = sessionForThread(attempted.reviewThreadId);
+        if (transitionSession) {
+          emit("reviewer.browser_turn.transition", transitionSession, {
+            attemptId: attempted.id, from: fromState, to: input.nextStatus,
+            routeEpoch: attempted.routeEpoch, errorCode: input.errorCode ?? null,
+          });
+        }
+      }
+      return attempted;
     },
     recordPartialObservation(input) {
       if (input.textPrefix.length > PARTIAL_OBSERVATION_PREFIX_LIMIT) {
@@ -512,9 +551,17 @@ export function createReviewerJobStore(database: DatabaseHandle): ReviewerJobSto
     settleForFeedback(input) {
       const now = new Date().toISOString();
       const statuses = ACTIVE.map(() => "?").join(",");
-      database.sqlite.prepare(`update review_browser_turns set state = 'feedback_committed', feedback_committed_at = ?, lease_token_sha256 = null, lease_expires_at = null
+      const settled = database.sqlite.prepare(`update review_browser_turns set state = 'feedback_committed', feedback_committed_at = ?, lease_token_sha256 = null, lease_expires_at = null
         where route_epoch = ? and review_message_id in (select id from review_thread_messages where handoff_id = ?)
           and state in (${statuses})`).run(now, input.routeEpoch, input.handoffId, ...ACTIVE);
+      if (emit && settled.changes > 0) {
+        const settleSession = sessionForHandoff(input.handoffId);
+        if (settleSession) {
+          emit("reviewer.browser_turn.settled", settleSession, {
+            handoffId: input.handoffId, routeEpoch: input.routeEpoch, settled: settled.changes,
+          });
+        }
+      }
     },
     settleForAgentMessage(input) {
       const now = new Date().toISOString();

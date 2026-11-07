@@ -466,9 +466,19 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   const continuationManager = createContinuationManager(db);
   const dispatchOutbox = createDispatchOutbox(db);
   const scheduledJobs = createScheduledJobStore(db, dispatchOutbox);
-  const reviewRoutes = createReviewRouteStore(db);
+  const reviewRoutes = createReviewRouteStore(db, {
+    onEvent: (type, sessionId, payload) => {
+      const event = eventStore.appendEvent({ type, sessionId, payload }, { publish: false });
+      eventStore.publishEvents([event]);
+    },
+  });
   const reviewThreads = createReviewThreadStore(db);
-  const reviewBrowserJobs = createReviewerJobStore(db);
+  const reviewBrowserJobs = createReviewerJobStore(db, {
+    onEvent: (type, sessionId, payload) => {
+      const event = eventStore.appendEvent({ type, sessionId, payload }, { publish: false });
+      eventStore.publishEvents([event]);
+    },
+  });
   const reviewBrowserController = createReviewerBrowserController({
     database: db,
     stateDir: config.stateDir,

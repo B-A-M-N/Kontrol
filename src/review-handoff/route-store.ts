@@ -186,7 +186,10 @@ function rowToHandoff(row: ReviewHandoffRow): ReviewHandoff {
   };
 }
 
-export function createReviewRouteStore(database: DatabaseHandle): ReviewRouteStore {
+export type RouteStoreEventSink = (type: string, sessionId: string, payload: Record<string, unknown>) => void;
+
+export function createReviewRouteStore(database: DatabaseHandle, options: { onEvent?: RouteStoreEventSink } = {}): ReviewRouteStore {
+  const emit = options.onEvent;
   const supersedeRouteEpoch = (routeId: string, routeEpoch: number, now: string): void => {
     const threads = database.db.select({ id: reviewThreads.id }).from(reviewThreads).where(and(
       eq(reviewThreads.routeId, routeId), eq(reviewThreads.routeEpoch, routeEpoch),
@@ -224,6 +227,12 @@ export function createReviewRouteStore(database: DatabaseHandle): ReviewRouteSto
       sql`${reviewThreadMessages.threadId} in (select id from review_threads where route_id = ${routeId} and route_epoch = ${routeEpoch})`,
       sql`${reviewThreadMessages.status} in ('awaiting_activation', 'queued', 'presenting', 'reviewer_claimed')`,
     )).run();
+    if (emit) {
+      const route = database.db.select({ workSessionId: reviewRoutes.workSessionId }).from(reviewRoutes).where(eq(reviewRoutes.id, routeId)).get();
+      if (route) {
+        emit("review.handoff.superseded", route.workSessionId, { routeId, routeEpoch });
+      }
+    }
   };
   const syncThreadDeliveryStatus = (routeId: string, routeEpoch: number, status: "active" | "paused", now: string): void => {
     const threads = database.db.select().from(reviewThreads).where(and(
