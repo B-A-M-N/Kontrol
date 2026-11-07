@@ -33,6 +33,10 @@ export interface WorkSessionStoreDeps {
   /** Optional terminal-status observer (grant revocation in server.ts). */
   onTerminal?: (workSessionId: string) => void | Promise<void>;
   onTerminalFailure?: (workSessionId: string, error: unknown) => void;
+  /** Server-issued installation identity (state-owner stateId), bound at
+   * session creation. Restored rows from another installation keep their
+   * original value; claim paths refuse cross-installation access. */
+  installationId?: string;
 }
 
 export function createWorkSessionStore(deps: WorkSessionStoreDeps) {
@@ -83,6 +87,7 @@ export function createWorkSessionStore(deps: WorkSessionStoreDeps) {
       submittedBy: row.submittedBy,
       ownerContextId: row.ownerContextId ?? undefined,
       principalId: row.principalId ?? undefined,
+      installationId: row.installationId ?? undefined,
       title: row.title ?? undefined,
       lastConsumedFeedbackId: row.lastConsumedFeedbackId ?? undefined,
       lastConsumedReviewEpoch: row.lastConsumedReviewEpoch ?? 0,
@@ -141,6 +146,7 @@ export function createWorkSessionStore(deps: WorkSessionStoreDeps) {
             submittedBy: session.submittedBy,
             ownerContextId: session.ownerContextId ?? null,
             principalId: session.principalId ?? null,
+            installationId: deps.installationId ?? null,
             title: session.title ?? null,
             lastConsumedFeedbackId: null,
             lastConsumedReviewEpoch: 0,

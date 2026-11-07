@@ -327,6 +327,9 @@ export const workSessions = sqliteTable("work_sessions", {
   ownerContextId: text("owner_context_id"),
   /** Durable authenticated principal for reconnect-stable job ownership. */
   principalId: text("principal_id"),
+  /** Server-issued installation identity (state-owner stateId) at creation.
+   * Authenticated by the state-directory ownership fence, never self-asserted. */
+  installationId: text("installation_id"),
   title: text("title"),
   lastConsumedFeedbackId: text("last_consumed_feedback_id"),
   lastConsumedReviewEpoch: integer("last_consumed_review_epoch").notNull().default(0),
@@ -980,6 +983,7 @@ export const reviewRoutes = sqliteTable("review_routes", {
   workSessionId: text("work_session_id").notNull().references(() => workSessions.id, { onDelete: "cascade" }),
   ownerPrincipalId: text("owner_principal_id").notNull(),
   ownerContextId: text("owner_context_id").notNull(),
+  installationId: text("installation_id"),
   mode: text("mode").notNull().default("isolated_review"),
   deliveryPolicy: text("delivery_policy").notNull().default("explicit_user_action"),
   deliveryTransport: text("delivery_transport").notNull().default("mcp_app"),
@@ -1044,6 +1048,7 @@ export const reviewThreads = sqliteTable("review_threads", {
   routeEpoch: integer("route_epoch").notNull(),
   workSessionId: text("work_session_id").notNull().references(() => workSessions.id, { onDelete: "cascade" }),
   ownerPrincipalId: text("owner_principal_id").notNull(),
+  installationId: text("installation_id"),
   reviewerPrincipalId: text("reviewer_principal_id"),
   reviewerContextId: text("reviewer_context_id"),
   hostKind: text("host_kind").notNull().default("kontrol_ui"),

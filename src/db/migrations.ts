@@ -140,6 +140,7 @@ const migrations: Migration[] = [
   { version: 115, name: "review-browser-partial-observations", up: migrateReviewBrowserPartialObservations },
   { version: 116, name: "review-browser-terminal-outcome", up: migrateReviewBrowserTerminalOutcome },
   { version: 117, name: "review-mutation-reassessments", up: migrateReviewMutationReassessments },
+  { version: 118, name: "installation-binding", up: migrateInstallationBinding },
 ];
 
 function migrateWorkspaceGoals(sqlite: Database.Database): void {
@@ -362,6 +363,19 @@ function migrateReviewMutationReassessments(sqlite: Database.Database): void {
       on review_mutation_reassessments(workspace_id, work_session_id, created_at);
   `);
 }
+/**
+ * Installation identity binding (migration 118): server-issued state-owner
+ * stateId persisted on work sessions, review routes, and reviewer threads
+ * at creation. NULL = legacy row created before binding existed (accepted
+ * but flagged at claim time). A restored DB opened under a different
+ * installation mismatches and claim/activation refuses.
+ */
+function migrateInstallationBinding(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "work_sessions", "installation_id", "text");
+  addColumnIfMissing(sqlite, "review_routes", "installation_id", "text");
+  addColumnIfMissing(sqlite, "review_threads", "installation_id", "text");
+}
+
 
 function migrateApprovalCommandRedaction(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "approval_requests", "command_digest", "text");

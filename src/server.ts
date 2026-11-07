@@ -187,9 +187,9 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   // State-directory ownership fence first: verify-or-establish
   // state-owner.json before any component (OAuth store, managers) opens
   // the database, so mixed profiles can never share a state dir.
-  if (config.stateAccess) {
-    claimStateDirectory(config.stateDir, config.stateAccess);
-  }
+  const installationId = config.stateAccess
+    ? claimStateDirectory(config.stateDir, config.stateAccess).stateId
+    : undefined;
   // P0.3: module-level defaults are injected from parsed config, never read
   // from process.env at import time.
   setDefaultAcpTimeout(config.acpDispatchTimeoutMs);
@@ -447,6 +447,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   };
   let revokeWorkSessionGrants: ((workSessionId: string) => void) | undefined;
   const workSessions = createWorkSessionManager(db, {
+    installationId,
     onTerminal: async (workSessionId) => {
       revokeWorkSessionGrants?.(workSessionId);
       await processSessions.terminateByWorkSession(workSessionId);
@@ -478,8 +479,9 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
       const event = eventStore.appendEvent({ type, sessionId, payload }, { publish: false });
       eventStore.publishEvents([event]);
     },
+    installationId,
   });
-  const reviewThreads = createReviewThreadStore(db);
+  const reviewThreads = createReviewThreadStore(db, { installationId });
   const reviewBrowserJobs = createReviewerJobStore(db, {
     onEvent: (type, sessionId, payload) => {
       const event = eventStore.appendEvent({ type, sessionId, payload }, { publish: false });

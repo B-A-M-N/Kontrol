@@ -9,6 +9,7 @@ export interface ReviewThread {
   routeEpoch: number;
   workSessionId: string;
   ownerPrincipalId: string;
+  installationId?: string;
   reviewerPrincipalId?: string;
   reviewerContextId?: string;
   hostKind: string;
@@ -36,6 +37,7 @@ function asThread(row: typeof reviewThreads.$inferSelect): ReviewThread {
     routeEpoch: row.routeEpoch,
     workSessionId: row.workSessionId,
     ownerPrincipalId: row.ownerPrincipalId,
+    installationId: row.installationId ?? undefined,
     reviewerPrincipalId: row.reviewerPrincipalId ?? undefined,
     reviewerContextId: row.reviewerContextId ?? undefined,
     hostKind: row.hostKind,
@@ -82,7 +84,7 @@ export interface ReviewThreadStore {
   queueAgentMessage(input: { threadId: string; agentMessageId: string; kind: "clarification_request" | "blocker"; title?: string; body?: string }): typeof reviewThreadMessages.$inferSelect | undefined;
 }
 
-export function createReviewThreadStore(database: DatabaseHandle): ReviewThreadStore {
+export function createReviewThreadStore(database: DatabaseHandle, options: { installationId?: string } = {}): ReviewThreadStore {
   const getForRoute = (routeId: string, routeEpoch: number) => {
     const row = database.db.select().from(reviewThreads).where(and(
       eq(reviewThreads.routeId, routeId), eq(reviewThreads.routeEpoch, routeEpoch),
@@ -175,7 +177,8 @@ export function createReviewThreadStore(database: DatabaseHandle): ReviewThreadS
           const id = `rthread_${randomUUID()}`;
           database.db.insert(reviewThreads).values({
             id, routeId: route.id, routeEpoch: route.routeEpoch, workSessionId: route.workSessionId,
-            ownerPrincipalId: route.ownerPrincipalId, hostKind: "kontrol_ui", status: "pending_activation",
+            ownerPrincipalId: route.ownerPrincipalId, installationId: options.installationId ?? route.installationId ?? null,
+            hostKind: "kontrol_ui", status: "pending_activation",
             maxRounds: route.maxReviewRounds, revision: 1, createdAt: now.toISOString(),
           }).run();
           current = getForRoute(route.id, route.routeEpoch);
@@ -207,6 +210,11 @@ export function createReviewThreadStore(database: DatabaseHandle): ReviewThreadS
         if (!route || !thread || route.status !== "active" || route.routeEpoch !== grant.routeEpoch
           || thread.routeEpoch !== grant.routeEpoch || thread.status === "closed") {
           throw new Error("Review thread activation is stale for the current route.");
+        }
+        // Installation binding: never activate a thread created by a
+        // different installation into this instance.
+        if (options.installationId && thread.installationId && thread.installationId !== options.installationId) {
+          throw new Error("Review thread belongs to a different installation; this instance cannot activate it.");
         }
         const existingContextBinding = database.db.select().from(reviewThreads).where(and(
           eq(reviewThreads.reviewerPrincipalId, input.principalId),

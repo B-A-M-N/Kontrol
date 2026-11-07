@@ -22,6 +22,7 @@ export interface ReviewRoute {
   workSessionId: string;
   ownerPrincipalId: string;
   ownerContextId: string;
+  installationId?: string;
   mode: ReviewRouteMode;
   deliveryPolicy: "explicit_user_action" | "inbox_only";
   deliveryTransport: ReviewDeliveryTransport;
@@ -142,6 +143,7 @@ function rowToRoute(row: ReviewRouteRow): ReviewRoute {
     workSessionId: row.workSessionId,
     ownerPrincipalId: row.ownerPrincipalId,
     ownerContextId: row.ownerContextId,
+    installationId: row.installationId ?? undefined,
     mode: row.mode as ReviewRouteMode,
     deliveryPolicy: row.deliveryPolicy as "explicit_user_action" | "inbox_only",
     deliveryTransport: row.deliveryTransport as ReviewDeliveryTransport,
@@ -188,7 +190,7 @@ function rowToHandoff(row: ReviewHandoffRow): ReviewHandoff {
 
 export type RouteStoreEventSink = (type: string, sessionId: string, payload: Record<string, unknown>) => void;
 
-export function createReviewRouteStore(database: DatabaseHandle, options: { onEvent?: RouteStoreEventSink } = {}): ReviewRouteStore {
+export function createReviewRouteStore(database: DatabaseHandle, options: { onEvent?: RouteStoreEventSink; installationId?: string } = {}): ReviewRouteStore {
   const emit = options.onEvent;
   const supersedeRouteEpoch = (routeId: string, routeEpoch: number, now: string): void => {
     const threads = database.db.select({ id: reviewThreads.id }).from(reviewThreads).where(and(
@@ -312,6 +314,7 @@ export function createReviewRouteStore(database: DatabaseHandle, options: { onEv
             workSessionId: input.workSessionId,
             ownerPrincipalId: input.ownerPrincipalId,
             ownerContextId: input.ownerContextId,
+            installationId: options.installationId ?? null,
             mode: input.mode,
             deliveryPolicy: "explicit_user_action",
             deliveryTransport: requestedTransport,
@@ -501,6 +504,12 @@ export function createReviewRouteStore(database: DatabaseHandle, options: { onEv
         if (!route) throw new Error("Review route disappeared before claim.");
         if (handoff.routeEpoch !== route.routeEpoch || route.status !== "active") {
           throw new Error(`Review handoff is not claimable on a ${route.status} route with epoch ${route.routeEpoch}.`);
+        }
+        // Installation binding: a route created by a different installation
+        // (e.g. this DB restored into a new state dir) can never be claimed
+        // over — the installation id is server-issued, never self-asserted.
+        if (options.installationId && route.installationId && route.installationId !== options.installationId) {
+          throw new Error(`Review handoff belongs to a different installation (${route.installationId}); this instance (${options.installationId}) cannot claim it.`);
         }
         if (route.mode === "isolated_review") {
           if (!input.reviewThreadId) throw new Error("An activated reviewer thread is required to claim isolated review.");
