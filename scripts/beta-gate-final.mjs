@@ -5,7 +5,8 @@
 // probe run independently; qualify only when all evidence describes the same
 // candidate and the checkout is clean and unchanged at the final decision.
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MINIMUM_DEPLOYMENT_UPTIME_MS, validateBetaDeploymentUptimeReceipt, validateBetaFaultMatrix, validateBetaSoakAssertions } from "./beta-soak-contract.mjs";
@@ -238,6 +239,73 @@ const receipt = {
 };
 receipt.qualified = Object.values(receipt.checks).every(Boolean);
 receipt.status = receipt.qualified ? "qualified" : "failed";
+
+// Diagnostic qualification tiers: a view over the evidence above, never a
+// qualification authority. Code-qualified means the committed tree builds
+// and tests; artifact-qualified additionally re-hashes the candidate bytes
+// against its metadata; deployment-qualified additionally requires observed
+// soak, real deployment uptime, and a verified external transport. A passing
+// test suite is never presented as an operationally qualified deployment.
+function hashArtifactTree(directory) {
+  const hash = createHash("sha256").update("kontrol-release-format:4\n");
+  const walk = (current, relative) => {
+    for (const entry of readdirSync(current).sort()) {
+      const absolute = join(current, entry);
+      const rel = relative ? `${relative}/${entry}` : entry;
+      if (rel === "build-meta.json") continue;
+      const info = lstatSync(absolute);
+      if (info.isDirectory()) walk(absolute, rel);
+      else if (info.isFile()) hash.update(rel).update(readFileSync(absolute));
+      else throw new Error(`unsupported release entry ${rel}`);
+    }
+  };
+  walk(directory, "");
+  return hash.digest("hex").slice(0, 16);
+}
+
+let artifactContentVerified = false;
+let artifactHashError;
+if (candidate?.artifactPath && candidateMetadata?.contentSha256) {
+  try {
+    artifactContentVerified =
+      hashArtifactTree(resolve(root, candidate.artifactPath)) === candidateMetadata.contentSha256;
+  } catch (error) {
+    artifactHashError = error instanceof Error ? error.message : String(error);
+  }
+}
+const codeTierQualified = Boolean(code?.codeQualified === true && candidateIdentity && sourceUnchanged);
+const artifactTierQualified = Boolean(codeTierQualified && artifactContentVerified);
+const deploymentTierQualified = Boolean(
+  artifactTierQualified
+  && soakIdentity && soakAssertionsPass && deploymentUptimeQualified
+  && externalCatalogCheck.externalTransportVerified === true,
+);
+receipt.qualificationTiers = {
+  codeQualified: {
+    status: codeTierQualified ? "qualified" : "blocked",
+    evidence: { codeQualified: code?.codeQualified === true, candidateIdentity, sourceUnchanged },
+  },
+  artifactQualified: {
+    status: artifactTierQualified ? "qualified" : codeTierQualified ? "degraded" : "blocked",
+    evidence: { artifactContentVerified, ...(artifactHashError ? { artifactHashError } : {}) },
+  },
+  deploymentQualified: {
+    status: deploymentTierQualified ? "qualified" : artifactTierQualified ? "degraded" : "blocked",
+    evidence: {
+      soakIdentity,
+      soakAssertionsPass,
+      deploymentUptimeQualified,
+      externalTransportVerified: externalCatalogCheck.externalTransportVerified === true,
+    },
+  },
+};
+receipt.highestQualificationTier = receipt.qualificationTiers.deploymentQualified.status === "qualified"
+  ? "deployment-qualified"
+  : receipt.qualificationTiers.artifactQualified.status === "qualified"
+    ? "artifact-qualified"
+    : receipt.qualificationTiers.codeQualified.status === "qualified"
+      ? "code-qualified"
+      : "blocked";
 receipt.finishedAt = new Date().toISOString();
 writeReceipt(receipt);
 
