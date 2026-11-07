@@ -114,8 +114,8 @@ try {
   assert.equal(metadata.schemaVersion, metadata.maxReadableSchemaVersion);
   assert.equal(metadata.minReadableSchemaVersion, 0);
   assert.equal(metadata.schemaCompatibility, "upgrade-in-place; downgrade-via-versioned-backup");
-  assert.equal(metadata.releaseFormatVersion, 4);
-  assert.match(metadata.contentSha256, /^[a-f0-9]{16}$/);
+  assert.equal(metadata.releaseFormatVersion, 5);
+  assert.match(metadata.contentSha256, /^[a-f0-9]{64}$/);
 
   // Exercise the exact release probe used by start-all.sh. Static required-file
   // checks alone would not catch a relocated module whose import resolves

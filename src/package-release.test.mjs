@@ -500,22 +500,21 @@ async function exerciseInstalledServiceLifecycle(installedPkg, tmpRoot) {
   const candidate = join(rootDir, "candidate");
   mkdirSync(candidate, { recursive: true });
   const baseMeta = JSON.parse(readFileSync(join(installedPkg, "dist", "build-meta.json"), "utf8"));
-  // Seal the real content identity: installation recomputes the tree
-  // hash and refuses mismatched metadata before any readiness path runs.
+  // Seal the real content identity with the canonical v5 tree hash:
+  // installation recomputes the tree hash and refuses mismatched
+  // metadata before any readiness path runs.
+  const { treeContentSha256 } = await import(pathToFileURL(join(installedPkg, "dist", "release-integrity.js")).href);
   const candidateCli = "#!/usr/bin/env node\n";
-  const candidateContentSha = createHash("sha256")
-    .update("kontrol-release-format:4\n")
-    .update("cli.js")
-    .update(candidateCli)
-    .digest("hex").slice(0, 16);
+  writeFileSync(join(candidate, "cli.js"), candidateCli);
+  const candidateContentSha = treeContentSha256(candidate);
   const candidateMeta = {
     ...baseMeta,
+    releaseFormatVersion: 5,
     buildId: `${baseMeta.buildId}-candidate`,
     contentSha256: candidateContentSha,
     schemaVersion: Number(baseMeta.schemaVersion) + 1,
     maxReadableSchemaVersion: Number(baseMeta.maxReadableSchemaVersion) + 1,
   };
-  writeFileSync(join(candidate, "cli.js"), candidateCli);
   writeFileSync(join(candidate, "build-meta.json"), JSON.stringify(candidateMeta));
 
   // Hermetic operator configuration: without an explicit fixture config dir
