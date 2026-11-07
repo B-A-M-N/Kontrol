@@ -186,6 +186,20 @@ export function markMigrationRollbackWindowComplete(stateDir: string, deployment
   const prior = readDeploymentMigrationRecord(stateDir, deploymentId);
   if (!prior?.backupPath) return false;
   if (prior.migrationFailed || prior.restoredAt || !prior.migrationOccurred || !prior.rollbackRestoreRequired || !existsSync(prior.backupPath)) return false;
+  // The owning deployment transaction must be durably committed before
+  // rollback authority is relinquished: stage, deployment ID, selected
+  // build, and live schema all cross-checked. Anything less keeps the
+  // backup protected (fail-retain).
+  const deployment = readJsonRecord(join(stateDir, `deployment.${deploymentId}.json`));
+  if (!deployment || deployment.deploymentId !== deploymentId || deployment.stage !== "commit") {
+    throw new Error(`cannot close deployment ${deploymentId} rollback window: owning deployment record is not durably committed`);
+  }
+  const candidate = deployment.candidate as { buildId?: unknown } | undefined;
+  const selectedBuild = candidate && typeof candidate === "object" && typeof candidate.buildId === "string"
+    ? candidate.buildId : undefined;
+  if (!selectedBuild) {
+    throw new Error(`cannot close deployment ${deploymentId} rollback window: deployment record names no selected candidate build`);
+  }
   const current = currentDatabaseSchema(prior.databasePath);
   if (current !== prior.candidateSchemaVersion || prior.currentSchemaVersion !== current) {
     throw new Error(`cannot close deployment ${deploymentId} rollback window: database schema ${current} does not match completed candidate schema ${prior.candidateSchemaVersion}`);

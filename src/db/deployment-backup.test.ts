@@ -195,6 +195,22 @@ try {
   const { markMigrationCompleted, markMigrationRollbackWindowComplete } = await import("./deployment-backup.js");
   markMigrationCompleted(window, deploymentId, LATEST_SCHEMA_VERSION);
   sqlite.close();
+  // Without a durably committed owning deployment record the window must
+  // NOT close: closing first would strand a failed commit without
+  // rollback authority.
+  assert.throws(() => markMigrationRollbackWindowComplete(window, deploymentId), /not durably committed/,
+    "window close requires the owning deployment record at stage=commit");
+  assert.equal(readDeploymentMigrationRecord(window, deploymentId)?.rollbackRestoreRequired, true,
+    "failed close attempt keeps rollback authority");
+  // A pre-commit stage also refuses.
+  writeFileSync(join(window, `deployment.${deploymentId}.json`), JSON.stringify({
+    deploymentId, stage: "prepared", candidate: { buildId: "candidate-build" },
+  }));
+  assert.throws(() => markMigrationRollbackWindowComplete(window, deploymentId), /not durably committed/);
+  // Only the committed record closes the window.
+  writeFileSync(join(window, `deployment.${deploymentId}.json`), JSON.stringify({
+    deploymentId, stage: "commit", candidate: { buildId: "candidate-build" },
+  }));
   assert.equal(markMigrationRollbackWindowComplete(window, deploymentId), true);
   assert.equal(readDeploymentMigrationRecord(window, deploymentId)?.rollbackRestoreRequired, false);
   // A second close is a no-op (window already complete).

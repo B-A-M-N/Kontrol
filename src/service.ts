@@ -1428,14 +1428,18 @@ async function upgrade(paths: ServicePaths, dependencies: ServiceCommandDependen
       systemctl(paths, ["enable", "--now", "kontrol.target"], dependencies);
       await (dependencies.waitForReady?.(paths, candidate) ?? waitForReady(paths, candidate));
       verifyAuxiliariesActive(manifest, dependencies);
-      // The rollback window ends only after the candidate is ready and the
-      // live schema still matches it. Retain the backup on any uncertainty.
+      // The rollback window ends only after the candidate is ready, the
+      // deployment transaction has durably committed, and the live schema
+      // still matches it. Rollback authority is preserved through every
+      // pre-commit failure path: closing the window before the commit
+      // write would leave a failed commit unrecoverable. An unverifiable
+      // close fails retentive (backup stays protected), never additive.
+      updateDeploymentRecord(paths, record, { stage: "commit" });
       try {
         markMigrationRollbackWindowComplete(paths.stateDir, deploymentId);
       } catch {
         // Fail-retain: an unverifiable window keeps its backup protected.
       }
-      updateDeploymentRecord(paths, record, { stage: "commit" });
       return;
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
