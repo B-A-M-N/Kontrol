@@ -21,7 +21,7 @@ export interface StateOwnershipContext {
 
 const LAUNCHERS_BY_PROFILE: Readonly<Record<StateProfile, ReadonlySet<string>>> = {
   development: new Set(["dev-watch", "serve"]),
-  qualification: new Set(["qualification"]),
+  qualification: new Set(["qualification", "release-smoke"]),
   production: new Set(["systemd"]),
 };
 
@@ -82,7 +82,7 @@ export function resolveStateDirectory(options: {
   }
   const requestedProfile = env.KONTROL_STATE_PROFILE;
   const launcherContext = env.KONTROL_LAUNCHER?.trim() || (options.defaultProfile === "qualification" ? "qualification" : options.defaultProfile === "production" ? "systemd" : "serve");
-  const inferredProfile: StateProfile = launcherContext === "systemd" ? "production" : launcherContext === "qualification" ? "qualification" : options.defaultProfile ?? "development";
+  const inferredProfile: StateProfile = launcherContext === "systemd" ? "production" : launcherContext === "qualification" || launcherContext === "release-smoke" ? "qualification" : options.defaultProfile ?? "development";
   const profile = requestedProfile ?? inferredProfile;
   if (profile !== "development" && profile !== "qualification" && profile !== "production") {
     throw new Error(`Invalid KONTROL_STATE_PROFILE: ${profile}. Expected development, qualification, or production.`);

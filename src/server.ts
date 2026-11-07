@@ -84,6 +84,7 @@ import { createSupervisorRuns } from "./supervisor-runs.js";
 import { shutdownMissionVerifiers } from "./mission-verifier.js";
 import { createReviewWorkflowService, type ReviewWorkflowService } from "./review-workflow.js";
 import { databasePath, openDatabase, type DatabaseHandle } from "./db/client.js";
+import { claimStateDirectory } from "./state-directory.js";
 import { pruneUnreferencedMigrationBackups } from "./db/deployment-backup.js";
 import { inspectDatabaseSchemaContract, LATEST_SCHEMA_VERSION } from "./db/migrations.js";
 import { createPolicyEngine, policyCanAsk, type PolicyConfig, type PolicyEngine, type ApprovalScope } from "./policy.js";
@@ -183,6 +184,12 @@ export { type RunningServer } from "./server/mcp-session-state.js";
 
 
 export function createServer(config = loadConfig(), deploymentContext: DeploymentContext = resolveDeploymentContext()): RunningServer {
+  // State-directory ownership fence first: verify-or-establish
+  // state-owner.json before any component (OAuth store, managers) opens
+  // the database, so mixed profiles can never share a state dir.
+  if (config.stateAccess) {
+    claimStateDirectory(config.stateDir, config.stateAccess);
+  }
   // P0.3: module-level defaults are injected from parsed config, never read
   // from process.env at import time.
   setDefaultAcpTimeout(config.acpDispatchTimeoutMs);

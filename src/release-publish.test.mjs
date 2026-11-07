@@ -25,8 +25,10 @@ import { execFileSync, spawnSync } from "node:child_process";
 import {
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -61,6 +63,23 @@ function writeCandidate(root, buildId, gitSha) {
   }
   const workspaceAppHtml = "<!doctype html>\n";
   writeFileSync(join(candidate, "ui", "workspace-app.html"), workspaceAppHtml);
+  // Seal the real content identity: release verification recomputes the
+  // tree hash and rejects metadata that does not match the bytes.
+  const contentSha256 = (() => {
+    const hash = createHash("sha256").update("kontrol-release-format:4\n");
+    const walk = (dir, rel) => {
+      for (const entry of readdirSync(dir).sort()) {
+        const abs = join(dir, entry);
+        const relative = rel ? `${rel}/${entry}` : entry;
+        if (relative === "build-meta.json") continue;
+        const info = lstatSync(abs);
+        if (info.isDirectory()) walk(abs, relative);
+        else if (info.isFile()) hash.update(relative).update(readFileSync(abs));
+      }
+    };
+    walk(candidate, "");
+    return hash.digest("hex").slice(0, 16);
+  })();
   const manifest = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
   const lock = JSON.parse(readFileSync(join(repoRoot, "package-lock.json"), "utf8"));
   const declared = { ...(manifest.dependencies ?? {}), ...(manifest.optionalDependencies ?? {}) };
@@ -72,7 +91,7 @@ function writeCandidate(root, buildId, gitSha) {
   writeFileSync(join(candidate, "build-meta.json"), `${JSON.stringify({
     buildId,
     gitSha,
-    contentSha256: "0123456789abcdef0123456789abcdef",
+    contentSha256,
     schemaVersion: 0,
     minReadableSchemaVersion: 0,
     maxReadableSchemaVersion: 0,
