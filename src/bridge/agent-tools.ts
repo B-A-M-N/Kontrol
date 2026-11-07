@@ -113,7 +113,7 @@ export function registerAgentTools(server: McpServer, config: BridgeConfig): voi
       annotations: { readOnlyHint: false },
     },
     config,
-    async ({ agentName, task, dispatchIntent = "required_delegate", workspaceId, workspaceSessionId, workSessionId, sessionId, agentUrl, webhookUrl }) => {
+    async ({ agentName, task, dispatchIntent = "required_delegate", workspaceId, workspaceSessionId, workSessionId, sessionId, agentUrl, webhookUrl, clientMutationId }) => {
       if (!isReviewer(config.principalRole)) {
         return forbidden(config.principalRole, "call_acp_agent");
       }
@@ -134,6 +134,7 @@ export function registerAgentTools(server: McpServer, config: BridgeConfig): voi
         // session may be reused without the strict review-gate checks that
         // submit_to_coding_agent enforces. Terminal sessions still fail closed.
         allowNonReviewSessionReuse: true,
+        clientMutationId,
       });
       const displayName = result.agentName ?? agentName;
       if (result.status === "unavailable") {

@@ -54,7 +54,7 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
       annotations: { readOnlyHint: false },
     },
     config,
-    async ({ task, dispatchIntent = "optional_assist", workspaceId, workspaceSessionId, workSessionId, sessionId, agentName, completionPolicy, missionContract }) => {
+    async ({ task, dispatchIntent = "optional_assist", workspaceId, workspaceSessionId, workSessionId, sessionId, agentName, completionPolicy, missionContract, clientMutationId }) => {
       if (!isReviewer(config.principalRole)) {
         return forbidden(config.principalRole, "submit_to_coding_agent");
       }
@@ -73,6 +73,7 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
         dispatchIntent,
         completionPolicy,
         mission: missionContract,
+        clientMutationId,
       });
       if (result.status === "unavailable") {
         if (dispatchIntent === "optional_assist") {

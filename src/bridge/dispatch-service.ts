@@ -22,6 +22,7 @@
  * work-session / registry / event stores.
  */
 import { callRemoteAgent, selectHealthyAgent } from "../acp-gateway.js";
+import { checkDispatchReplay, deriveStableDispatchKey } from "./dispatch-identity.js";
 import type { BridgeConfig } from "./context.js";
 import type { MissionCriterionInput, WorkOrderInput } from "../mission-ledger.js";
 import type { ApprovalMode, AutonomyMode, SupervisorStatus } from "../supervisor-runs.js";
@@ -52,6 +53,9 @@ export interface DurableDispatchInput {
    * checks still apply. Default false (fail closed).
    */
   allowNonReviewSessionReuse?: boolean;
+  /** Caller-supplied mutation id (stable per retried request). Becomes the
+   * dispatch intent when present; the mutation-receipt store keys on it too. */
+  clientMutationId?: string;
   mission?: {
     objective: string;
     desiredOutcome?: string;
@@ -227,6 +231,56 @@ export async function dispatchToRegisteredAgent(
     ? config.agentRegistry.getLatestDispatchAttemptForRun(runBeforeDispatch.runId)?.dispatchIdempotencyKey
     : undefined;
 
+  // --- Stable dispatch identity (replay-safe across retries/crashes) ---
+  // Derived from the delivery intent, never minted per call. A pre-flight
+  // replay check short-circuits an intent that already reached an adapter
+  // (accepted) or may have (dispatching/uncertain) without a second POST.
+  const wsForIdentity = config.workSessions.get(wsId);
+  const stableDispatchKey = deriveStableDispatchKey(config.agentRegistry, runBeforeDispatch?.runId, {
+    workSessionId: wsId,
+    intentId: input.clientMutationId ?? (createdSessionForDispatch ? "initial" : (wsForIdentity?.latestFeedback?.id ?? "initial")),
+    feedbackEpoch: wsForIdentity?.reviewEpoch ?? 0,
+    latestFeedbackId: wsForIdentity?.latestFeedback?.id,
+    agentId: peer.id,
+    task: `${task}\n\n${workSessionInstructions(wsId, peer)}`,
+  });
+  const replay = checkDispatchReplay(config.agentRegistry, stableDispatchKey);
+  if (replay.kind !== "none") {
+    const attempt = replay.attempt!;
+    if (replay.kind === "accepted") {
+      config.eventStore.appendEvent({
+        type: "agent.dispatch.replayed",
+        sessionId: wsId,
+        payload: { dispatchIdempotencyKey: stableDispatchKey, runId: attempt.runId, remoteRunId: attempt.remoteRunId },
+      });
+      return {
+        status: "accepted",
+        runId: attempt.runId,
+        remoteRunId: attempt.remoteRunId,
+        workSessionId: wsId,
+        workspaceSessionId,
+        agentName: selectedAgentName,
+        agentId: peer.id,
+        text: "Dispatch intent replayed: the recorded run was returned without a new dispatch.",
+      };
+    }
+    config.eventStore.appendEvent({
+      type: "agent.dispatch.uncertain",
+      sessionId: wsId,
+      payload: { dispatchIdempotencyKey: stableDispatchKey, runId: attempt.runId, reason: "replay_requires_reconciliation" },
+    });
+    return {
+      status: "uncertain",
+      runId: attempt.runId,
+      workSessionId: wsId,
+      workspaceSessionId,
+      agentName: selectedAgentName,
+      agentId: peer.id,
+      error: "Dispatch acceptance is uncertain. The recorded intent may already have reached the adapter; reconciliation is required before any retry.",
+      text: "Dispatch acceptance is uncertain; reconcile before retrying.",
+    };
+  }
+
   let supervisorRun: SupervisorRunLike | undefined;
   const rollbackDispatch = (reason: string, runId?: string) => {
     if (createdSessionForDispatch) {
@@ -303,6 +357,8 @@ export async function dispatchToRegisteredAgent(
         task: `${dispatchTask}\n\n${workSessionInstructions(wsId, peer)}`,
         workspaceSessionId,
         workSessionId: wsId,
+        dispatchIdempotencyKey: stableDispatchKey,
+        existingRunId: runBeforeDispatch?.runId,
         ...checkoutLeaseMetadata(config, wsId),
         mode: "async",
         fireAndForget: true,

@@ -1,6 +1,6 @@
 import { randomUUID, createHash, timingSafeEqual } from "node:crypto";
 import { brandRunId, brandWorkSessionId, brandWorkspaceId, type RunId, type WorkSessionId, type WorkspaceId } from "./branded.js";
-import { eq, and, lt, desc, sql } from "drizzle-orm";
+import { eq, and, asc, lt, desc, sql } from "drizzle-orm";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import { validateWebhookUrl, type WebhookPolicy } from "./webhook-policy.js";
 import {
@@ -251,6 +251,7 @@ export interface AgentRegistryManager {
   getRunByDispatchIdempotencyKey(key: string): PersistentAcpRun | undefined;
   getDispatchAttemptByIdempotencyKey(key: string): PersistentAcpDispatchAttempt | undefined;
   getLatestDispatchAttemptForRun(runId: string): PersistentAcpDispatchAttempt | undefined;
+  listDispatchAttemptsForRun(runId: string): PersistentAcpDispatchAttempt[];
   beginDispatchAttempt(input: { key: string; runId: string; agentId?: string; attemptNumber: number }): void;
   updateDispatchAttempt(key: string, input: { status: string; remoteRunId?: string }): void;
   listRuns(workspaceSessionId?: string, limit?: number): PersistentAcpRun[];
@@ -708,6 +709,23 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
     };
+  }
+
+  listDispatchAttemptsForRun(runId: string): PersistentAcpDispatchAttempt[] {
+    return this.database.db.select().from(acpRunDispatchAttempts)
+      .where(eq(acpRunDispatchAttempts.runId, runId))
+      .orderBy(asc(acpRunDispatchAttempts.attemptNumber), asc(acpRunDispatchAttempts.createdAt))
+      .all()
+      .map((row) => ({
+        dispatchIdempotencyKey: row.dispatchIdempotencyKey,
+        runId: row.runId,
+        agentId: row.agentId ?? undefined,
+        attemptNumber: row.attemptNumber,
+        remoteRunId: row.remoteRunId ?? undefined,
+        status: row.status,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      }));
   }
 
   getLatestDispatchAttemptForRun(runId: string): PersistentAcpDispatchAttempt | undefined {

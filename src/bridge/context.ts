@@ -7,6 +7,7 @@
  */
 export type { LiveWaiterRegistry } from "./shared.js";
 import { callRemoteAgent, selectHealthyAgent } from "../acp-gateway.js";
+import { deriveStableDispatchKey } from "./dispatch-identity.js";
 import type { AgentRegistryManager } from "../acp-registry.js";
 import type { AgentMessageManager } from "../agent-messages.js";
 import type { ServerConfig } from "../config.js";
@@ -267,6 +268,7 @@ export async function dispatchAgentTask(
     agentName?: string;
     completionPolicy?: "agent_completion" | "webui_approval_required";
     appendSessionInstructions?: boolean;
+    clientMutationId?: string;
   },
 ) {
   const startedAt = performance.now();
@@ -300,6 +302,15 @@ export async function dispatchAgentTask(
         task,
         workspaceSessionId: input.workspaceSessionId,
         workSessionId: wsId,
+        dispatchIdempotencyKey: deriveStableDispatchKey(config.agentRegistry, config.agentRegistry.getRunByWorkSessionId(wsId)?.runId, {
+          workSessionId: wsId,
+          intentId: input.clientMutationId ?? "initial",
+          feedbackEpoch: config.workSessions.get(wsId)?.reviewEpoch ?? 0,
+          latestFeedbackId: config.workSessions.get(wsId)?.latestFeedback?.id,
+          agentId: selection.agent.id,
+          task,
+        }),
+        existingRunId: config.agentRegistry.getRunByWorkSessionId(wsId)?.runId,
         ...checkoutLeaseMetadata(config, wsId),
         mode: "async",
         fireAndForget: true,

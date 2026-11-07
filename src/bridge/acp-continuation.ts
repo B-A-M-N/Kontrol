@@ -3,6 +3,7 @@
  */
 import { createHash } from "node:crypto";
 import { callRemoteAgent, selectHealthyAgent } from "../acp-gateway.js";
+import { deriveStableDispatchKey } from "./dispatch-identity.js";
 import type { AgentCallResult } from "../acp-gateway.js";
 import { DEFAULT_CLAIM_LEASE_MS } from "../continuation.js";
 import type { Continuation } from "../continuation.js";
@@ -59,6 +60,14 @@ export async function defaultResume(
       workspaceSessionId: session.workspaceSessionId,
       workSessionId: continuation.sessionId,
       existingRunId: run?.runId,
+      dispatchIdempotencyKey: deriveStableDispatchKey(config.agentRegistry, run?.runId, {
+        workSessionId: continuation.sessionId,
+        intentId: continuation.id,
+        feedbackEpoch: continuation.reviewEpoch,
+        latestFeedbackId: continuation.feedbackEventId,
+        agentId: agent?.id ?? agentName,
+        task,
+      }),
       continuationId: continuation.id,
       ...(contextTransfer ? { contextTransfer } : {}),
       ...checkoutLeaseMetadata(config, continuation.sessionId),
