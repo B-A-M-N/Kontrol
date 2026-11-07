@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -13,17 +14,26 @@ import { LATEST_SCHEMA_VERSION } from "./db/migrations.js";
 import { probeTunnelChannel, readServiceBuild, recoverTunnel, renderServiceComponentUnit, renderUserServiceUnit, requireTunnelReviewerWiring, runServiceCommand, servicePaths, waitForCoreReady, withTunnelReviewerAuth } from "./service.js";
 import { writeKontrolAuth, writeKontrolConfig } from "./user-config.js";
 
+// Seal a fixture artifact with its real content identity (tree hash over
+// every file except build-meta.json) so install-time verification passes.
+function sealFixtureArtifact(path: string, buildId: string, schemaVersion: number, extra: Record<string, unknown> = {}): void {
+  const hash = createHash("sha256").update("kontrol-release-format:4\n");
+  hash.update("cli.js").update(readFileSync(join(path, "cli.js")));
+  writeFileSync(join(path, "build-meta.json"), JSON.stringify({
+    buildId,
+    contentSha256: hash.digest("hex").slice(0, 16),
+    schemaVersion,
+    minReadableSchemaVersion: 0,
+    maxReadableSchemaVersion: schemaVersion,
+    ...extra,
+  }));
+}
+
 const root = mkdtempSync(join(tmpdir(), "kontrol-service-test-"));
 const artifact = join(root, "release with spaces");
 mkdirSync(artifact, { recursive: true });
 writeFileSync(join(artifact, "cli.js"), "#!/usr/bin/env node\n");
-writeFileSync(join(artifact, "build-meta.json"), JSON.stringify({
-  buildId: "build-test-1",
-  contentSha256: "0123456789abcdef",
-  schemaVersion: 52,
-  minReadableSchemaVersion: 0,
-  maxReadableSchemaVersion: 52,
-}));
+sealFixtureArtifact(artifact, "build-test-1", 52);
 
 const build = readServiceBuild(artifact);
 assert.equal(build.buildId, "build-test-1");
@@ -77,13 +87,7 @@ try {
   const writeArtifact = (path: string, buildId: string, contentSha256: string, schemaVersion: number) => {
     mkdirSync(path, { recursive: true });
     writeFileSync(join(path, "cli.js"), `#!/usr/bin/env node\n// ${buildId}\n`);
-    writeFileSync(join(path, "build-meta.json"), JSON.stringify({
-      buildId,
-      contentSha256,
-      schemaVersion,
-      minReadableSchemaVersion: 0,
-      maxReadableSchemaVersion: schemaVersion,
-    }));
+    sealFixtureArtifact(path, buildId, schemaVersion);
   };
   writeArtifact(artifactA, "build-a", "aaaaaaaaaaaaaaaa", LATEST_SCHEMA_VERSION);
   writeArtifact(artifactB, "build-b", "bbbbbbbbbbbbbbbb", LATEST_SCHEMA_VERSION + 1);
@@ -416,13 +420,7 @@ try {
       const path = join(gateRoot, dirName);
       mkdirSync(path, { recursive: true });
       writeFileSync(join(path, "cli.js"), "#!/usr/bin/env node\n");
-      writeFileSync(join(path, "build-meta.json"), JSON.stringify({
-        buildId,
-        contentSha256: "aaaaaaaaaaaaaaaa",
-        schemaVersion,
-        minReadableSchemaVersion: minReadable,
-        maxReadableSchemaVersion: maxReadable,
-      }));
+      sealFixtureArtifact(path, buildId, schemaVersion, { minReadableSchemaVersion: minReadable, maxReadableSchemaVersion: maxReadable });
       return path;
     };
     const writeRawDb = (stateDir: string, version: number): void => {

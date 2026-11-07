@@ -27,6 +27,7 @@ import {
 import { loadPolicyConfig, policyCanAsk } from "./policy.js";
 import { acquireDeploymentLock, releaseDeploymentLock, type DeploymentLockHandle } from "./deployment-lock.js";
 import { markMigrationRollbackWindowComplete, restoreDeploymentDatabaseBackup } from "./db/deployment-backup.js";
+import { assertArtifactContent } from "./release-integrity.js";
 
 export interface ServiceBuild {
   artifactPath: string;
@@ -470,6 +471,9 @@ function readInstalledState(paths: ServicePaths): InstalledServiceState | undefi
 }
 
 function copyRelease(paths: ServicePaths, build: ServiceBuild): InstalledServiceState {
+  // Verify the source artifact tree before copying: metadata alone is
+  // never trusted for installation.
+  assertArtifactContent(build.artifactPath);
   mkdirSync(paths.releasesRoot, { recursive: true, mode: 0o700 });
   const destination = join(paths.releasesRoot, build.buildId);
   if (!existsSync(destination)) {
@@ -479,12 +483,14 @@ function copyRelease(paths: ServicePaths, build: ServiceBuild): InstalledService
       for (const entry of readdirSync(build.artifactPath)) {
         cpSync(join(build.artifactPath, entry), join(temporary, entry), { recursive: true });
       }
+      assertArtifactContent(temporary);
       readServiceBuild(temporary);
       renameSync(temporary, destination);
     } finally {
       rmSync(temporary, { recursive: true, force: true });
     }
   } else {
+    assertArtifactContent(destination);
     const installed = readServiceBuild(destination);
     if (installed.buildId !== build.buildId || installed.contentSha256 !== build.contentSha256) {
       throw new Error(`Immutable release identity collision at ${destination}`);

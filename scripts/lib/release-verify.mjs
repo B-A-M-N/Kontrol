@@ -19,6 +19,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import { validateRelease } from "./validate-release.mjs";
+import { verifyReleaseArtifact } from "./release-retention.mjs";
 
 export class ReleaseVerificationError extends Error {
   constructor(message) {
@@ -79,7 +80,7 @@ export function verifyCheckoutIdentity(root, receipt) {
   return head;
 }
 
-export function verifyCandidateArtifact(root, requestedBuildId, head) {
+export function verifyCandidateArtifact(root, requestedBuildId, head, expectedContentSha256) {
   let candidatePath;
   let metadata;
   try {
@@ -97,6 +98,19 @@ export function verifyCandidateArtifact(root, requestedBuildId, head) {
   }
   if (metadata.gitSha && metadata.gitSha !== head) {
     fail(`candidate artifact was built from ${String(metadata.gitSha).slice(0, 12)}, not this checkout (${head.slice(0, 12)})`);
+  }
+  // Bind the receipt to the artifact's actual bytes, not just its metadata:
+  // recompute the content identity over the tree and compare with both the
+  // recorded metadata and the receipt's candidate content identity.
+  const verification = verifyReleaseArtifact(candidatePath);
+  if (!verification.ok) {
+    fail(`candidate artifact content does not verify: ${verification.reason}`);
+  }
+  if (metadata.contentSha256 && verification.contentSha256 !== metadata.contentSha256) {
+    fail(`candidate artifact content identity ${verification.contentSha256} does not match its metadata ${metadata.contentSha256}`);
+  }
+  if (expectedContentSha256 && verification.contentSha256 !== expectedContentSha256) {
+    fail(`candidate artifact content identity ${verification.contentSha256} does not match the qualification receipt ${expectedContentSha256}`);
   }
   return candidatePath;
 }
@@ -121,7 +135,7 @@ export function verifyQualifiedRelease(options = {}) {
   }
 
   const head = verifyCheckoutIdentity(root, receipt);
-  const candidatePath = verifyCandidateArtifact(root, requestedBuildId, head);
+  const candidatePath = verifyCandidateArtifact(root, requestedBuildId, head, receipt.candidate?.metadata?.contentSha256 ?? receipt.candidate?.contentSha256);
 
   try {
     validateRelease(candidatePath);

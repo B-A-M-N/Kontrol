@@ -20,6 +20,38 @@ const resultPath = process.env.KONTROL_BUILD_RESULT_PATH
 
 rmSync(resultPath, { force: true });
 
+// Build-source gate (historical 67e73cc0): when the caller declares an
+// expected source (KONTROL_EXPECTED_SOURCE_SHA), the build refuses to run
+// from any other commit or a dirty tree, and re-checks before publishing so
+// a source change mid-build cannot silently enter the artifact.
+function gitHead() {
+  try {
+    return execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+function assertBuildSource(expectedHead) {
+  const head = gitHead();
+  if (expectedHead !== undefined && head !== expectedHead) {
+    throw new Error(`build source changed during build: expected ${expectedHead}, got ${head ?? "unknown"}`);
+  }
+  const expected = process.env.KONTROL_EXPECTED_SOURCE_SHA;
+  if (expected) {
+    if (head !== expected) {
+      throw new Error(`build source ${head ?? "unknown"} does not match expected ${expected}; refusing to build from a different commit`);
+    }
+    if (process.env.KONTROL_RELEASE_QUALIFICATION === "1") {
+      const dirty = execFileSync("git", ["status", "--porcelain"], { cwd: root, encoding: "utf8" }).trim();
+      if (dirty) {
+        throw new Error(`build source tree is dirty under release qualification (${dirty.split("\n").length} changed paths); refusing to build an unqualified candidate`);
+      }
+    }
+  }
+  return head;
+}
+
 function run(command, args, environment = {}) {
   execFileSync(command, args, {
     cwd: root,
@@ -144,6 +176,7 @@ try {
   // Every producer writes only to the isolated candidate tree. The live dist/
   // directory is untouched until all source, UI, metadata, and entrypoint
   // checks pass.
+  const buildStartHead = assertBuildSource();
   runNpm(["run", "build:app"]);
   run(process.execPath, [
     join(root, "node_modules", "typescript", "bin", "tsc"),
@@ -211,6 +244,8 @@ try {
   }
 
   run(process.execPath, ["scripts/validate-release.mjs", tempDist]);
+
+  assertBuildSource(buildStartHead);
 
   const releasePath = join(releasesDir, buildId);
   mkdirSync(releasesDir, { recursive: true });
