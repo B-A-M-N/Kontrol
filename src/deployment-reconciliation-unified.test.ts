@@ -115,6 +115,21 @@ try {
   assert.equal(inspectUnifiedDeploymentReconciliation(servicePaths, { observeSystemd }).status, "DRIFT",
     "a generation mismatch remains DRIFT even when every other evidence source passes");
 
+  // A generation record from a DIFFERENT artifact root (e.g. a tmux-track
+  // record in a devspace checkout while systemd serves the state dir)
+  // is not this deployment's ownership evidence: it must be reported,
+  // not compared against the live runtime.
+  const foreignRoot = join(stateDir, "other-checkout", "releases", "foreign-build");
+  mkdirSync(foreignRoot, { recursive: true });
+  writeFileSync(join(serviceStateDir, "generation.json"), JSON.stringify({
+    status: "active", activeBuildId: "foreign-build", generationId: "foreign-generation", artifactPath: foreignRoot,
+  }));
+  const foreignRecord = inspectUnifiedDeploymentReconciliation(servicePaths, { observeSystemd });
+  assert.equal(foreignRecord.status, "PASS",
+    "a generation record owned by another artifact root must not produce drift");
+  assert.match(foreignRecord.evidence.runtime.detail, /another artifact root/,
+    "the runtime evidence reports the other-track record instead of comparing it");
+
   const rollbackArtifact = join(stateDir, "releases", "build-previous");
   mkdirSync(rollbackArtifact, { recursive: true });
   writeFileSync(join(rollbackArtifact, "build-meta.json"), JSON.stringify({

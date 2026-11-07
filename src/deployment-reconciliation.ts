@@ -159,6 +159,23 @@ function inspectObservedRuntime(identity: ReturnType<typeof readRuntimeIdentity>
     return { status: "WARN", detail: `no live process for recorded pid=${identity.pid}; build=${identity.buildId}` };
   }
   if (generation) {
+    // generation.json is written by the tmux-track launcher only; a
+    // systemd-track deployment never updates it. Compare the live
+    // runtime against the record only when the record's artifact lives
+    // under the SAME artifact root as the runtime (same deployment
+    // track). A record from another track's root (e.g. a devspace
+    // checkout while systemd serves the state directory) is reported,
+    // not treated as ownership evidence.
+    const liveArtifactRoot = identity.artifactPath ? dirname(resolve(identity.artifactPath)) : undefined;
+    const generationArtifact = generation.artifactPath ? resolve(generation.artifactPath) : undefined;
+    const sameTrack = Boolean(liveArtifactRoot && generationArtifact
+      && (generationArtifact === liveArtifactRoot || generationArtifact.startsWith(`${liveArtifactRoot}/`)));
+    if (!sameTrack) {
+      return {
+        status: "PASS",
+        detail: `pid=${identity.pid} build=${identity.buildId} generation=${identity.generationId ?? "unknown"} artifact=${identity.artifactPath ?? "unknown"}; generation record ${generation.generationId ?? generation.activeBuildId ?? "unknown"} belongs to another artifact root and is not compared`,
+      };
+    }
     const buildMatches = identity.buildId === generation.activeBuildId;
     const pathMatches = !generation.artifactPath
       || (identity.artifactPath !== undefined && resolve(identity.artifactPath) === resolve(generation.artifactPath));
@@ -216,10 +233,21 @@ export function inspectUnifiedDeploymentReconciliation(
       ? { status: "FAILED", detail: `no live process for recorded pid=${identity.pid}; build=${identity.buildId}` }
       : { status: "PASS", detail: `pid=${identity.pid} build=${identity.buildId} generation=${identity.generationId ?? "unknown"} artifact=${identity.artifactPath ?? "unknown"}` };
   if (identity && generation) {
+    // Same track rule as inspectObservedRuntime: only compare when the
+    // generation record's artifact lives under the live runtime's
+    // artifact root. Another track's record is reported, not compared.
+    const liveArtifactRoot = identity.artifactPath ? dirname(resolve(identity.artifactPath)) : undefined;
+    const generationArtifact = generation.artifactPath ? resolve(generation.artifactPath) : undefined;
+    const sameTrack = Boolean(liveArtifactRoot && generationArtifact
+      && (generationArtifact === liveArtifactRoot || generationArtifact.startsWith(`${liveArtifactRoot}/`)));
+    if (!sameTrack) {
+      evidence.runtime = { status: "PASS", detail: `pid=${identity.pid} build=${identity.buildId} generation=${identity.generationId ?? "unknown"} artifact=${identity.artifactPath ?? "unknown"}; generation record ${generation.generationId ?? generation.activeBuildId ?? "unknown"} belongs to another artifact root and is not compared` };
+    } else {
     const matches = identity.buildId === generation.activeBuildId
       && (!generation.generationId || identity.generationId === generation.generationId)
       && (!generation.artifactPath || (identity.artifactPath !== undefined && resolve(identity.artifactPath) === resolve(generation.artifactPath)));
     if (!matches) evidence.runtime = { status: "DRIFT", detail: `runtime=${identity.buildId}@${identity.artifactPath ?? "unknown"}; generation record=${generation.activeBuildId ?? "unknown"}@${generation.artifactPath ?? "unknown"}` };
+    }
   }
   const normalizedArtifactPath = resolve(artifactPath);
   const artifactMeta = readJsonFile<ArtifactMetadata>(join(normalizedArtifactPath, "build-meta.json"));
