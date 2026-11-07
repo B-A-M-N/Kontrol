@@ -246,29 +246,16 @@ receipt.status = receipt.qualified ? "qualified" : "failed";
 // against its metadata; deployment-qualified additionally requires observed
 // soak, real deployment uptime, and a verified external transport. A passing
 // test suite is never presented as an operationally qualified deployment.
-function hashArtifactTree(directory) {
-  const hash = createHash("sha256").update("kontrol-release-format:4\n");
-  const walk = (current, relative) => {
-    for (const entry of readdirSync(current).sort()) {
-      const absolute = join(current, entry);
-      const rel = relative ? `${relative}/${entry}` : entry;
-      if (rel === "build-meta.json") continue;
-      const info = lstatSync(absolute);
-      if (info.isDirectory()) walk(absolute, rel);
-      else if (info.isFile()) hash.update(rel).update(readFileSync(absolute));
-      else throw new Error(`unsupported release entry ${rel}`);
-    }
-  };
-  walk(directory, "");
-  return hash.digest("hex").slice(0, 16);
-}
-
 let artifactContentVerified = false;
 let artifactHashError;
 if (candidate?.artifactPath && candidateMetadata?.contentSha256) {
   try {
+    // Canonical format-aware verifier (dist/release-integrity.js), lazy:
+    // the standalone gate tests run without a prior build. The candidate
+    // is re-hashed under its own release-format version.
+    const { verifyArtifactContent } = await import(new URL("../dist/release-integrity.js", import.meta.url).href);
     artifactContentVerified =
-      hashArtifactTree(resolve(root, candidate.artifactPath)) === candidateMetadata.contentSha256;
+      verifyArtifactContent(resolve(root, candidate.artifactPath)).ok;
   } catch (error) {
     artifactHashError = error instanceof Error ? error.message : String(error);
   }

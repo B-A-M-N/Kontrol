@@ -1,9 +1,10 @@
-import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync, readdirSync, statSync } from "node:fs";
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync, readdirSync, statSync, lstatSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildToolEnvironment } from "./lib/tool-environment.mjs";
+import { releaseContentHashV5, RELEASE_CONTENT_HASH_FORMAT_VERSION } from "./lib/release-hash-v5.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const tempDist = mkdtempSync(join(root, ".kontrol-build-"));
@@ -11,7 +12,7 @@ const releasesDir = join(root, "releases");
 // Bump when the release metadata/loader contract changes in a way that must
 // invalidate an older immutable directory. build-meta.json is excluded from
 // the content hash because it carries the final build identity.
-const RELEASE_FORMAT_VERSION = 4;
+const RELEASE_FORMAT_VERSION = RELEASE_CONTENT_HASH_FORMAT_VERSION;
 const MAX_WORKSPACE_APP_HISTORY = 64;
 const MAX_WORKSPACE_APP_HISTORY_AGE_MS = 30 * 24 * 60 * 60 * 1_000;
 const resultPath = process.env.KONTROL_BUILD_RESULT_PATH
@@ -68,22 +69,12 @@ function runNpm(args, environment = {}) {
   run(process.execPath, [npmExecPath, ...args], environment);
 }
 
-function hashTree(directory, artifactHash, relativeDirectory = "") {
-  for (const entry of readdirSync(directory).sort()) {
-    const absolute = join(directory, entry);
-    const relative = join(relativeDirectory, entry);
-    if (relative === "build-meta.json") continue;
-    const stats = statSync(absolute);
-    if (stats.isDirectory()) hashTree(absolute, artifactHash, relative);
-    else artifactHash.update(relative).update(readFileSync(absolute));
-  }
-}
-
+// v5 content hashing is shared with the gate/verification tooling via
+// scripts/lib/release-hash-v5.mjs (build-atomic cannot import dist/
+// because it creates it; agreement with src/release-integrity.ts is
+// asserted by release-integrity.test.ts).
 function artifactHashFor(directory) {
-  const artifactHash = createHash("sha256");
-  artifactHash.update(`kontrol-release-format:${RELEASE_FORMAT_VERSION}\n`);
-  hashTree(directory, artifactHash);
-  return artifactHash.digest("hex").slice(0, 16);
+  return releaseContentHashV5(directory);
 }
 
 function collectWorkspaceAppHistory() {

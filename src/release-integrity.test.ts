@@ -45,4 +45,37 @@ const linked = makeArtifact();
 symlinkSync(join(linked.root, "cli.js"), join(linked.root, "link.js"));
 assert.equal(verifyArtifactContent(linked.root).ok, false, "symlink artifact fails");
 
+// --- v5 framed hash ---
+const { treeContentSha256 } = await import("./release-integrity.js");
+// @ts-expect-error tooling mirror without a compiled declaration (see scripts/lib/release-hash-v5.mjs)
+const { releaseContentHashV5 } = await import("../scripts/lib/release-hash-v5.mjs");
+
+// The historical ambiguity: {a: "bc"} and {ab: "c"} serialize identically
+// under the un-delimited v4 framing. The v5 framing must distinguish them.
+const treeA = join(tmpdir(), `kontrol-v5-a-${process.pid}-${Math.random().toString(16).slice(2)}`);
+const treeB = join(tmpdir(), `kontrol-v5-b-${process.pid}-${Math.random().toString(16).slice(2)}`);
+for (const tree of [treeA, treeB]) mkdirSync(tree, { recursive: true });
+writeFileSync(join(treeA, "a"), "bc");
+writeFileSync(join(treeA, "cli.js"), "x");
+writeFileSync(join(treeB, "ab"), "c");
+writeFileSync(join(treeB, "cli.js"), "x");
+const legacyA = (() => { const h = createHash("sha256").update("kontrol-release-format:4\n"); hashTree(treeA, h); return h.digest("hex"); })();
+const legacyB = (() => { const h = createHash("sha256").update("kontrol-release-format:4\n"); hashTree(treeB, h); return h.digest("hex"); })();
+assert.equal(legacyA, legacyB, "v4 reference: the two trees collide (the defect)");
+assert.notEqual(treeContentSha256(treeA), treeContentSha256(treeB), "v5 framing distinguishes path/content boundaries");
+assert.equal(treeContentSha256(treeA), releaseContentHashV5(treeA), "canonical and build-tooling hashes agree");
+assert.equal(treeContentSha256(treeA).length, 64, "v5 uses the complete SHA-256 digest");
+
+// A v5 artifact verifies end-to-end (and only its own format).
+const v5 = (() => {
+  const root = join(tmpdir(), `kontrol-v5-${process.pid}-${Math.random().toString(16).slice(2)}`);
+  mkdirSync(root, { recursive: true });
+  writeFileSync(join(root, "cli.js"), "x");
+  writeFileSync(join(root, "build-meta.json"), JSON.stringify({ buildId: "v5build", releaseFormatVersion: 5, contentSha256: treeContentSha256(root) }));
+  return root;
+})();
+assert.equal(verifyArtifactContent(v5).ok, true, "untampered v5 artifact verifies");
+writeFileSync(join(v5, "cli.js"), "y");
+assert.equal(verifyArtifactContent(v5).ok, false, "tampered v5 artifact fails");
+
 console.log("release-integrity.test.ts: all assertions passed");
