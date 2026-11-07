@@ -344,12 +344,25 @@ assert.equal(noisyInteractive.running, true);
 assert.ok(noisyInteractive.sessionId);
 
 await new Promise((resolve) => setTimeout(resolve, 50));
-const noisyInputResult = await manager.write({
+// Poll for the terminal state: under gate load the child may not have exited
+// within one yield budget. The asserted properties (exited + correct output)
+// are unchanged; only the wait shape is load-tolerant.
+let noisyInputResult = await manager.write({
   workspaceId: "workspace-a",
   sessionId: noisyInteractive.sessionId,
   chars: "hello\n",
   yieldTimeMs: 2_000,
 });
+const noisyDeadline = Date.now() + 10_000;
+while (noisyInputResult.running && Date.now() < noisyDeadline) {
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  noisyInputResult = await manager.write({
+    workspaceId: "workspace-a",
+    sessionId: noisyInteractive.sessionId,
+    chars: "",
+    yieldTimeMs: 1_000,
+  });
+}
 assert.equal(noisyInputResult.running, false);
 assert.match(noisyInputResult.output, /input:hello/);
 
