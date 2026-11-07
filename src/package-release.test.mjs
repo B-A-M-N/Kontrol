@@ -500,14 +500,22 @@ async function exerciseInstalledServiceLifecycle(installedPkg, tmpRoot) {
   const candidate = join(rootDir, "candidate");
   mkdirSync(candidate, { recursive: true });
   const baseMeta = JSON.parse(readFileSync(join(installedPkg, "dist", "build-meta.json"), "utf8"));
+  // Seal the real content identity: installation recomputes the tree
+  // hash and refuses mismatched metadata before any readiness path runs.
+  const candidateCli = "#!/usr/bin/env node\n";
+  const candidateContentSha = createHash("sha256")
+    .update("kontrol-release-format:4\n")
+    .update("cli.js")
+    .update(candidateCli)
+    .digest("hex").slice(0, 16);
   const candidateMeta = {
     ...baseMeta,
     buildId: `${baseMeta.buildId}-candidate`,
-    contentSha256: "b".repeat(16),
+    contentSha256: candidateContentSha,
     schemaVersion: Number(baseMeta.schemaVersion) + 1,
     maxReadableSchemaVersion: Number(baseMeta.maxReadableSchemaVersion) + 1,
   };
-  writeFileSync(join(candidate, "cli.js"), "#!/usr/bin/env node\n");
+  writeFileSync(join(candidate, "cli.js"), candidateCli);
   writeFileSync(join(candidate, "build-meta.json"), JSON.stringify(candidateMeta));
 
   // Hermetic operator configuration: without an explicit fixture config dir

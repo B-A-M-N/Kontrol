@@ -5,6 +5,7 @@ import type { AuthInfo, OAuthClientInformationFull, OAuthTokenRevocationRequest,
 import { AccessDeniedError, InvalidGrantError, InvalidRequestError, InvalidTokenError } from "@modelcontextprotocol/server-legacy/auth";
 import type { OAuthRegisteredClientsStore, OAuthServerProvider, AuthorizationParams } from "@modelcontextprotocol/server-legacy/auth";
 import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
+import type { StateOwnershipContext } from "./state-directory.js";
 
 export interface OAuthConfig {
   ownerToken: string;
@@ -160,9 +161,10 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     private readonly config: OAuthConfig,
     resourceServerUrl: URL,
     stateDir: string,
+    stateAccess?: StateOwnershipContext,
   ) {
     this.resourceServerUrl = resourceUrlFromServerUrl(resourceServerUrl);
-    this.oauthStore = new SqliteOAuthStore(stateDir);
+    this.oauthStore = new SqliteOAuthStore(stateDir, stateAccess);
     this.clientsStore = new SqliteOAuthClientsStore(this.oauthStore, config.allowedRedirectHosts);
     // P1 #6: expired tokens/codes are compacted on a schedule, not just at
     // store-open time.

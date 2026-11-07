@@ -39,7 +39,7 @@ export function deriveAuth(config: ServerConfig): DerivedAuth {
   if (oauthEnabled) {
     const mcpUrl = new URL("/mcp", config.publicBaseUrl);
     resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
-    oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
+    oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir, config.stateAccess);
     bearerAuth = requireBearerAuth({
       verifier: oauthProvider,
       requiredScopes: [config.oauth.scopes[0] ?? "kontrol"],

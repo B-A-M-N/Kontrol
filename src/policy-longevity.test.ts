@@ -84,7 +84,7 @@ assert.equal(config.policy.defaultMode, "allow", `policy.defaultMode must be all
 assert.equal(config.policy.toolRules.bash, "ask",
   `bash must gate as ask; toolRules: ${JSON.stringify(config.policy.toolRules)}`);
 
-const oauthProvider = new SingleUserOAuthProvider(config.oauth, new URL("/mcp", config.publicBaseUrl), stateDir);
+const oauthProvider = new SingleUserOAuthProvider(config.oauth, new URL("/mcp", config.publicBaseUrl), stateDir, config.stateAccess);
 const redirectUri = "http://localhost/oauth/callback";
 const oauthClient = await oauthProvider.clientsStore.registerClient?.({
   redirect_uris: [redirectUri],

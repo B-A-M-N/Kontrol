@@ -3,6 +3,7 @@ import type { OAuthClientInformationFull } from "@modelcontextprotocol/server";
 import { InvalidRequestError } from "@modelcontextprotocol/server-legacy/auth";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/server-legacy/auth";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
+import type { StateOwnershipContext } from "./state-directory.js";
 
 /**
  * P1 #6: dynamic client registrations older than this (and with no live
@@ -68,8 +69,8 @@ function redirectHostAllowed(redirectUri: string, allowedHosts: string[]): boole
 export class SqliteOAuthStore {
   private readonly database: DatabaseHandle;
 
-  constructor(stateDir: string) {
-    this.database = openDatabase(stateDir);
+  constructor(stateDir: string, stateAccess?: StateOwnershipContext) {
+    this.database = openDatabase(stateDir, stateAccess ? { stateAccess } : {});
     this.deleteExpiredTokens(Math.floor(Date.now() / 1000));
   }
 
