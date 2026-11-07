@@ -141,6 +141,7 @@ const migrations: Migration[] = [
   { version: 116, name: "review-browser-terminal-outcome", up: migrateReviewBrowserTerminalOutcome },
   { version: 117, name: "review-mutation-reassessments", up: migrateReviewMutationReassessments },
   { version: 118, name: "installation-binding", up: migrateInstallationBinding },
+  { version: 119, name: "initial-dispatch-reservations", up: migrateInitialDispatchReservations },
 ];
 
 function migrateWorkspaceGoals(sqlite: Database.Database): void {
@@ -374,6 +375,29 @@ function migrateInstallationBinding(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "work_sessions", "installation_id", "text");
   addColumnIfMissing(sqlite, "review_routes", "installation_id", "text");
   addColumnIfMissing(sqlite, "review_threads", "installation_id", "text");
+}
+
+/**
+ * Durable initial-dispatch reservations: one logical dispatch intent
+ * (owner + workspace + clientMutationId) binds to exactly one work
+ * session. A lost initial response can then be recovered by the caller
+ * retrying with the same clientMutationId — the retry adopts the
+ * recorded session and its run instead of creating a second session
+ * and dispatching again. The task fingerprint makes key reuse with
+ * different content fail explicitly.
+ */
+function migrateInitialDispatchReservations(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists initial_dispatch_reservations (
+      reservation_key text primary key not null,
+      work_session_id text not null references work_sessions(id) on delete cascade,
+      task_fingerprint text not null,
+      created_at text not null,
+      updated_at text not null
+    );
+    create index if not exists initial_dispatch_reservations_session_idx
+      on initial_dispatch_reservations(work_session_id);
+  `);
 }
 
 

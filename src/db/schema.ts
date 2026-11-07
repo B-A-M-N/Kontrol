@@ -514,6 +514,22 @@ export const acpRunDispatchAttempts = sqliteTable("acp_run_dispatch_attempts", {
   index("acp_run_dispatch_attempts_run_idx").on(table.runId, table.attemptNumber),
 ]);
 
+/**
+ * Durable initial-dispatch reservations (migration 119): one logical
+ * initial dispatch intent (authenticated owner + workspace +
+ * clientMutationId) binds to exactly one work session, so a lost initial
+ * response is recoverable without a duplicate session/dispatch.
+ */
+export const initialDispatchReservations = sqliteTable("initial_dispatch_reservations", {
+  reservationKey: text("reservation_key").primaryKey(),
+  workSessionId: text("work_session_id").notNull().references(() => workSessions.id, { onDelete: "cascade" }),
+  taskFingerprint: text("task_fingerprint").notNull(),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  index("initial_dispatch_reservations_session_idx").on(table.workSessionId),
+]);
+
 export const agentWebhookQueue = sqliteTable("agent_webhook_queue", {
   id: text("id").primaryKey(),
   runId: text("run_id").notNull().references(() => acpRuns.runId, { onDelete: "cascade" }),

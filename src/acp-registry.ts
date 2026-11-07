@@ -7,6 +7,7 @@ import {
   agentRegistry,
   acpRuns,
   acpRunDispatchAttempts,
+  initialDispatchReservations,
   agentWebhookQueue,
   type AgentRegistryRow,
   type AcpRunRow,
@@ -251,6 +252,8 @@ export interface AgentRegistryManager {
   getRunByDispatchIdempotencyKey(key: string): PersistentAcpRun | undefined;
   getDispatchAttemptByIdempotencyKey(key: string): PersistentAcpDispatchAttempt | undefined;
   getLatestDispatchAttemptForRun(runId: string): PersistentAcpDispatchAttempt | undefined;
+  getInitialDispatchReservation(reservationKey: string): { workSessionId: string; taskFingerprint: string } | undefined;
+  bindInitialDispatchReservation(input: { reservationKey: string; workSessionId: string; taskFingerprint: string }): { workSessionId: string };
   listDispatchAttemptsForRun(runId: string): PersistentAcpDispatchAttempt[];
   beginDispatchAttempt(input: { key: string; runId: string; agentId?: string; attemptNumber: number }): void;
   updateDispatchAttempt(key: string, input: { status: string; remoteRunId?: string }): void;
@@ -709,6 +712,41 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
     };
+  }
+
+  /**
+   * Initial-dispatch reservation (migration 119): an authenticated
+   * (owner, workspace, clientMutationId) intent binds to exactly one work
+   * session. bindInitialDispatchReservation is insert-or-adopt: concurrent
+   * identical binds converge on the first session; a different task
+   * fingerprint under the same key throws.
+   */
+  getInitialDispatchReservation(reservationKey: string): { workSessionId: string; taskFingerprint: string } | undefined {
+    const row = this.database.db.select().from(initialDispatchReservations)
+      .where(eq(initialDispatchReservations.reservationKey, reservationKey)).limit(1).get();
+    return row ? { workSessionId: row.workSessionId, taskFingerprint: row.taskFingerprint } : undefined;
+  }
+
+  bindInitialDispatchReservation(input: { reservationKey: string; workSessionId: string; taskFingerprint: string }): { workSessionId: string } {
+    const now = new Date().toISOString();
+    return this.database.sqlite.transaction(() => {
+      const prior = this.database.db.select().from(initialDispatchReservations)
+        .where(eq(initialDispatchReservations.reservationKey, input.reservationKey)).limit(1).get();
+      if (prior) {
+        if (prior.taskFingerprint !== input.taskFingerprint) {
+          throw new Error("clientMutationId was already used with different task content for this owner and workspace; refusing to bind a second session.");
+        }
+        return { workSessionId: prior.workSessionId };
+      }
+      this.database.db.insert(initialDispatchReservations).values({
+        reservationKey: input.reservationKey,
+        workSessionId: input.workSessionId,
+        taskFingerprint: input.taskFingerprint,
+        createdAt: now,
+        updatedAt: now,
+      }).run();
+      return { workSessionId: input.workSessionId };
+    })();
   }
 
   listDispatchAttemptsForRun(runId: string): PersistentAcpDispatchAttempt[] {

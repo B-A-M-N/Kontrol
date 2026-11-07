@@ -159,6 +159,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 116, name: "review-browser-terminal-outcome" },
       { version: 117, name: "review-mutation-reassessments" },
       { version: 118, name: "installation-binding" },
+      { version: 119, name: "initial-dispatch-reservations" },
     ]);
   } finally {
     database.close();

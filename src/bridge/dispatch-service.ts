@@ -21,6 +21,7 @@
  * configuration, or any storage system other than the existing
  * work-session / registry / event stores.
  */
+import { createHash } from "node:crypto";
 import { callRemoteAgent, selectHealthyAgent } from "../acp-gateway.js";
 import { checkDispatchReplay, deriveStableDispatchKey } from "./dispatch-identity.js";
 import type { BridgeConfig } from "./context.js";
@@ -167,6 +168,34 @@ export async function dispatchToRegisteredAgent(
   // --- Work-session ownership (Kontrol owns creation) ---
   let wsId = input.workSessionId;
   let createdSessionForDispatch = false;
+  // Initial-dispatch reservation: a caller without a workSessionId names
+  // the intent only by clientMutationId. The durable reservation binds
+  // (authenticated owner, workspace, clientMutationId) to one session, so
+  // a lost initial response is recoverable by retry: the retry adopts the
+  // recorded session (and its run via the replay check below) instead of
+  // creating a second session whose new ID would mint a new dispatch key.
+  let reservationKey: string | undefined;
+  let reservationFingerprint: string | undefined;
+  if (!wsId && input.clientMutationId) {
+    const owner = livePrincipalId(config) ?? config.principalId;
+    reservationFingerprint = createHash("sha256").update(task).digest("hex");
+    reservationKey = createHash("sha256")
+      .update(["initial-dispatch-v1", owner, workspaceSessionId, input.clientMutationId].join("\n"))
+      .digest("hex");
+    try {
+      const existing = config.agentRegistry.getInitialDispatchReservation(reservationKey);
+      if (existing) {
+        if (existing.taskFingerprint !== reservationFingerprint) {
+          const text = `clientMutationId ${input.clientMutationId} was already used with different task content for this owner and workspace; refusing to bind a second session.`;
+          return { status: "failed", workspaceSessionId, error: text, isError: true, text };
+        }
+        wsId = existing.workSessionId;
+      }
+    } catch (error) {
+      const text = `Cannot read the initial-dispatch reservation: ${error instanceof Error ? error.message : String(error)}`;
+      return { status: "failed", workspaceSessionId, error: text, isError: true, text };
+    }
+  }
   if (!wsId) {
     const created = config.workSessions.create({
       workspaceSessionId,
@@ -178,6 +207,26 @@ export async function dispatchToRegisteredAgent(
     });
     wsId = created.id;
     createdSessionForDispatch = true;
+    // Bind the reservation at creation so the very next retry (whose lost
+    // response motivated it) adopts THIS session instead of creating one.
+    if (reservationKey && reservationFingerprint) {
+      try {
+        const bound = config.agentRegistry.bindInitialDispatchReservation({
+          reservationKey, workSessionId: wsId, taskFingerprint: reservationFingerprint,
+        });
+        if (bound.workSessionId !== wsId) {
+          // A concurrent identical submission won the bind: adopt its
+          // session and cancel the one just created (never dispatched).
+          config.workSessions.updateStatus(wsId, "cancelled");
+          wsId = bound.workSessionId;
+          createdSessionForDispatch = false;
+        }
+      } catch (error) {
+        config.workSessions.updateStatus(wsId, "cancelled");
+        const text = error instanceof Error ? error.message : String(error);
+        return { status: "failed", workspaceSessionId, error: text, isError: true, text };
+      }
+    }
   } else {
     const existing = config.workSessions.get(wsId);
     if (!existing) {
@@ -235,14 +284,28 @@ export async function dispatchToRegisteredAgent(
   // Derived from the delivery intent, never minted per call. A pre-flight
   // replay check short-circuits an intent that already reached an adapter
   // (accepted) or may have (dispatching/uncertain) without a second POST.
+  // Supervised missions bind the logical mission contract (objective,
+  // work order, modes, baseline) into the fingerprint: the mission prompt
+  // rendered later can differ from the raw task, so a changed contract
+  // must change the key.
   const wsForIdentity = config.workSessions.get(wsId);
+  const missionContractFingerprint = input.mission
+    ? createHash("sha256").update(JSON.stringify([
+      input.mission.objective, input.mission.desiredOutcome,
+      input.mission.acceptanceCriteria, input.mission.supervisorInstructions,
+      input.mission.autonomyMode, input.mission.approvalMode,
+      input.mission.maxWallTimeMinutes ?? null,
+      input.mission.workOrder ?? null,
+      missionBaseline ? [missionBaseline.baselineKind, missionBaseline.baselineRef, missionBaseline.baselineCommit] : null,
+    ])).digest("hex")
+    : undefined;
   const stableDispatchKey = deriveStableDispatchKey(config.agentRegistry, runBeforeDispatch?.runId, {
     workSessionId: wsId,
     intentId: input.clientMutationId ?? (createdSessionForDispatch ? "initial" : (wsForIdentity?.latestFeedback?.id ?? "initial")),
     feedbackEpoch: wsForIdentity?.reviewEpoch ?? 0,
     latestFeedbackId: wsForIdentity?.latestFeedback?.id,
     agentId: peer.id,
-    task: `${task}\n\n${workSessionInstructions(wsId, peer)}`,
+    task: `${task}\n\n${workSessionInstructions(wsId, peer)}${missionContractFingerprint ? `\n\nmission-contract:${missionContractFingerprint}` : ""}`,
   });
   const replay = checkDispatchReplay(config.agentRegistry, stableDispatchKey);
   if (replay.kind !== "none") {
