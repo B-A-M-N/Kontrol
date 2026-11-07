@@ -116,6 +116,7 @@ try {
   const owner = "peer:meta-muse:credential";
   recordPeerWorktree(workspaceId, owner, stateDir);
   const config = loadConfig({
+    KONTROL_CONFIG_DIR: mkdtempSync(join(tmpdir(), "kontrol-hermetic-config-")),
     KONTROL_ALLOWED_ROOTS: "/tmp",
     KONTROL_STATE_DIR: stateDir,
     KONTROL_AUTH_MODE: "tunnel",

@@ -10,6 +10,7 @@ import { loadConfig } from "./config.js";
 const root = mkdtempSync(join(tmpdir(), "kontrol-owner-context-"));
 try {
   const config = loadConfig({
+    KONTROL_CONFIG_DIR: mkdtempSync(join(tmpdir(), "kontrol-hermetic-config-")),
     KONTROL_ALLOWED_ROOTS: root,
     KONTROL_WORKTREE_ROOT: join(root, "worktrees"),
     KONTROL_AUTH_MODE: "tunnel",

@@ -42,6 +42,7 @@ try {
   mkdirSync(join(root, "src"), { recursive: true });
   for (const mode of ["changes", "full"] as const) {
     const config = loadConfig({
+      KONTROL_CONFIG_DIR: mkdtempSync(join(tmpdir(), "kontrol-hermetic-config-")),
       KONTROL_ALLOWED_ROOTS: root,
       KONTROL_WORKTREE_ROOT: join(root, `.worktrees-${mode}`),
       KONTROL_AGENT_DIR: join(root, `.agent-${mode}`),

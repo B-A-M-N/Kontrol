@@ -14,6 +14,7 @@ const database = openDatabase(join(root, "state"));
 const workspaceStore = new SqliteWorkspaceStore(database);
 const workSessions = createWorkSessionManager(database);
 const config = loadConfig({
+    KONTROL_CONFIG_DIR: mkdtempSync(join(tmpdir(), "kontrol-hermetic-config-")),
   KONTROL_ALLOWED_ROOTS: root,
   KONTROL_WORKTREE_ROOT: join(root, "worktrees"),
   KONTROL_AUTH_MODE: "tunnel",

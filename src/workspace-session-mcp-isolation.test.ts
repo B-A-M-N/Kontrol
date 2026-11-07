@@ -1,7 +1,8 @@
-import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import assert from "node:assert/strict";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { createMcpServer } from "./mcp/workspace-server.js";
 import { loadConfig } from "./config.js";
@@ -20,6 +21,7 @@ try {
   await writeFile(join(root, "nested", "unread", "file.txt"), "before\n");
 
   const config = loadConfig({
+    KONTROL_CONFIG_DIR: mkdtempSync(join(tmpdir(), "kontrol-hermetic-config-")),
     KONTROL_ALLOWED_ROOTS: root,
     KONTROL_WORKTREE_ROOT: join(root, ".kontrol", "worktrees"),
     KONTROL_AGENT_DIR: join(root, ".pi", "agent"),

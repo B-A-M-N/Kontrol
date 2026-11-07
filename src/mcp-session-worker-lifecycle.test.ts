@@ -1,3 +1,6 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import assert from "node:assert/strict";
 import { createMcpSessionLifecycle } from "./server/mcp-session-lifecycle.js";
 import { loadConfig } from "./config.js";
@@ -6,6 +9,7 @@ import { ProcessSessionManager } from "./process-sessions.js";
 import type { McpSessionState } from "./server/mcp-session-state.js";
 
 const config = loadConfig({
+    KONTROL_CONFIG_DIR: mkdtempSync(join(tmpdir(), "kontrol-hermetic-config-")),
   KONTROL_ALLOWED_ROOTS: "/tmp",
   KONTROL_WORKTREE_ROOT: "/tmp/kontrol-worker-lifecycle-worktrees",
   KONTROL_AUTH_MODE: "tunnel",

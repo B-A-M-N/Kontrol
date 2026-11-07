@@ -1,6 +1,7 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import assert from "node:assert/strict";
 import { loadConfig } from "./config.js";
 import {
@@ -137,6 +138,7 @@ try {
   );
 
   const disabledConfig = loadConfig({
+    KONTROL_CONFIG_DIR: join(root, ".kontrol"),
     KONTROL_ALLOWED_ROOTS: projectRoot,
     KONTROL_AGENT_DIR: agentDir,
     KONTROL_SKILL_PATHS: explicitSkills,
@@ -147,6 +149,7 @@ try {
   assert.deepEqual(loadWorkspaceSkills(disabledConfig, projectRoot).skills, []);
 
   const config = loadConfig({
+    KONTROL_CONFIG_DIR: join(root, ".kontrol"),
     KONTROL_ALLOWED_ROOTS: projectRoot,
     KONTROL_AGENT_DIR: agentDir,
     KONTROL_SKILL_PATHS: [explicitSkills, "~/.claude/skills", "./.claude/skills"].join(","),
@@ -166,6 +169,7 @@ try {
   assert.equal(loaded.diagnostics.some((diagnostic) => diagnostic.type === "collision"), true);
 
   const duplicateConfig = loadConfig({
+    KONTROL_CONFIG_DIR: join(root, ".kontrol"),
     KONTROL_ALLOWED_ROOTS: projectRoot,
     KONTROL_AGENT_DIR: agentDir,
     KONTROL_SKILL_PATHS: [explicitSkills, "./.agents/skills"].join(","),
@@ -178,6 +182,7 @@ try {
   );
 
   const legacyPiConfig = loadConfig({
+    KONTROL_CONFIG_DIR: join(root, ".kontrol"),
     KONTROL_ALLOWED_ROOTS: projectRoot,
     KONTROL_AGENT_DIR: agentDir,
     KONTROL_SKILL_PATHS: [explicitSkills, join(projectRoot, ".pi", "skills")].join(","),
