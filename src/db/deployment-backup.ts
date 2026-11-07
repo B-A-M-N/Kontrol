@@ -177,6 +177,64 @@ export function markMigrationFailed(stateDir: string, deploymentId: string | und
 }
 
 /**
+ * End the immediate rollback window only after the owning service deployment
+ * has committed and the live database still matches the candidate schema.
+ * The active service manifest keeps this backup protected until a later
+ * committed generation replaces it.
+ */
+export function markMigrationRollbackWindowComplete(stateDir: string, deploymentId: string): boolean {
+  const prior = readDeploymentMigrationRecord(stateDir, deploymentId);
+  if (!prior?.backupPath) return false;
+  if (prior.migrationFailed || prior.restoredAt || !prior.migrationOccurred || !prior.rollbackRestoreRequired || !existsSync(prior.backupPath)) return false;
+  const current = currentDatabaseSchema(prior.databasePath);
+  if (current !== prior.candidateSchemaVersion || prior.currentSchemaVersion !== current) {
+    throw new Error(`cannot close deployment ${deploymentId} rollback window: database schema ${current} does not match completed candidate schema ${prior.candidateSchemaVersion}`);
+  }
+  writeJsonAtomic(deploymentMigrationRecordPath(stateDir, deploymentId), {
+    ...prior,
+    rollbackRestoreRequired: false,
+    updatedAt: new Date().toISOString(),
+  } satisfies DeploymentMigrationRecord);
+  return true;
+}
+
+/**
+ * Return IDs whose migration backups are still referenced by the installed
+ * production state or an unfinished service transaction. Undefined means
+ * authority is missing or ambiguous and cleanup must retain everything.
+ */
+export function protectedMigrationBackupDeploymentIds(stateDir: string): Set<string> | undefined {
+  const servicePath = join(stateDir, "service.json");
+  if (!existsSync(servicePath)) return undefined;
+  const service = readJsonRecord(servicePath);
+  if (!service || typeof service.deploymentId !== "string" || !service.deploymentId) return undefined;
+  const protectedIds = new Set([service.deploymentId]);
+
+  for (const name of readdirSync(stateDir)) {
+    if (!/^deployment\..+\.json$/.test(name)) continue;
+    const journal = readJsonRecord(join(stateDir, name));
+    if (!journal || typeof journal.deploymentId !== "string" || !journal.deploymentId) return undefined;
+    const stage = journal.stage;
+    const status = journal.status;
+    if (stage === undefined && status === undefined) return undefined;
+    const terminal = stage !== undefined
+      ? stage === "commit" || stage === "failed"
+      : status === "committed" || status === "failed";
+    if (!terminal) protectedIds.add(journal.deploymentId);
+  }
+  return protectedIds;
+}
+
+function readJsonRecord(path: string): Record<string, unknown> | undefined {
+  try {
+    const value: unknown = JSON.parse(readFileSync(path, "utf8"));
+    return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Prune unreferenced completed migration backups after retention. Protected
  * generations and incomplete rollback records are never removed.
  */

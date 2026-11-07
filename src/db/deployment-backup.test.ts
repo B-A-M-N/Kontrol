@@ -176,4 +176,30 @@ try {
 } finally {
   rmSync(sameSchema, { recursive: true, force: true });
 }
+console.log("deployment-backup: rollback window close verified");
+
+// Rollback-window completion (historical e70aa942 contract): the window
+// closes only when a migration backup exists, the migration occurred, the
+// restore is still required, nothing failed/was restored, and the live DB
+// still matches the candidate schema. Any uncertainty retains the backup.
+const window = mkdtempSync(join(tmpdir(), "kontrol-db-window-"));
+try {
+  const dbPath = createPreMigrationDatabase(window, LATEST_SCHEMA_VERSION - 1);
+  const deploymentId = brandDeploymentId("window-close-deployment");
+  const sqlite = new Database(dbPath);
+  const captured = captureMigrationBackup(sqlite, dbPath, window, deploymentId, LATEST_SCHEMA_VERSION);
+  assert.ok(captured?.backupPath, "schema-raising deployment captures a backup");
+  // Simulate the candidate completing the migration against the live DB.
+  const { migrateDatabase } = await import("./migrations.js");
+  migrateDatabase(sqlite);
+  const { markMigrationCompleted, markMigrationRollbackWindowComplete } = await import("./deployment-backup.js");
+  markMigrationCompleted(window, deploymentId, LATEST_SCHEMA_VERSION);
+  sqlite.close();
+  assert.equal(markMigrationRollbackWindowComplete(window, deploymentId), true);
+  assert.equal(readDeploymentMigrationRecord(window, deploymentId)?.rollbackRestoreRequired, false);
+  // A second close is a no-op (window already complete).
+  assert.equal(markMigrationRollbackWindowComplete(window, deploymentId), false);
+} finally {
+  rmSync(window, { recursive: true, force: true });
+}
 console.log("deployment-backup.test.ts: all assertions passed");

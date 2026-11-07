@@ -26,7 +26,7 @@ import {
 } from "./lifecycle-coordinator.js";
 import { loadPolicyConfig, policyCanAsk } from "./policy.js";
 import { acquireDeploymentLock, releaseDeploymentLock, type DeploymentLockHandle } from "./deployment-lock.js";
-import { restoreDeploymentDatabaseBackup } from "./db/deployment-backup.js";
+import { markMigrationRollbackWindowComplete, restoreDeploymentDatabaseBackup } from "./db/deployment-backup.js";
 
 export interface ServiceBuild {
   artifactPath: string;
@@ -1419,6 +1419,13 @@ async function upgrade(paths: ServicePaths, dependencies: ServiceCommandDependen
       systemctl(paths, ["enable", "--now", "kontrol.target"], dependencies);
       await (dependencies.waitForReady?.(paths, candidate) ?? waitForReady(paths, candidate));
       verifyAuxiliariesActive(manifest, dependencies);
+      // The rollback window ends only after the candidate is ready and the
+      // live schema still matches it. Retain the backup on any uncertainty.
+      try {
+        markMigrationRollbackWindowComplete(paths.stateDir, deploymentId);
+      } catch {
+        // Fail-retain: an unverifiable window keeps its backup protected.
+      }
       updateDeploymentRecord(paths, record, { stage: "commit" });
       return;
     } catch (error) {
