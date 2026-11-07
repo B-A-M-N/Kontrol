@@ -325,6 +325,25 @@ import {
     bypassed = error;
   }
   assert.ok(bypassed instanceof Error, "takeover flag must not bypass the fence");
+
+  // Missing tmux socket (`error connecting to /tmp/tmux-UID/default (No such
+  // file or directory)`) is also an empty tmux backend: with an active
+  // systemd core the backend must resolve to systemd, never unknown.
+  const binSocket = mkdtempSync(join(tmpdir(), "kontrol-lifecycle-socket-"));
+  writeFileSync(join(binSocket, "systemctl"), '#!/bin/sh\necho "kontrol-core.service loaded active running"\nexit 0\n', { mode: 0o755 });
+  writeFileSync(join(binSocket, "tmux"), '#!/bin/sh\necho "error connecting to /tmp/tmux-1000/default (No such file or directory)" >&2\nexit 1\n', { mode: 0o755 });
+  const socketResolved = JSON.parse(runCli(["resolve-backend"], binSocket)) as { backend: string };
+  assert.equal(socketResolved.backend, "systemd", "missing tmux socket + active systemd resolves to systemd");
+
+  // A genuine tmux probe failure (permission error on the socket) must stay
+  // unavailable → unknown, never read as an empty backend.
+  const binDenied = mkdtempSync(join(tmpdir(), "kontrol-lifecycle-denied-"));
+  writeFileSync(join(binDenied, "systemctl"), '#!/bin/sh\necho "kontrol-core.service loaded active running"\nexit 0\n', { mode: 0o755 });
+  writeFileSync(join(binDenied, "tmux"), '#!/bin/sh\necho "error connecting to /tmp/tmux-1000/default (Permission denied)" >&2\nexit 1\n', { mode: 0o755 });
+  const deniedResolved = JSON.parse(runCli(["resolve-backend"], binDenied)) as { backend: string };
+  assert.equal(deniedResolved.backend, "unknown", "permission-denied tmux probe fails closed as unknown");
+  rmSync(binSocket, { recursive: true, force: true });
+  rmSync(binDenied, { recursive: true, force: true });
   rmSync(bin, { recursive: true, force: true });
   rmSync(binConflict, { recursive: true, force: true });
 }

@@ -458,9 +458,12 @@ export function listActiveSystemdUnits(): ProbeOutcome {
 
 /**
  * Real tmux probe. Exit 0 lists sessions; exit 1 reporting "no server
- * running" (no daemon at all) or "no sessions" (daemon alive, zero
- * sessions) means a genuinely empty backend. Any other outcome (missing
- * binary, socket errors) is `unavailable`, never evidence of emptiness.
+ * running" (no daemon at all), "no sessions" (daemon alive, zero
+ * sessions), or a missing default socket ("error connecting to
+ * /tmp/tmux-UID/default (No such file or directory)" — the daemon is
+ * not running) means a genuinely empty backend. Any other outcome
+ * (missing binary, permission errors, unexpected failures) is
+ * `unavailable`, never evidence of emptiness.
  */
 export function listTmuxSessions(): ProbeOutcome {
   let result: ReturnType<typeof spawnSync>;
@@ -473,7 +476,8 @@ export function listTmuxSessions(): ProbeOutcome {
     return { status: "ok", names: String(result.stdout ?? "").split("\n").map((line) => line.trim()).filter(Boolean) };
   }
   const stderr = String(result.stderr ?? "");
-  if (result.status === 1 && /no server running|no sessions/i.test(stderr)) return { status: "ok", names: [] };
+  if (result.status === 1 && (/no server running|no sessions/i.test(stderr)
+    || /error connecting to \S+ \(No such file or directory\)/.test(stderr))) return { status: "ok", names: [] };
   return { status: "unavailable", reason: `tmux list-sessions exited ${String(result.status ?? "unknown")}: ${stderr.trim().slice(0, 200)}` };
 }
 
