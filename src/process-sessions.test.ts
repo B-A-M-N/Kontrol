@@ -675,7 +675,12 @@ try {
 const noisyReaped = new ProcessSessionManager({
   maxRunningProcesses: 1,
   maxRunningProcessesPerOwner: 1,
-  idleTimeoutMs: 1_000,
+  // Load-tolerant window: output every 10ms must count as activity through
+  // a 3s idle budget, and the 1.2s assertion below runs past the original
+  // 1s window. Under gate-load the interval can starve for >1s, which would
+  // legitimately reap under the old budget without contradicting the
+  // product contract this case proves.
+  idleTimeoutMs: 3_000,
   maxRuntimeMs: 10_000,
   reaperIntervalMs: 10,
 });

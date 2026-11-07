@@ -661,6 +661,7 @@ async function peerDelete(sessionId: string): Promise<void> {
     oauthConfig.oauth,
     new URL("/mcp", oauthConfig.publicBaseUrl),
     oauthStateDir,
+    oauthConfig.stateAccess,
   );
   const redirectUri = "http://127.0.0.1/oauth/callback";
   const oauthClient = await issuingProvider.clientsStore.registerClient?.({
