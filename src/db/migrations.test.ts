@@ -13,7 +13,7 @@ sqlite.pragma("foreign_keys = ON");
 try {
   migrateDatabase(sqlite);
   const schemaContract = inspectDatabaseSchemaContract(sqlite);
-  assert.equal(schemaContract.expectedTableCount, 53, "schema contract covers all Drizzle table mappings, including peer-job and PTY binding storage");
+  assert.equal(schemaContract.expectedTableCount, 54, "schema contract covers all Drizzle table mappings, including peer-job, PTY binding, and initial-dispatch reservation storage");
   assert.deepEqual(schemaContract.missing, [], "all Drizzle tables and columns are present in migrated SQLite");
   assert.equal(schemaContract.appliedVersion, LATEST_SCHEMA_VERSION);
   const scheduledTargetColumns = sqlite.prepare("pragma table_info(scheduled_jobs)").all() as Array<{ name: string }>;
