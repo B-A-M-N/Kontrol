@@ -57,4 +57,45 @@ try {
   rmSync(root, { recursive: true, force: true });
 }
 
+// Canonical intent fingerprint: one intent → one fingerprint and one
+// dispatch key. Any mission-contract change alters the fingerprint, so
+// a reused clientMutationId is refused exactly like a changed task.
+{
+  const { canonicalIntentFingerprint } = await import("./dispatch-service.js");
+  const base = {
+    task: "same task text",
+    mission: {
+      objective: "ship it",
+      desiredOutcome: "done",
+      acceptanceCriteria: [{ id: "a" }],
+      supervisorInstructions: "review",
+      autonomyMode: "manual" as const,
+      approvalMode: "human_required" as const,
+    },
+    missionBaseline: { baselineKind: "git", baselineRef: "main", baselineCommit: "abc" },
+  };
+  const a = canonicalIntentFingerprint(base);
+  const b = canonicalIntentFingerprint(base);
+  assert.equal(a.intentFingerprint, b.intentFingerprint, "same intent → same fingerprint");
+  assert.equal(a.canonicalIntent, b.canonicalIntent);
+
+  const changedCriteria = canonicalIntentFingerprint({
+    ...base, mission: { ...base.mission, acceptanceCriteria: [{ id: "b" }] },
+  });
+  assert.notEqual(changedCriteria.intentFingerprint, a.intentFingerprint,
+    "changed mission contract → different fingerprint (second execution impossible)");
+  assert.notEqual(changedCriteria.canonicalIntent, a.canonicalIntent);
+
+  const changedObjective = canonicalIntentFingerprint({
+    ...base, mission: { ...base.mission, objective: "ship something else" },
+  });
+  assert.notEqual(changedObjective.intentFingerprint, a.intentFingerprint,
+    "changed objective → different fingerprint");
+
+  const noMission = canonicalIntentFingerprint({ task: "same task text" });
+  assert.notEqual(noMission.intentFingerprint, a.intentFingerprint,
+    "adding a mission contract to the same task changes the intent");
+  assert.equal(noMission.canonicalIntent, "same task text");
+}
+
 console.log("initial-dispatch-reservation.test.ts: all assertions passed");

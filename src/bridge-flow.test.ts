@@ -1892,6 +1892,48 @@ try {
     reviewPatch = "diff --git a/x.txt b/x.txt\n--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-old\n+new\n";
   }
 
+  // ── Scenario: initial-dispatch reservation recovery across review
+  // submission and mission-contract change ──
+  {
+    const dispatchCountBefore = receivedRuns.length;
+    const first = await callReviewer("submit_to_coding_agent", {
+      task: "recoverable intent task",
+      workspaceSessionId: WS,
+      clientMutationId: "reservation-recovery-1",
+    });
+    assert.ok(!first.isError, `first dispatch succeeds: ${JSON.stringify(first)}`);
+    const runId = first.structuredContent.runId;
+    const wsId = first.structuredContent.workSessionId;
+    assert.equal(receivedRuns.length, dispatchCountBefore + 1, "first dispatch executed once");
+
+    // Simulate the agent finishing and the session advancing to review
+    // (the lost-response window the reservation exists to cover).
+    workSessions.updateStatus(wsId, "awaiting_review");
+
+    const retry = await callReviewer("submit_to_coding_agent", {
+      task: "recoverable intent task",
+      workspaceSessionId: WS,
+      clientMutationId: "reservation-recovery-1",
+    });
+    assert.ok(!retry.isError, `retry after review submission must recover the run, not be rejected: ${JSON.stringify(retry)}`);
+    assert.equal(retry.structuredContent.runId, runId, "retry returns the original run");
+    assert.equal(retry.structuredContent.workSessionId, wsId, "retry adopts the recorded session");
+    assert.equal(receivedRuns.length, dispatchCountBefore + 1, "no second execution for the same intent");
+
+    // Same clientMutationId with a changed task is refused, never
+    // bound to a second session.
+    const changed = await callReviewer("submit_to_coding_agent", {
+      task: "DIFFERENT task text",
+      workspaceSessionId: WS,
+      clientMutationId: "reservation-recovery-1",
+    });
+    assert.ok(changed.isError, "mutex reused with different content is refused");
+    assert.match(String(changed.content[0]?.text ?? ""), /already used with different task content/);
+
+    await callReviewer("cancel_work_session", { sessionId: wsId });
+    reviewWorkflow.finalizeCancellation({ sessionId: wsId, reason: "test adapter stopped" });
+  }
+
   // ── Scenario 5: continuation lease release / requeue ──
   {
     const cm = createContinuationManager(join(root, "cm-lease"));

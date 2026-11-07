@@ -27,6 +27,7 @@ import { checkDispatchReplay, deriveStableDispatchKey } from "./dispatch-identit
 import type { BridgeConfig } from "./context.js";
 import type { MissionCriterionInput, WorkOrderInput } from "../mission-ledger.js";
 import type { ApprovalMode, AutonomyMode, SupervisorStatus } from "../supervisor-runs.js";
+
 import {
   acquireCheckoutModifyLease,
   captureMissionBaseline,
@@ -37,6 +38,41 @@ import {
   renderMissionPrompt,
   workSessionInstructions,
 } from "./shared.js";
+
+/**
+ * The ONE canonical intent fingerprint (Finding 4 follow-up): task text
+ * plus the mission-contract fingerprint. Used identically by the
+ * initial-dispatch reservation and by the stable dispatch identity, so
+ * a reused clientMutationId is rejected for ANY intent change (task or
+ * mission contract), and one intent maps to exactly one dispatch key.
+ */
+export function canonicalIntentFingerprint(input: {
+  task: string;
+  mission?: {
+    objective: string;
+    desiredOutcome?: string;
+    acceptanceCriteria?: unknown;
+    supervisorInstructions?: string;
+    autonomyMode?: AutonomyMode;
+    approvalMode?: ApprovalMode;
+    maxWallTimeMinutes?: number;
+    workOrder?: unknown;
+  };
+  missionBaseline?: { baselineKind: string; baselineRef: string; baselineCommit: string };
+}): { canonicalIntent: string; intentFingerprint: string } {
+  const missionContractFingerprint = input.mission
+    ? createHash("sha256").update(JSON.stringify([
+      input.mission.objective, input.mission.desiredOutcome,
+      input.mission.acceptanceCriteria, input.mission.supervisorInstructions,
+      input.mission.autonomyMode, input.mission.approvalMode,
+      input.mission.maxWallTimeMinutes ?? null,
+      input.mission.workOrder ?? null,
+      input.missionBaseline ? [input.missionBaseline.baselineKind, input.missionBaseline.baselineRef, input.missionBaseline.baselineCommit] : null,
+    ])).digest("hex")
+    : undefined;
+  const canonicalIntent = `${input.task}${missionContractFingerprint ? `\n\nmission-contract:${missionContractFingerprint}` : ""}`;
+  return { canonicalIntent, intentFingerprint: createHash("sha256").update(canonicalIntent).digest("hex") };
+}
 
 export interface DurableDispatchInput {
   task: string;
@@ -168,6 +204,15 @@ export async function dispatchToRegisteredAgent(
   // --- Work-session ownership (Kontrol owns creation) ---
   let wsId = input.workSessionId;
   let createdSessionForDispatch = false;
+  // ONE canonical intent fingerprint for the reservation AND the stable
+  // dispatch identity: task text + mission-contract fingerprint. A
+  // reused clientMutationId with the same task but a different mission
+  // contract is rejected by the reservation check exactly as a changed
+  // task would be, instead of passing the reservation and minting a
+  // second execution for the same clientMutationId.
+  const { canonicalIntent, intentFingerprint: _intentFingerprint } = canonicalIntentFingerprint({
+    task, mission: input.mission, missionBaseline,
+  });
   // Initial-dispatch reservation: a caller without a workSessionId names
   // the intent only by clientMutationId. The durable reservation binds
   // (authenticated owner, workspace, clientMutationId) to one session, so
@@ -176,9 +221,16 @@ export async function dispatchToRegisteredAgent(
   // creating a second session whose new ID would mint a new dispatch key.
   let reservationKey: string | undefined;
   let reservationFingerprint: string | undefined;
+  // True when this call adopted its session from an existing
+  // reservation: the reservation is proof this exact intent was already
+  // dispatched, so the non-review-session reuse gate must not reject it
+  // (e.g. a retry arriving after the session advanced to
+  // awaiting_review). The replay check below then returns the existing
+  // run instead of dispatching a second execution.
+  let adoptedViaReservation = false;
   if (!wsId && input.clientMutationId) {
     const owner = livePrincipalId(config) ?? config.principalId;
-    reservationFingerprint = createHash("sha256").update(task).digest("hex");
+    reservationFingerprint = _intentFingerprint;
     reservationKey = createHash("sha256")
       .update(["initial-dispatch-v1", owner, workspaceSessionId, input.clientMutationId].join("\n"))
       .digest("hex");
@@ -190,6 +242,7 @@ export async function dispatchToRegisteredAgent(
           return { status: "failed", workspaceSessionId, error: text, isError: true, text };
         }
         wsId = existing.workSessionId;
+        adoptedViaReservation = true;
       }
     } catch (error) {
       const text = `Cannot read the initial-dispatch reservation: ${error instanceof Error ? error.message : String(error)}`;
@@ -247,7 +300,7 @@ export async function dispatchToRegisteredAgent(
     const freshUndispatchedSession =
       existing.status === "in_progress" && !existing.latestSubmission && !latestRun;
     if (!input.allowNonReviewSessionReuse) {
-      if (!freshUndispatchedSession && !["changes_requested", "resuming"].includes(existing.status)) {
+      if (!adoptedViaReservation && !freshUndispatchedSession && !["changes_requested", "resuming"].includes(existing.status)) {
         const text = `Work session ${wsId} is ${existing.status}; dispatch requires a fresh undispatched session or an explicit changes_requested/resuming handoff.`;
         return { status: "failed", workspaceSessionId, workSessionId: wsId, error: text, isError: true, text };
       }
@@ -289,23 +342,16 @@ export async function dispatchToRegisteredAgent(
   // rendered later can differ from the raw task, so a changed contract
   // must change the key.
   const wsForIdentity = config.workSessions.get(wsId);
-  const missionContractFingerprint = input.mission
-    ? createHash("sha256").update(JSON.stringify([
-      input.mission.objective, input.mission.desiredOutcome,
-      input.mission.acceptanceCriteria, input.mission.supervisorInstructions,
-      input.mission.autonomyMode, input.mission.approvalMode,
-      input.mission.maxWallTimeMinutes ?? null,
-      input.mission.workOrder ?? null,
-      missionBaseline ? [missionBaseline.baselineKind, missionBaseline.baselineRef, missionBaseline.baselineCommit] : null,
-    ])).digest("hex")
-    : undefined;
   const stableDispatchKey = deriveStableDispatchKey(config.agentRegistry, runBeforeDispatch?.runId, {
     workSessionId: wsId,
     intentId: input.clientMutationId ?? (createdSessionForDispatch ? "initial" : (wsForIdentity?.latestFeedback?.id ?? "initial")),
     feedbackEpoch: wsForIdentity?.reviewEpoch ?? 0,
     latestFeedbackId: wsForIdentity?.latestFeedback?.id,
     agentId: peer.id,
-    task: `${task}\n\n${workSessionInstructions(wsId, peer)}${missionContractFingerprint ? `\n\nmission-contract:${missionContractFingerprint}` : ""}`,
+    // The identity's task carries the SAME canonical intent (task +
+    // mission-contract fingerprint) as the reservation fingerprint, so
+    // one intent maps to one key and one reservation.
+    task: `${canonicalIntent}\n\n${workSessionInstructions(wsId, peer)}`,
   });
   const replay = checkDispatchReplay(config.agentRegistry, stableDispatchKey);
   if (replay.kind !== "none") {
