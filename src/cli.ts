@@ -10,7 +10,8 @@ import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { satisfies } from "semver";
 import { loadConfig } from "./config.js";
 import { databasePath, inspectDatabase, openDatabase } from "./db/client.js";
-import { inspectDeploymentReconciliation } from "./deployment-reconciliation.js";
+import { inspectDeploymentReconciliation, inspectUnifiedDeploymentReconciliation } from "./deployment-reconciliation.js";
+import { servicePaths } from "./service.js";
 import { FilesystemSnapshotStore } from "./filesystem-snapshot-store.js";
 import { loadPolicyConfig, policyCanAsk } from "./policy.js";
 import { collectDurableSnapshotRoots } from "./runtime/snapshot-roots.js";
@@ -72,6 +73,36 @@ async function main(argv: string[]): Promise<void> {
       runConfigCommand(args);
       return;
     case "service":
+      if (args[0] === "status" && args.includes("--unified")) {
+        // Unified deployment reconciliation (detection, never recovery):
+        // committed manifest vs systemd vs live runtime vs artifact vs DB
+        // ledger. Missing evidence is UNKNOWN, never inferred. Only meaningful
+        // on systemd hosts (service.json present); tmux-only stacks keep the
+        // legacy doctor reconciliation instead.
+        const paths = servicePaths(process.env);
+        if (!existsSync(paths.statePath)) {
+          if (args.includes("--json")) console.log(JSON.stringify({ status: "UNKNOWN", detail: `no committed service manifest at ${paths.statePath}` }));
+          else console.log(`deployment reconciliation: UNKNOWN (no committed service manifest at ${paths.statePath})`);
+          process.exitCode = 1;
+          return;
+        }
+        const result = inspectUnifiedDeploymentReconciliation({
+          stateDir: paths.stateDir,
+          statePath: paths.statePath,
+          unitPath: paths.unitPath,
+          serviceName: paths.serviceName,
+        });
+        if (args.includes("--json")) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          for (const [name, item] of Object.entries(result.evidence)) {
+            console.log(`deployment ${name}: ${item.status} (${item.detail})`);
+          }
+          console.log(`deployment reconciliation: ${result.status}`);
+        }
+        if (result.status === "FAILED" || result.status === "DRIFT") process.exitCode = 1;
+        return;
+      }
       await runServiceCommand(args);
       return;
     case "snapshots":

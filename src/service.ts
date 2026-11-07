@@ -42,6 +42,9 @@ export interface InstalledServiceState extends ServiceBuild {
   serviceName: string;
   deploymentId: string;
   installedAt: string;
+  /** Installed component graph (adapters/tunnel), persisted so deployment
+   * reconciliation can verify systemd component evidence. */
+  serviceComponents?: KontrolServiceComponent[];
 }
 
 export interface ServicePaths {
@@ -1011,7 +1014,7 @@ async function install(paths: ServicePaths, dependencies: ServiceCommandDependen
     try {
       materializeTunnelReviewerSecret(components, env, paths.environmentFile);
       requireServiceEnvironmentFile(paths);
-      const state = { ...copyRelease(paths, build), deploymentId };
+      const state = { ...copyRelease(paths, build), deploymentId, serviceComponents: components };
       const record = makeRecord(deploymentId, "install", undefined, state);
       writeDeploymentRecord(paths, record);
       try {
@@ -1395,7 +1398,7 @@ async function upgrade(paths: ServicePaths, dependencies: ServiceCommandDependen
     try {
       materializeTunnelReviewerSecret(upgradeComponents, env, paths.environmentFile);
       requireServiceEnvironmentFile(paths);
-      candidate = { ...copyRelease(paths, build), deploymentId };
+      candidate = { ...copyRelease(paths, build), deploymentId, serviceComponents: upgradeComponents };
     } catch (error) {
       restoreFileSnapshot(paths.environmentFile, environmentSnapshot);
       throw error;
